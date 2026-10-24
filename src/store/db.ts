@@ -14,6 +14,7 @@ export interface OpenDbOptions {
 
 export class CairnDb {
   private txDepth = 0;
+  private closed = false;
 
   private constructor(
     public readonly raw: DatabaseSync,
@@ -126,6 +127,8 @@ export class CairnDb {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.raw.close();
   }
 }
