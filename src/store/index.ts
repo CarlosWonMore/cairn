@@ -10,4 +10,5 @@ export * from './archives.js';
 export * from './plans.js';
 export * from './outbox.js';
 export * from './blocks.js';
+export * from './conflicts.js';
 export * from './open.js';

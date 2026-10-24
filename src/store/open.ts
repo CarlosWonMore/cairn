@@ -9,6 +9,7 @@ import { ImportArchiveRepository } from './archives.js';
 import { PlanRepository } from './plans.js';
 import { OutboxRepository } from './outbox.js';
 import { ManagedBlockRepository, DeviceInstallationRepository } from './blocks.js';
+import { ConflictRepository } from './conflicts.js';
 import { AuditLog } from './audit.js';
 import {
   loadIdentity,
@@ -65,6 +66,7 @@ export interface CairnStore {
   outbox: OutboxRepository;
   blocks: ManagedBlockRepository;
   installations: DeviceInstallationRepository;
+  conflicts: ConflictRepository;
   audit: AuditLog;
   /** 写操作前置守卫：克隆/暂停状态抛 E_DEVICE_CLONED / E_DEVICE_SUSPENDED。 */
   assertWritable(): void;
@@ -121,7 +123,8 @@ export function openStore(opts: OpenStoreOptions = {}): CairnStore {
     const outbox = new OutboxRepository(db, audit);
     const blocks = new ManagedBlockRepository(db);
     const installations = new DeviceInstallationRepository(db);
-    for (const repo of [scopes, memories, archives, plans, outbox, blocks, installations]) {
+    const conflicts = new ConflictRepository(db);
+    for (const repo of [scopes, memories, archives, plans, outbox, blocks, installations, conflicts]) {
       repo.setWriteGuard(readOnly ? () => { throw err('E_READONLY', '只读连接拒绝写入'); } : writeGuard);
     }
     const store: CairnStore = {
@@ -138,6 +141,7 @@ export function openStore(opts: OpenStoreOptions = {}): CairnStore {
       outbox,
       blocks,
       installations,
+      conflicts,
       audit,
       assertWritable() {
         writeGuard();
