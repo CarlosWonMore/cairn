@@ -407,8 +407,7 @@ test('检索：searchMemories 只读（不更新 last_used_at）', () => {
     searchMemories(store, { text: '结构化检索', query: qa });
     searchMemories(store, { text: 'trigram', query: qa });
     const after = store.memories.get(ids.zhou);
-    assert.ok(after !== undefined);
-    assert.equal(after.lastUsedAt, null, '检索不得写库；last_used 更新交给调用方');
+    assert.ok(after != null && after.lastUsedAt === null, '检索不得写库；last_used 更新交给调用方');
   });
 });
 

@@ -366,6 +366,8 @@ export async function disableProjection(
       // 用户未做其他修改：整文件恢复原始字节
       await writeFileAtomic(input.targetPath, backup);
       restoredOriginal = true;
+      // 备份字节已完整还原，备份文件完成使命（删除失败不影响结论）
+      await rm(backupPath, { force: true }).catch(() => undefined);
     } else if (removal.changed && removal.output !== currentText) {
       await writeFileAtomic(input.targetPath, Buffer.from(removal.output, 'utf8'));
     }
