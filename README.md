@@ -1,24 +1,32 @@
-# AI Memory
+# Cairn
 
-个人、多设备、多 Agent 的本地优先记忆主权层。
+> 内部代号，未完成商标核查。Cairn（石堆路标）——徒步者沿路堆石给后来者指路；对应"跨设备、跨 Agent 留下可解释、可删除、可迁移的记忆标记"，而不是"又一个会记住你一切的云服务"。
 
-当前阶段：M0 本地可执行验证已完成，首个 OpenSpec 变更待审阅，尚未进入产品实现。
+个人、多设备、多 Agent 的**本地优先记忆主权层**。
 
-## 新会话入口
+- 本地 SQLite 是每台设备的权威副本，断网时新增、检索、更正、遗忘、导出全部可用；
+- 云端只是后续可选的加密中继与备份，不是使用记忆的前提；
+- 标准记忆走 MCP，管理走 CLI，低能力 Agent 走受管 Markdown 投影；不逆向任何 Agent 的私有数据库；
+- 模型只提出候选；作用域、审批、来源、修订、冲突与删除由确定性代码执行；
+- 同步、抽取、嵌入与维护全部退出 Agent 会话关键路径，任何后台失败只留下可重试状态。
 
-1. 阅读 `AGENTS.md` 和 `docs/M0-session-handoff.md`。
-2. 审阅 `openspec/changes/add-local-first-memory-mvp/` 下的 proposal、specs、design、tasks。
-3. 用户确认后，在新会话执行 `/opsx:apply` 或明确要求应用 `add-local-first-memory-mvp`；不要重复创建同名提案。
+## 状态
 
-## 关键资料
+当前处于首个 OpenSpec 变更 `add-local-first-memory-mvp` 的实现阶段（本地 MVP，无模型、无云端、单机）。
 
-- `docs/AI-Memory-development-plan.md`：资料库开发方案的本地完整快照。
-- `docs/M0-session-handoff.md`：本会话全部流程、结论、验收、阻塞和迁移说明。
-- `artifacts/m0/`：原型、探针、测试、CLI 日志、审计和迁移清单。
-- `openspec/config.yaml`：项目上下文、制品规则和 apply/archive 约束。
+- 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
+- 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks）。
+- M0 原型证据与审计：`artifacts/m0/`（本地证据，不入库）。
 
-## 当前硬约束
+## 开发
 
-本地 SQLite 为权威副本；MCP + CLI + 受管投影；记忆作用域贯穿检索、导出和后续同步；模型只提候选；后台故障不得中断 Agent 会话。当前不考虑本地模型，不做团队共享，不在首个变更连接真实 ECS/OBS 或接管 Agent 私有记忆。
+```bash
+npm install
+npm run build && npm test   # Node.js 22.5+（当前验证环境 Node 24）
+```
 
-`artifacts/m0/` 是证据与原型，不是生产代码。实现必须遵循 OpenSpec 变更并独立复跑验收。
+模块划分（design D1）：`core / store / retrieval / governance / onboarding / interfaces / projection / agents / jobs`。CLI 与 MCP 共用同一应用服务，不各自实现记忆规则。
+
+## 许可证
+
+MIT。见 [LICENSE](./LICENSE)。
