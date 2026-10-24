@@ -40,6 +40,8 @@ function toolDef(
 }
 
 export function createServer(home?: string): Server {
+  // MCP 调用方是 Agent 通道：受作用域约束（CLI 是 user 通道，数据主权者）
+  process.env['CAIRN_CHANNEL'] = 'agent';
   const service = AppService.open(home);
   const server = new Server(
     { name: 'cairn', version: '0.1.0' },

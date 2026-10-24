@@ -26,7 +26,8 @@ interface Flags {
 const VALUE_FLAGS = new Set([
   'home', 'kind', 'scope', 'scope-id', 'project', 'project-name', 'agent', 'agent-id', 'ttl-days',
   'expires', 'status', 'limit', 'out', 'format', 'reason', 'host', 'home-root', 'project-root',
-  'mode', 'plan-file', 'mcp-command', 'mcp-args', 'max', 'expected-revision',
+  'mode', 'plan-file', 'mcp-command', 'mcp-args', 'max', 'expected-revision', 'approval', 'ttl',
+  'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {

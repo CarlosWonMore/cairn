@@ -15,7 +15,7 @@ import {
 } from '../core/types.js';
 import { err, ExitCode } from '../core/errors.js';
 import { contentHash } from '../core/hash.js';
-import { scopeAllowsUpstream } from '../core/scope.js';
+import { scopeAllowsUpstream, scopeAllowsRead } from '../core/scope.js';
 import { searchMemories, SearchInput, SearchOutput } from '../retrieval/search.js';
 import { exportData, ExportInput, ExportOutput } from '../retrieval/export.js';
 import { registerDefaultHandlers, runOnce, RunOnceSummary } from '../jobs/worker.js';
@@ -59,6 +59,8 @@ export interface AddMemoryInput {
 export interface CallerContext {
   deviceId: string;
   agentId: string;
+  /** user = 本地 CLI（数据主权者，全库可见）；agent = MCP 调用方（受作用域约束）。 */
+  channel: 'user' | 'agent';
 }
 
 export interface MemoryDetail {
@@ -109,6 +111,7 @@ export class AppService {
     return {
       deviceId: this.store.identity.deviceId,
       agentId: process.env['CAIRN_AGENT_ID'] ?? 'cli',
+      channel: process.env['CAIRN_CHANNEL'] === 'agent' ? 'agent' : 'user',
     };
   }
 
@@ -175,10 +178,7 @@ export class AppService {
     // 秘密扫描：显式写入同样阻断（构想 §12.3），错误只含 masked 摘要
     const scan = scanText(input.content);
     if (!scan.clean) {
-      throw err('E_SECRET_DETECTED', '内容疑似包含秘密，已阻断（详情见 masked 摘要，不回显原文）', {
-        findings: scan.findings.map((f) => ({ kind: f.kind, masked: f.masked })),
-        injectionFindings: scan.injectionFindings.map((f) => ({ kind: f.kind, rule: f.rule })),
-      });
+      throw scanError(scan);
     }
     const scope = this.resolveScope(input.scope);
     if (input.sensitivity === 'sensitive' && scope.syncPolicy !== 'local_only') {
@@ -275,6 +275,16 @@ export class AppService {
     const store = this.store;
     const memory = store.memories.require(id);
     const scope = store.scopes.requireById(memory.scopeId);
+    if (this.caller.channel === 'agent') {
+      const query = {
+        deviceId: this.caller.deviceId,
+        agentId: this.caller.agentId,
+        projectId: process.env['CAIRN_PROJECT_ID'] ?? null,
+      };
+      if (!scopeAllowsRead(scope, query)) {
+        throw err('E_SCOPE_MISMATCH', '当前调用方无权读取该记忆详情（作用域不匹配）', { memoryId: id });
+      }
+    }
     return {
       memory,
       revisions: store.memories.revisions(id),
@@ -297,9 +307,7 @@ export class AppService {
     store.assertWritable();
     const scan = scanText(input.content);
     if (!scan.clean) {
-      throw err('E_SECRET_DETECTED', '候选内容疑似包含秘密，已阻断', {
-        findings: scan.findings.map((f) => ({ kind: f.kind, masked: f.masked })),
-      });
+      throw scanError(scan);
     }
     const scope = this.resolveScope(undefined);
     const ctx = this.caller;
@@ -431,6 +439,13 @@ export class AppService {
   async importFromPath(input: { sourcePath: string; agentKind: string; batchId?: string; sourceKind?: ImportSourceKind }): Promise<{ outcome: ImportOutcome; batchId: string }> {
     const store = this.store;
     store.assertWritable();
+    // 防回环：受管投影文件不作为导入来源（导出—回读—再导出循环）
+    const { readFileSync } = await import('node:fs');
+    const { hasCairnMarker } = await import('../projection/markdown.js');
+    const text = readFileSync(input.sourcePath, 'utf8');
+    if (hasCairnMarker(text)) {
+      throw err('E_PROJECTION_LOOP', '来源文件包含本产品受管投影标记；导入它会造成投影回环，已拒绝', { sourcePath: input.sourcePath });
+    }
     const outcome = await importSnapshot(store, {
       agentKind: input.agentKind,
       sourcePath: input.sourcePath,
@@ -554,5 +569,18 @@ export class AppService {
   }
 }
 
+
+/** 扫描命中错误：秘密优先；仅注入命中 → E_INJECTION_SUSPECTED。均不回显原文。 */
+function scanError(scan: ReturnType<typeof scanText>): Error {
+  if (scan.findings.length > 0) {
+    return err('E_SECRET_DETECTED', '内容疑似包含秘密，已阻断（详情见 masked 摘要，不回显原文）', {
+      findings: scan.findings.map((f) => ({ kind: f.kind, masked: f.masked })),
+      injectionFindings: scan.injectionFindings.map((f) => ({ kind: f.kind, rule: f.rule })),
+    });
+  }
+  return err('E_INJECTION_SUSPECTED', '内容疑似提示注入指令，已按不可信数据处理并阻断该写入', {
+    injectionFindings: scan.injectionFindings.map((f) => ({ kind: f.kind, rule: f.rule })),
+  });
+}
 
 export { ExitCode };
