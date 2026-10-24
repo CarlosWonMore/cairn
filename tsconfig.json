@@ -15,8 +15,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,
-    "sourceMap": true,
-    "verbatimModuleSyntax": true
+    "sourceMap": true
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules", "dist", "artifacts"]

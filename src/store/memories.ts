@@ -1,0 +1,460 @@
+import { CairnDb } from './db.js';
+import {
+  AddMemoryInput,
+  MemoryRecord,
+  MemoryKind,
+  MemoryStatus,
+  Authority,
+  EvidenceInput,
+  EvidenceRecord,
+  RevisionRecord,
+  Sensitivity,
+  MEMORY_KINDS,
+  MEMORY_STATUSES,
+  AUTHORITIES,
+} from '../core/types.js';
+import { err } from '../core/errors.js';
+import { uuidv7 } from '../core/ids.js';
+import { nowIso } from '../core/time.js';
+import { normalizeContent, contentHash as contentHashOf, sha256Hex } from '../core/hash.js';
+import { WriteGuardMixin } from './write-guard.js';
+
+/**
+ * 记忆仓储（任务 2.1）：显式新增、详情、更正、归档、遗忘与当前修订解析。
+ * 更正形成新修订并保留 supersedes 链；历史修订不可无痕修改。
+ * 内容哈希基于规范化正文（core/hash），原始正文始终保留。
+ */
+
+export interface ReviseOptions {
+  reason?: string;
+  author: string;
+  /** 乐观锁：期望的当前修订 id；不匹配抛 E_TARGET_CHANGED。 */
+  expectedCurrentRevisionId?: string;
+  expiresAt?: string | null;
+  sensitivity?: Sensitivity;
+}
+
+export interface MemoryFilter {
+  scopeId?: string;
+  status?: MemoryStatus;
+  statuses?: MemoryStatus[];
+  kind?: MemoryKind;
+  authority?: Authority;
+  sourceImportBatchId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export class MemoryRepository extends WriteGuardMixin {
+  constructor(private readonly db: CairnDb) {
+    super();
+  }
+
+  add(input: AddMemoryInput, deviceId: string): MemoryRecord {
+    this.checkWritable();
+    validateMemoryInput(input);
+    const id = uuidv7();
+    const at = nowIso();
+    const normalized = normalizeContent(input.content);
+    const hash = contentHashOf(input.content);
+    const confidence = input.confidence ?? defaultConfidence(input.authority);
+    const sensitivity = input.sensitivity ?? 'normal';
+
+    this.db.transaction(() => {
+      this.db.run(
+        `INSERT INTO memory (id, owner_id, kind, content, normalized_content, scope_id, status, authority,
+           confidence, source_agent, source_session_id, source_import_batch_id, source_message_range,
+           observed_at, valid_from, valid_to, expires_at, sensitivity, content_hash, created_by, created_at, updated_at)
+         VALUES (?, 'local-user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        input.kind,
+        input.content,
+        normalized,
+        input.scopeId,
+        initialStatus(input.authority),
+        input.authority,
+        confidence,
+        input.sourceAgent ?? null,
+        input.sourceSessionId ?? null,
+        input.sourceImportBatchId ?? null,
+        input.sourceMessageRange ?? null,
+        input.observedAt ?? at,
+        input.validFrom ?? null,
+        input.validTo ?? null,
+        input.expiresAt ?? null,
+        sensitivity,
+        hash,
+        input.createdBy,
+        at,
+        at,
+      );
+      const revId = uuidv7();
+      this.db.run(
+        `INSERT INTO memory_revision (id, memory_id, seq, parent_revision_ids, content, content_hash, scope_id,
+           status, authority, author, device_id, reason, created_at)
+         VALUES (?, ?, 1, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        revId,
+        id,
+        input.content,
+        hash,
+        input.scopeId,
+        initialStatus(input.authority),
+        input.authority,
+        input.createdBy,
+        deviceId,
+        null,
+        at,
+      );
+      this.db.run('UPDATE memory SET current_revision_id = ? WHERE id = ?', revId, id);
+      this.insertEvidence(id, revId, input.evidence ?? []);
+    });
+    return this.require(id);
+  }
+
+  get(id: string): MemoryRecord | null {
+    const row = this.db.get('SELECT * FROM memory WHERE id = ?', id);
+    return row ? mapMemory(row) : null;
+  }
+
+  require(id: string): MemoryRecord {
+    const m = this.get(id);
+    if (!m) throw err('E_NOT_FOUND', `记忆不存在: ${id}`);
+    return m;
+  }
+
+  /**
+   * 用户更正（任务 2.1）：新修订 + supersedes 历史；expected 不匹配时
+   * 抛 E_TARGET_CHANGED（目标在批准后变化则拒绝过期计划，spec memory-governance）。
+   */
+  revise(id: string, newContent: string, opts: ReviseOptions, deviceId: string): { memory: MemoryRecord; revision: RevisionRecord } {
+    this.checkWritable();
+    const mem = this.require(id);
+    if (mem.status === 'tombstoned') throw err('E_CONFLICT_STATE', '已遗忘的记忆不能修改');
+    const at = nowIso();
+    const hash = contentHashOf(newContent);
+    return this.db.transaction(() => {
+      const cur = this.db.get('SELECT current_revision_id FROM memory WHERE id = ?', id)!;
+      const currentRevId = cur.current_revision_id as string | null;
+      if (opts.expectedCurrentRevisionId && currentRevId !== opts.expectedCurrentRevisionId) {
+        throw err('E_TARGET_CHANGED', '记忆在计划批准后产生了新修订，拒绝基于过期目标应用', {
+          memoryId: id,
+          expected: opts.expectedCurrentRevisionId,
+          actual: currentRevId,
+        });
+      }
+      const seqRow = this.db.get('SELECT MAX(seq) AS s FROM memory_revision WHERE memory_id = ?', id);
+      const seq = Number(seqRow?.s ?? 0) + 1;
+      const revId = uuidv7();
+      const newStatus: MemoryStatus = mem.status === 'conflicted' ? 'conflicted' : 'active';
+      this.db.run(
+        `INSERT INTO memory_revision (id, memory_id, seq, parent_revision_ids, content, content_hash, scope_id,
+           status, authority, author, device_id, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        revId,
+        id,
+        seq,
+        JSON.stringify(currentRevId ? [currentRevId] : []),
+        newContent,
+        hash,
+        mem.scopeId,
+        newStatus,
+        mem.authority,
+        opts.author,
+        deviceId,
+        opts.reason ?? null,
+        at,
+      );
+      this.db.run(
+        `UPDATE memory SET current_revision_id = ?, content = ?, normalized_content = ?, content_hash = ?,
+           status = ?, expires_at = IFNULL(?, expires_at), sensitivity = IFNULL(?, sensitivity), updated_at = ? WHERE id = ?`,
+        revId,
+        newContent,
+        normalizeContent(newContent),
+        hash,
+        newStatus,
+        opts.expiresAt ?? null,
+        opts.sensitivity ?? null,
+        at,
+        id,
+      );
+      return { memory: this.require(id), revision: this.requireRevision(revId) };
+    });
+  }
+
+  /** 候选晋升（真实审批后由治理层调用；agent_inferred/imported 不能静默变 active）。 */
+  promoteToActive(id: string, authority: Authority, by: string): MemoryRecord {
+    this.checkWritable();
+    const mem = this.require(id);
+    if (mem.status !== 'candidate') throw err('E_CONFLICT_STATE', `只有候选可晋升，当前 ${mem.status}`);
+    if (authority === 'agent_inferred' || authority === 'imported_unverified') {
+      throw err('E_FORBIDDEN', '不允许把候选晋升回推断/未验证权威');
+    }
+    this.db.run("UPDATE memory SET status = 'active', authority = ?, updated_at = ? WHERE id = ?", authority, nowIso(), id);
+    this.db.run('UPDATE memory_revision SET status = ?, authority = ? WHERE id = ?', 'active', authority, mem.currentRevisionId ?? '');
+    return this.require(id);
+  }
+
+  archive(id: string): MemoryRecord {
+    this.require(id);
+    this.db.run("UPDATE memory SET status = 'archived', updated_at = ? WHERE id = ?", nowIso(), id);
+    return this.require(id);
+  }
+
+  /** 遗忘（任务 2.1/2.5）：tombstone 可审计，被遗忘内容退出活动结果与投影。 */
+  forget(id: string, reason: string | null, by: string): MemoryRecord {
+    this.checkWritable();
+    const mem = this.require(id);
+    if (mem.status === 'tombstoned') return mem;
+    const at = nowIso();
+    this.db.transaction(() => {
+      this.db.run(
+        `INSERT INTO tombstone (id, memory_id, reason, forgotten_by, forgotten_at, content_hash) VALUES (?, ?, ?, ?, ?, ?)`,
+        uuidv7(),
+        id,
+        reason,
+        by,
+        at,
+        mem.contentHash,
+      );
+      this.db.run("UPDATE memory SET status = 'tombstoned', updated_at = ? WHERE id = ?", at, id);
+    });
+    return this.require(id);
+  }
+
+  getTombstone(memoryId: string): { id: string; reason: string | null; forgottenBy: string; forgottenAt: string; contentHash: string } | null {
+    const row = this.db.get('SELECT * FROM tombstone WHERE memory_id = ? ORDER BY forgotten_at DESC LIMIT 1', memoryId);
+    if (!row) return null;
+    return {
+      id: row.id as string,
+      reason: (row.reason as string | null) ?? null,
+      forgottenBy: row.forgotten_by as string,
+      forgottenAt: row.forgotten_at as string,
+      contentHash: row.content_hash as string,
+    };
+  }
+
+  resolveCurrent(id: string): { memory: MemoryRecord; revision: RevisionRecord } | null {
+    const mem = this.get(id);
+    if (!mem || !mem.currentRevisionId) return null;
+    return { memory: mem, revision: this.requireRevision(mem.currentRevisionId) };
+  }
+
+  revisions(id: string): RevisionRecord[] {
+    return this.db
+      .all('SELECT * FROM memory_revision WHERE memory_id = ? ORDER BY seq', id)
+      .map(mapRevision);
+  }
+
+  requireRevision(revId: string): RevisionRecord {
+    const row = this.db.get('SELECT * FROM memory_revision WHERE id = ?', revId);
+    if (!row) throw err('E_NOT_FOUND', `修订不存在: ${revId}`);
+    return mapRevision(row);
+  }
+
+  evidence(memoryId: string): EvidenceRecord[] {
+    return this.db.all('SELECT * FROM evidence WHERE memory_id = ? ORDER BY created_at, id', memoryId).map(mapEvidence);
+  }
+
+  addEvidence(memoryId: string, revisionId: string | null, input: EvidenceInput): EvidenceRecord {
+    const id = uuidv7();
+    this.db.run(
+      `INSERT INTO evidence (id, memory_id, revision_id, evidence_kind, source_agent, session_id, import_archive_id,
+         locator, excerpt_hash, trust_level, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      memoryId,
+      revisionId,
+      input.evidenceKind,
+      input.sourceAgent ?? null,
+      input.sessionId ?? null,
+      input.importArchiveId ?? null,
+      input.locator ?? null,
+      input.excerptHash ?? null,
+      input.trustLevel,
+      nowIso(),
+    );
+    const row = this.db.get('SELECT * FROM evidence WHERE id = ?', id)!;
+    return mapEvidence(row);
+  }
+
+  list(filter: MemoryFilter = {}): MemoryRecord[] {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter.scopeId) {
+      where.push('scope_id = ?');
+      params.push(filter.scopeId);
+    }
+    if (filter.status) {
+      where.push('status = ?');
+      params.push(filter.status);
+    } else if (filter.statuses) {
+      where.push(`status IN (${filter.statuses.map(() => '?').join(',')})`);
+      params.push(...filter.statuses);
+    }
+    if (filter.kind) {
+      where.push('kind = ?');
+      params.push(filter.kind);
+    }
+    if (filter.authority) {
+      where.push('authority = ?');
+      params.push(filter.authority);
+    }
+    if (filter.sourceImportBatchId) {
+      where.push('source_import_batch_id = ?');
+      params.push(filter.sourceImportBatchId);
+    }
+    const sql = `SELECT * FROM memory ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`;
+    params.push(filter.limit ?? 200, filter.offset ?? 0);
+    return this.db.all(sql, ...params).map(mapMemory);
+  }
+
+  /** 内容去重查找（同 scope 同规范化哈希）。 */
+  findByContentHash(scopeId: string, hash: string): MemoryRecord | null {
+    const row = this.db.get(
+      "SELECT * FROM memory WHERE scope_id = ? AND content_hash = ? AND status NOT IN ('tombstoned','superseded') ORDER BY updated_at DESC LIMIT 1",
+      scopeId,
+      hash,
+    );
+    return row ? mapMemory(row) : null;
+  }
+
+  countsByStatus(): Record<MemoryStatus, number> {
+    const out = Object.fromEntries(MEMORY_STATUSES.map((s) => [s, 0])) as Record<MemoryStatus, number>;
+    for (const r of this.db.all('SELECT status, COUNT(*) AS n FROM memory GROUP BY status')) {
+      out[r.status as MemoryStatus] = Number(r.n);
+    }
+    return out;
+  }
+
+  markUsed(id: string, at: string = nowIso()): void {
+    this.db.run('UPDATE memory SET last_used_at = ? WHERE id = ?', at, id);
+  }
+
+  touchVerified(id: string, at: string = nowIso()): void {
+    this.db.run('UPDATE memory SET last_verified_at = ?, updated_at = ? WHERE id = ?', at, at, id);
+  }
+
+  private insertEvidence(memoryId: string, revisionId: string, list: EvidenceInput[]): void {
+    for (const ev of list) {
+      this.addEvidence(memoryId, revisionId, ev);
+    }
+  }
+}
+
+/** authority → 初始状态：显式/确认即 active；推断/导入保持候选（spec memory-governance）。 */
+export function initialStatus(authority: Authority): MemoryStatus {
+  switch (authority) {
+    case 'user_explicit':
+    case 'user_confirmed':
+      return 'active';
+    case 'agent_inferred':
+    case 'imported_unverified':
+      return 'candidate';
+    default: {
+      const exhaustive: never = authority;
+      throw err('E_VALIDATION', `未知权威级别 ${String(exhaustive)}`);
+    }
+  }
+}
+
+function defaultConfidence(authority: Authority): number {
+  switch (authority) {
+    case 'user_explicit':
+      return 1;
+    case 'user_confirmed':
+      return 0.9;
+    case 'agent_inferred':
+      return 0.5;
+    case 'imported_unverified':
+      return 0.3;
+  }
+}
+
+export function validateMemoryInput(input: AddMemoryInput): void {
+  const problems: string[] = [];
+  if (!(MEMORY_KINDS as readonly string[]).includes(input.kind)) problems.push(`kind 非法: ${input.kind}`);
+  if (!(AUTHORITIES as readonly string[]).includes(input.authority)) problems.push(`authority 非法: ${input.authority}`);
+  if (typeof input.content !== 'string' || input.content.trim().length === 0) problems.push('content 不能为空');
+  if (input.content.length > 1_000_000) problems.push('content 超过 1MB 上限');
+  if (input.kind === 'instruction' && input.authority !== 'user_explicit' && input.authority !== 'user_confirmed') {
+    problems.push('instruction 只能来自 user_explicit / user_confirmed');
+  }
+  if (input.confidence != null && (input.confidence < 0 || input.confidence > 1)) problems.push('confidence 必须在 [0,1]');
+  if (problems.length > 0) throw err('E_VALIDATION', `记忆写入校验失败: ${problems.join('; ')}`, { problems });
+}
+
+export function mapMemory(r: Record<string, unknown>): MemoryRecord {
+  return {
+    id: r.id as string,
+    ownerId: r.owner_id as string,
+    kind: r.kind as MemoryKind,
+    content: r.content as string,
+    normalizedContent: r.normalized_content as string,
+    scopeId: r.scope_id as string,
+    status: r.status as MemoryStatus,
+    authority: r.authority as Authority,
+    confidence: Number(r.confidence),
+    sourceAgent: (r.source_agent as string | null) ?? null,
+    sourceSessionId: (r.source_session_id as string | null) ?? null,
+    sourceImportBatchId: (r.source_import_batch_id as string | null) ?? null,
+    sourceMessageRange: (r.source_message_range as string | null) ?? null,
+    observedAt: r.observed_at as string,
+    validFrom: (r.valid_from as string | null) ?? null,
+    validTo: (r.valid_to as string | null) ?? null,
+    lastVerifiedAt: (r.last_verified_at as string | null) ?? null,
+    lastUsedAt: (r.last_used_at as string | null) ?? null,
+    expiresAt: (r.expires_at as string | null) ?? null,
+    sensitivity: r.sensitivity as Sensitivity,
+    currentRevisionId: (r.current_revision_id as string | null) ?? null,
+    contentHash: r.content_hash as string,
+    createdBy: r.created_by as string,
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function mapRevision(r: Record<string, unknown>): RevisionRecord {
+  let parents: string[] = [];
+  try {
+    const v = JSON.parse((r.parent_revision_ids as string) ?? '[]') as unknown;
+    if (Array.isArray(v)) parents = v.map(String);
+  } catch {
+    parents = [];
+  }
+  return {
+    id: r.id as string,
+    memoryId: r.memory_id as string,
+    seq: Number(r.seq),
+    parentRevisionIds: parents,
+    content: r.content as string,
+    contentHash: r.content_hash as string,
+    scopeId: r.scope_id as string,
+    status: r.status as MemoryStatus,
+    authority: r.authority as Authority,
+    author: r.author as string,
+    deviceId: r.device_id as string,
+    reason: (r.reason as string | null) ?? null,
+    createdAt: r.created_at as string,
+  };
+}
+
+export function mapEvidence(r: Record<string, unknown>): EvidenceRecord {
+  return {
+    id: r.id as string,
+    memoryId: r.memory_id as string,
+    revisionId: (r.revision_id as string | null) ?? null,
+    evidenceKind: r.evidence_kind as EvidenceRecord['evidenceKind'],
+    sourceAgent: (r.source_agent as string | null) ?? null,
+    sessionId: (r.session_id as string | null) ?? null,
+    importArchiveId: (r.import_archive_id as string | null) ?? null,
+    locator: (r.locator as string | null) ?? null,
+    excerptHash: (r.excerpt_hash as string | null) ?? null,
+    trustLevel: r.trust_level as EvidenceRecord['trustLevel'],
+    createdAt: r.created_at as string,
+  };
+}
+
+/** 证据摘录只存哈希，不存原文（构想 §8.3）。 */
+export function evidenceExcerptHash(excerpt: string): string {
+  return sha256Hex(excerpt);
+}
