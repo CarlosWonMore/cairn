@@ -255,6 +255,41 @@ export class MemoryRepository extends WriteGuardMixin {
     return this.db.all('SELECT * FROM evidence WHERE memory_id = ? ORDER BY created_at, id', memoryId).map(mapEvidence);
   }
 
+  /** 记忆间关系：supersedes / contradicts / related_to（首版仅三种）。 */
+  addRelation(fromMemoryId: string, toMemoryId: string, type: 'supersedes' | 'contradicts' | 'related_to'): string {
+    if (fromMemoryId === toMemoryId) throw err('E_VALIDATION', '关系两端不能是同一记忆');
+    this.require(fromMemoryId);
+    this.require(toMemoryId);
+    const existing = this.db.get(
+      'SELECT id FROM relation WHERE from_memory_id = ? AND to_memory_id = ? AND relation_type = ?',
+      fromMemoryId,
+      toMemoryId,
+      type,
+    );
+    if (existing) return existing.id as string;
+    const id = uuidv7();
+    this.db.run(
+      'INSERT INTO relation (id, from_memory_id, to_memory_id, relation_type, created_at) VALUES (?, ?, ?, ?, ?)',
+      id,
+      fromMemoryId,
+      toMemoryId,
+      type,
+      nowIso(),
+    );
+    return id;
+  }
+
+  relationsOf(memoryId: string): { id: string; fromMemoryId: string; toMemoryId: string; relationType: string }[] {
+    return this.db
+      .all('SELECT * FROM relation WHERE from_memory_id = ? OR to_memory_id = ?', memoryId, memoryId)
+      .map((r) => ({
+        id: r.id as string,
+        fromMemoryId: r.from_memory_id as string,
+        toMemoryId: r.to_memory_id as string,
+        relationType: r.relation_type as string,
+      }));
+  }
+
   addEvidence(memoryId: string, revisionId: string | null, input: EvidenceInput): EvidenceRecord {
     const id = uuidv7();
     this.db.run(
