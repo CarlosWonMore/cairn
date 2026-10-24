@@ -3,14 +3,17 @@ import assert from 'node:assert/strict';
 import { spawn, ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
+import { cliEntry } from '../spawn-target.js';
 
 /**
  * MCP stdio 协议合同（任务 5.2 / agent-interfaces spec）：
  * stdout 只含 JSON-RPC；日志仅 stderr；断开后本地仍可用。
  */
 
-const ROOT = join(import.meta.dirname ?? process.cwd(), '..', '..');
-const SERVER = join(ROOT, 'src', 'interfaces', 'mcp', 'server.ts');
+const { mcpServerEntry } = await import('../spawn-target.js');
+const serverTarget = mcpServerEntry();
+const SERVER = serverTarget.file;
+const SERVER_LOADER = serverTarget.loader;
 
 interface Probe {
   proc: ChildProcess;
@@ -22,7 +25,7 @@ interface Probe {
 }
 
 function startServer(home: string): Probe {
-  const p = spawn(process.execPath, ['--import', 'tsx', SERVER, '--home', home], {
+  const p = spawn(process.execPath, [...SERVER_LOADER, SERVER, '--home', home], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const probe: Probe = {
@@ -39,7 +42,12 @@ function startServer(home: string): Probe {
     },
     kill() {
       return new Promise((r) => {
-        p.on('close', () => r());
+        // 进程可能已自行退出：先检查再挂监听，避免 await 永不返回
+        if (p.exitCode !== null || p.signalCode !== null) {
+          r();
+          return;
+        }
+        p.once('close', () => r());
         p.kill();
       });
     },
@@ -138,7 +146,8 @@ test('MCP：客户端断开后服务器退出，本地库仍可被 CLI 使用（
   const base = ['--home', home, '--json'];
   const cli = (args: string[]) =>
     new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
-      const p = spawn(process.execPath, ['--import', 'tsx', join(ROOT, 'src', 'interfaces', 'cli', 'main.ts'), ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const cliTarget = cliEntry();
+      const p = spawn(process.execPath, [...cliTarget.loader, cliTarget.file, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       p.stdout.on('data', (c) => (stdout += c));
       p.on('close', (code) => resolve({ code, stdout }));

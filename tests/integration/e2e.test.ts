@@ -12,12 +12,13 @@ import { makeTestHome, cleanupTestHome } from '../helpers.js';
  * 三次独立授权不可捆绑；双 MCP 客户端 + CLI 跨进程共用同一本地库。
  */
 
-const ROOT = join(import.meta.dirname ?? process.cwd(), '..', '..');
-const CLI_ENTRY = join(ROOT, 'src', 'interfaces', 'cli', 'main.ts');
+import { cliEntry, mcpServerEntry } from '../spawn-target.js';
+const cliTarget = cliEntry();
+const serverTarget = mcpServerEntry();
 
 function runCli(args: string[], env?: Record<string, string>): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const p = spawn(process.execPath, ['--import', 'tsx', CLI_ENTRY, ...args], {
+    const p = spawn(process.execPath, [...cliTarget.loader, cliTarget.file, ...args], {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -149,9 +150,8 @@ test('E2E 全链路：发现→导入→计划→审批→应用→投影→卸�
 
 test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开后其余继续可用', async () => {
   const home = makeTestHome();
-  const SERVER = join(ROOT, 'src', 'interfaces', 'mcp', 'server.ts');
-  const start = (agentId: string) => {
-    const p = spawn(process.execPath, ['--import', 'tsx', SERVER, '--home', home], {
+    const start = (agentId: string) => {
+    const p = spawn(process.execPath, [...serverTarget.loader, serverTarget.file, '--home', home], {
       env: { ...process.env, CAIRN_AGENT_ID: agentId },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -163,7 +163,11 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
       send: (o: unknown) => p.stdin!.write(JSON.stringify(o) + '\n'),
       out: () => out,
       wait: (ms: number) => new Promise((r) => setTimeout(r, ms)),
-      stop: () => new Promise<void>((r) => { p.on('close', () => r()); p.kill(); }),
+      stop: () => new Promise<void>((r) => {
+        if (p.exitCode !== null || p.signalCode !== null) { r(); return; }
+        p.once('close', () => r());
+        p.kill();
+      }),
     };
   };
   const a = start('agent-a');

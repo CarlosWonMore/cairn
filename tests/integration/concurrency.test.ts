@@ -9,12 +9,12 @@ import { makeTestHome, cleanupTestHome } from '../helpers.js';
  * 记录完整、无死锁挂起、WAL busy_timeout 内完成而非无限等待。
  */
 
-const ROOT = join(import.meta.dirname ?? process.cwd(), '..', '..');
-const WRITER = join(ROOT, 'tests', 'integration', 'fixtures', 'concurrent-writer.mts');
+import { concurrentWriterEntry } from '../spawn-target.js';
+const writerTarget = concurrentWriterEntry();
 
 function runWriter(home: string, index: number): Promise<{ code: number | null; stdout: string }> {
   return new Promise((resolve, reject) => {
-    const p = spawn(process.execPath, ['--import', 'tsx', WRITER, String(index)], {
+    const p = spawn(process.execPath, [...writerTarget.loader, writerTarget.file, String(index)], {
       env: { ...process.env, CAIRN_TEST_HOME: home },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

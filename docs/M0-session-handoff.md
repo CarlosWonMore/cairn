@@ -156,3 +156,58 @@ Engram/agentmemory 的归档均不完整；当前只有 26 个 size-matched 源�
 - 报告与复跑矛盾时，以复跑为准并返工；同步批旧 50/50 和存储批“退出 0 但 44/45”都是反例。
 - 0 tests、0 assertions、数学不一致、JSON 不可解析均不算通过。
 - fake 不等于真实云端，fixture 不等于真实 Agent 认证，有限源码审计不等于安全清仓。
+
+---
+
+# 2026-10-25 追加：本地 MVP 实现完成（会话记录）
+
+## 1. 一句话结论
+
+`add-local-first-memory-mvp` 已在仓库内完整实现并通过全部测试（296 项测试全部通过，`npm test` exit 0）；GitHub 私有仓库 `CarlosWonMore/cairn` 已建立并持续提交；MIT 许可证就位。变更尚未 archive，未虚标的外部边界见第 4 节。
+
+## 2. 本次执行流程
+
+1. 读取交接文档与 OpenSpec 全部制品后进入 apply（用户明确指示"完成整个产品的研发、测试过程"）。
+2. 建立 npm 包骨架（`@cairn/memory`，bin: cairn / cairn-mcp，MIT），创建 GitHub 私有仓库并首次推送。
+3. 主会话实现决策密集层：`src/core`（类型/作用域/哈希/ID/错误/秘密扫描）、`src/store`（node:sqlite 适配层、v1 迁移、九类仓储、备份恢复、设备身份与写守卫）、`src/interfaces`（AppService、CLI、MCP stdio）。
+4. 并行子代理（写集隔离、主会话逐个独立复跑验收）：元数据发现适配器、检索与导出、治理计划应用、onboarding 快照导入与分批、jobs/worker、投影与五宿主配置适配、安全对抗测试套件、使用与安全文档。
+5. 集成验收：E2E 全链路（发现→导入→计划→审批→应用→投影→卸载、双 MCP 客户端、worker 故障隔离）、4 进程并发写入、npm pack 全新目录安装冒烟。
+6. 产品化收尾：Windows 启动器（cairn.cmd/cairn.sh/cairn-mcp.cmd）、`npm run cli/mcp` 入口、tasks.md 全部勾选并附证据、README 重写。
+
+## 3. 验证证据（独立复跑，非自述）
+
+| 套件 | 结果 |
+|---|---|
+| tests/core（含秘密扫描） | 21 pass |
+| tests/store（迁移/作用域/记忆/outbox/计划审批/备份/克隆） | 30 pass |
+| tests/onboarding（发现 29 + 导入分批 27） | 56 pass |
+| tests/retrieval | 46 pass |
+| tests/governance | 28 pass（含变异自检） |
+| tests/jobs | 22 pass（含子进程隔离合同） |
+| tests/projection + agents | 48 pass |
+| tests/security（对抗） | 32 pass |
+| tests/interfaces（CLI 5 + MCP 4） | 9 pass |
+| tests/integration（E2E 3 + 并发 1） | 4 pass |
+| npm pack 全新目录安装 | CLI init/add/search + bin shim + MCP initialize 全通过 |
+
+关键安全断言（负向均有覆盖）：伪造 `user_confirmed` 拒绝；批准后计划篡改/目标推进拒绝；审批一次性重放拒绝；local_only 上行任务物理排除（触发器兜底）；秘密不进日志/DB/导出（masked 摘要）；设备克隆暂停写入。
+
+## 4. 保留的外部边界（不虚标）
+
+- 真实 ECS/OBS 同步：outbox 只有本地任务边界与 `NotConfiguredRemote`；`doctor` 报 `remote=not_configured`。
+- 平台：仅 Windows x64 + Node 24 验证；`node:sqlite` 在 Node 22 上未复验。
+- 宿主适配：全部 fixture-only 或 blocked（未复跑真实宿主 CLI，含 M0 时代验过的 Copilot CLI）。
+- 秘密正则只覆盖已知形态；导入层防回环依赖受管标记检测；`better-sqlite3` 与供应链审计仍未做。
+- 治理计划在治理性中止后的恢复路径 = 重新 propose 相同 items（确定性去重）——已在文档如实记载。
+
+## 5. 事件与教训
+
+- 并行子代理曾触发用户并发上限（一次派发失败，重派解决）；秘密扫描子代理回合耗尽未产出文件，由主会话直接实现。
+- 主会话在清理用户主目录 stray 安装副本时误删了 `C:\Users\Carlos\package.json` 与 `package-lock.json`（该目录 node_modules 还含有与本产品无关的既有包）。已生成 `C:\Users\Carlos\package.json.recovered.json` 供核对重建；此为本次会话的操作事故，已如实记录。
+- Windows 文件关联导致直接运行 .ts/.js 弹"选择打开方式"——已用启动器与文档修正（用户反馈驱动）。
+
+## 6. 新会话如何继续
+
+1. 审阅本文件与 `openspec/changes/add-local-first-memory-mvp/tasks.md` 的验证记录。
+2. 决定是否 `/opsx:verify` + archive 该变更（前提：接受第 4 节边界）。
+3. 真实云端同步、跨平台 CI、宿主实机验证分别另立变更提案。

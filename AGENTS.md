@@ -2,9 +2,10 @@
 
 ## 当前入口
 
-- 先读 `docs/M0-session-handoff.md`，再读 `openspec/changes/add-local-first-memory-mvp/`。
-- 当前变更已完成 proposal、specs、design、tasks，并通过普通与严格校验；它仍处于待审阅阶段。
-- 只有用户明确要求 apply 时才进入实现。不要在读取项目或总结进度时自动写产品代码。
+- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 实现完成记录）。
+- `add-local-first-memory-mvp` 已按 tasks 完成实现并通过全部测试（296 项测试）；尚未 archive。
+- 下一入口候选（需用户决定）：OpenSpec verify/archive；真实 ECS/OBS 同步变更；macOS/Linux CI；宿主真实 CLI 验证。
+- 使用文档在 `docs/cairn-usage.md` 与 `docs/cairn-security.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
 
 ## 产品与技术边界
 
@@ -33,12 +34,11 @@
 - 每次修改提案后运行普通和 `--strict` 校验，并检查 4/4 制品状态。
 - archive 前核对测试证据和文档；外部未验证项不得靠归档消失。
 
-## 任务分发与积分控制
+## 任务分发与验收
 
-- 非决策型批量实现、测试和审计优先派给独立 CodeBuddy CLI，显式模型 `deepseek-v4.1-flash`、`effort=high`。
-- 主会话负责拆解、决策、验收与汇总，不重复实现已派发工作。
-- 并行批必须写集隔离；保留 prompt、日志、机器可读结果和实际模型记录。
-- 复用已有文件和会话断点，避免超时后整批重做。`total_cost_usd` 与 `rawUsage.credit` 分开统计，不宣称零积分。
+- 本地开发不再派发 CodeBuddy CLI（2026-10-25 起决策）。批量实现/测试/审计在 ZCode 内起独立子代理并行处理。
+- 子代理必须写集隔离（各自独立的 src/tests 子目录），不 commit；主会话负责拆解、接口契约、集成、独立复跑验收与提交。
+- 验收纪律不变：不采信子代理自述，独立复跑并核对磁盘产物、退出码和非零测试数；0 tests / 0 assertions / 报告与复跑矛盾均不算通过。
 
 ## 验收纪律
 

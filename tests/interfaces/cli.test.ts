@@ -11,8 +11,9 @@ import { makeTestHome } from '../helpers.js';
  * 被治理拒绝返回稳定退出码。全部在合成 HOME 上运行。
  */
 
-const ROOT = join(import.meta.dirname ?? process.cwd(), '..', '..');
-const TSX = ['--import', 'tsx', join(ROOT, 'src', 'interfaces', 'cli', 'main.ts')];
+const { cliEntry } = await import('../spawn-target.js');
+const target = cliEntry();
+const TSX = [...target.loader, target.file];
 
 interface RunResult {
   code: number | null;

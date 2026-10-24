@@ -12,18 +12,25 @@
 
 ## 状态
 
-当前处于首个 OpenSpec 变更 `add-local-first-memory-mvp` 的实现阶段（本地 MVP，无模型、无云端、单机）。
+**本地 MVP 已实现并通过全部测试**（OpenSpec 变更 `add-local-first-memory-mvp`，无模型、无云端、单机）。
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
-- 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks）。
+- 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。
+- 使用文档：`docs/cairn-usage.md`（十分钟上手 / 三层独立授权初始化 / MCP 接入 / 宿主配置）。
+- 安全与运维：`docs/cairn-security.md`（信任模型 / 秘密与注入防线 / 备份恢复 / 卸载 / 故障排查）。
 - M0 原型证据与审计：`artifacts/m0/`（本地证据，不入库）。
 
-## 开发
+## 快速开始
 
 ```bash
 npm install
-npm run build && npm test   # Node.js 22.5+（当前验证环境 Node 24）
+npm run build          # Node.js 22.5+（当前验证环境 Node 24 / Windows x64）
+npm run cli -- doctor  # 健康检查（无模型、无云端核心可用）
+npm run cli -- add "项目的构建约定是 pnpm"
+npm run cli -- search "构建约定"
 ```
+
+**Windows 提醒：不要直接运行/双击 `.ts` 或 `.js` 文件**（会弹出"选择打开方式"）。始终使用 `npm run cli --`、`cairn.cmd`（仓库根目录启动器）或 `npm link` 后的全局 `cairn` 命令。详见 `docs/cairn-usage.md` 第 1 节。
 
 模块划分（design D1）：`core / store / retrieval / governance / onboarding / interfaces / projection / agents / jobs`。CLI 与 MCP 共用同一应用服务，不各自实现记忆规则。
 
