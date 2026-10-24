@@ -358,7 +358,7 @@ async function main(): Promise<void> {
           if (!batchId) {
             out({ activeBatch: null, note: '没有待整理批次' }, flags);
           } else {
-            out({ batchId, ...service.batchStatus(batchId) }, flags);
+            out({ ...service.batchStatus(batchId) }, flags);
           }
         } else if (sub === 'next') {
           if (!batchId) throw new CairnError('E_VALIDATION', '没有待整理批次；请先 cairn import');
