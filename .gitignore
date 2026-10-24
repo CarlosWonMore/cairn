@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+dist-*/
+*.tsbuildinfo
+
+# npm pack artifacts
+*.tgz
+
+# Local runtime data (Cairn 数据目录仅通过 CAIRN_HOME 重定向到临时目录，绝不入库)
+*.db
+*.db-wal
+*.db-shm
+*.db.backup
+.cairn-test/
+
+# M0 审计证据与运行产物：不是生产源码，公开分发不得打入（见 AGENTS.md 目录职责）
+artifacts/
+
+# 工具本地状态
+.codebuddy/
+.zcode/

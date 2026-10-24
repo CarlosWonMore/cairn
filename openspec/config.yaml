@@ -1,0 +1,48 @@
+schema: spec-driven
+
+context: |
+  Language: zh-CN
+  All artifacts must be written in zh-CN.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: AI Memory 是面向个人、多设备、多 Agent 的本地优先记忆主权层，不是规格驱动业务平台。
+  Stage: 当前处于 M0 验证与首个变更提案阶段；只有用户明确 apply 后才能实现。
+  Tech stack: TypeScript, Node.js 22+, SQLite/FTS5, MCP stdio, CLI, npm 发布与 npx 试用。
+  Evidence: docs/ 保存开发方案与交接结论；artifacts/m0/ 保存探针、测试、CLI 日志和有限范围审计。
+  Local authority: 每台设备的本地 SQLite 是可写权威副本；云端仅是可选加密中继与备份。
+  Session isolation: 同步、抽取、嵌入和维护不得阻塞或终止 Agent 会话；默认不安装同步 hook。
+  Protocol: stdio stdout 只输出 JSON-RPC；日志仅写 stderr 或文件。
+  Governance: 模型只生成候选；作用域、审批、来源、修订、冲突与删除必须由确定性代码执行。
+  Privacy: local-only/device 内容必须物理排除上行；不读取真实个人记忆，除非用户明确选择来源并授权。
+  Exclusions: 本次不考虑本地模型；首版不做团队共享、图数据库、实时双向原生记忆镜像或 Agent 私有数据库接管。
+  Distribution: 独立轻核心，npm 发布、npx 试用、固定版本长期使用；uvx 不是主分发。
+  Delegation: 非决策型批量实现、测试和审计优先派发 CodeBuddy CLI，显式使用 deepseek-v4.1-flash；主会话负责决策与独立验收。
+
+rules:
+  proposal:
+    - 必须区分已验证事实、原型证据、外部条件阻塞和产品假设。
+    - 必须写明非目标、风险、回滚方式以及不做什么。
+    - 不得把 fake backend、fixture 或单平台结果表述为真实云端或跨平台验收。
+  specs:
+    - 使用 RFC 2119 SHALL/MUST 与 Given/When/Then 场景。
+    - 记忆作用域必须同时约束写入、检索、投影、导出和同步。
+    - 必须覆盖幂等、伪造审批、计划篡改、会话故障隔离、秘密阻断和可恢复性。
+    - 不得引入本地模型、团队共享或未经公开接口支持的 Agent 私有能力。
+  design:
+    - 区分本地权威数据、候选治理、受管投影和可选同步协议。
+    - 必须包含威胁模型、迁移与回滚、故障注入和可观测性设计。
+    - 技术选型须引用 artifacts/m0 的可复跑证据，未决选型保持显式开放。
+  tasks:
+    - 任务必须小而可独立验收，给出测试或机器可读证据。
+    - 不得要求真实个人记忆、真实 Agent 配置或真实云端凭据作为默认测试输入。
+    - 未完成任务按可返工、外部条件阻塞、需用户决策分类，不得虚标完成。
+
+operations:
+  apply:
+    guidance:
+      - 严格按 tasks.md 实施，不在 apply 中扩大范围；非决策批量任务优先交 DeepSeek V4.1 Flash。
+      - 独立复跑测试并核对实际文件；0 tests、0 assertions 或无法解析的结果不算通过。
+      - 同步和模型任务必须证明失败不会中断模拟 Agent 会话。
+  archive:
+    guidance:
+      - 归档前完成严格校验、测试证据核对和文档回写。
+      - 将未完成外部验证保留到后续变更，不用归档掩盖阻塞。
