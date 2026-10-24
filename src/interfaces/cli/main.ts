@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { AppService, ExitCode } from '../app-service.js';
 import { CairnError, isCairnError } from '../../core/errors.js';
 import { HOST_ADAPTERS, AgentKind } from '../../agents/adapters.js';

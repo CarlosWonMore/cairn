@@ -23,8 +23,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "cli": "tsx src/interfaces/cli/main.ts",
+    "mcp": "tsx src/interfaces/mcp/server.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/test/",
+    "test": "npm run build && tsx --test --test-concurrency=2 \"tests/**/*.test.ts\"",
     "test:module": "node --import tsx --test",
     "smoke:pack": "npm run build && npm pack --dry-run"
   },
