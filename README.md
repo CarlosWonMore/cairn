@@ -16,7 +16,7 @@
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
 - 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。
-- 使用文档：`docs/cairn-usage.md`（十分钟上手 / 三层独立授权初始化 / MCP 接入 / 宿主配置）。
+- 使用文档：`docs/cairn-usage.md`（十分钟上手 / 三层独立授权初始化 / MCP 接入 / 宿主配置）；云同步：`docs/cairn-sync.md`（OBS/ECS 双后端 / E2EE / 双设备验证）。
 - 安全与运维：`docs/cairn-security.md`（信任模型 / 秘密与注入防线 / 备份恢复 / 卸载 / 故障排查）。
 - M0 原型证据与审计：`artifacts/m0/`（本地证据，不入库）。
 

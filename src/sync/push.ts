@@ -1,6 +1,7 @@
 import { CairnStore } from '../store/open.js';
 import { RemoteStore } from '../jobs/remote.js';
 import { err } from '../core/errors.js';
+import { sha256Hex } from '../core/hash.js';
 import { nowIso } from '../core/time.js';
 import {
   ChunkMeta,
@@ -20,6 +21,7 @@ import { VaultConfig, PERSONAL_SPACE_KEY } from './vault.js';
  * → manifest（单写者，headSeq 防回退）。事件按内容哈希链组织；
  * local_only/设备限定内容由 outbox 层物理排除（触发器兜底），
  * 打包层再按 scope 过滤一次（spec：打包前物理排除）。
+ * 失败只留下可重试状态：推送异常时已领取任务复位为 pending（spec agent-interfaces）。
  */
 
 const MAX_EVENTS_PER_CHUNK = 200;
@@ -64,7 +66,11 @@ function buildEvents(store: CairnStore, device: string, jobs: PendingJob[]): { e
       // 记忆已不存在：作为 tombstone 传播；对端按内容哈希血统对齐
       const hashRow = store.db.get('SELECT content_hash FROM tombstone WHERE memory_id = ? ORDER BY forgotten_at DESC LIMIT 1', job.entityId);
       events.push({
-        deviceId: device, seq: 0, type: 'memory_tombstone', memoryId: job.entityId, occurredAt: nowIso(),
+        deviceId: device,
+        seq: 0,
+        type: 'memory_tombstone',
+        memoryId: job.entityId,
+        occurredAt: nowIso(),
         payload: { lastContentHash: (hashRow?.content_hash as string) ?? '', knownHashes: hashRow ? [(hashRow.content_hash as string)] : [] },
       });
       doneJobIds.push(job.id);
@@ -76,11 +82,14 @@ function buildEvents(store: CairnStore, device: string, jobs: PendingJob[]): { e
       continue;
     }
     if (mem.status === 'tombstoned') {
-      // 已知修订哈希清单：对端按血统对齐本地记忆
       const knownHashes = store.memories.revisions(mem.id).map((r) => r.contentHash);
       const t = store.memories.getTombstone(mem.id);
       events.push({
-        deviceId: device, seq: 0, type: 'memory_tombstone', memoryId: mem.id, occurredAt: nowIso(),
+        deviceId: device,
+        seq: 0,
+        type: 'memory_tombstone',
+        memoryId: mem.id,
+        occurredAt: nowIso(),
         payload: { lastContentHash: t?.contentHash ?? mem.contentHash, knownHashes },
       });
       doneJobIds.push(job.id);
@@ -135,14 +144,28 @@ function assignSeqs(store: CairnStore, spaceKey: string, events: SyncEvent[]): v
   });
 }
 
-export async function syncPush(store: CairnStore, remote: RemoteStore, vault: VaultConfig, opts: { maxJobs?: number; preclaimedJobs?: { id: string; entityId: string }[] } = {}): Promise<PushResult | null> {
+export async function syncPush(store: CairnStore, remote: RemoteStore, vault: VaultConfig, opts: { maxJobs?: number; preclaimedJobs?: PendingJob[] } = {}): Promise<PushResult | null> {
   store.assertWritable();
   const spaceKey = PERSONAL_SPACE_KEY;
   const jobs = opts.preclaimedJobs ?? store.outbox.claimReady(opts.maxJobs ?? 200).filter((j) => j.jobType === 'sync_upstream');
   if (jobs.length === 0) return null;
+  try {
+    return await pushClaimed(store, remote, vault, spaceKey, jobs);
+  } catch (e) {
+    // 失败复位：已领取任务回到 pending（可重试状态），错误照常抛出
+    if (!opts.preclaimedJobs) {
+      for (const j of jobs) {
+        store.db.run("UPDATE outbox_job SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'running'", nowIso(), j.id);
+      }
+    }
+    throw e;
+  }
+}
+
+async function pushClaimed(store: CairnStore, remote: RemoteStore, vault: VaultConfig, spaceKey: string, jobs: PendingJob[]): Promise<PushResult> {
   const device = store.identity.deviceId;
 
-  const { events, doneJobIds } = buildEvents(store, device, jobs.map((j) => ({ id: j.id, entityId: j.entityId })));
+  const { events, doneJobIds } = buildEvents(store, device, jobs);
   if (events.length > 0) {
     assignSeqs(store, spaceKey, events);
     for (const ev of events) {
@@ -178,7 +201,8 @@ export async function syncPush(store: CairnStore, remote: RemoteStore, vault: Va
       kind: 'chunk',
       objectId: meta.key,
     });
-    await remote.putImmutable(chunkObjectKey(spaceKey, meta), sealed, meta.plaintextSha256);
+    // hash 参数 = 传输字节（密文）的哈希；内容寻址的明文哈希在 key 中
+    await remote.putImmutable(chunkObjectKey(spaceKey, meta), sealed, sha256Hex(Buffer.from(sealed)));
     publishedChunks.push(meta);
   }
 
@@ -230,4 +254,3 @@ function decryptManifestDoc(sealed: Uint8Array, vaultKey: Uint8Array, vaultId: s
   }
   return doc;
 }
-

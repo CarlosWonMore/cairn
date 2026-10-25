@@ -17,8 +17,8 @@
  */
 
 import { createServer } from 'node:http';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
-import { join, dirname, normalize } from 'node:path';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync } from 'node:fs';
+import { join, dirname, normalize, relative } from 'node:path';
 
 const PORT = Number(process.env['CAIRN_SYNCD_PORT'] ?? 8471);
 const HOST = process.env['CAIRN_SYNCD_HOST'] ?? '127.0.0.1';
@@ -63,6 +63,35 @@ const server = createServer((req, res) => {
 
   if (req.method === 'GET' && path === '/healthz') {
     send(res, 200, JSON.stringify({ ok: true, uptime: process.uptime() }));
+    return;
+  }
+
+  if (req.method === 'GET' && path === '/list') {
+    const rawPrefix = url.searchParams.get('prefix') ?? '';
+    if (!/^[A-Za-z0-9/_.-]*$/.test(rawPrefix) || rawPrefix.includes('..')) {
+      send(res, 400, 'bad prefix');
+      return;
+    }
+    // 虚拟键空间：chunks/<key> 与 manifests/<key> 两个物理子目录合并，
+    // 返回去掉首段存储类的虚拟 key（与 PUT /chunks/<key> 的寻址一致）
+    const keys = [];
+    const walk = (dir, topLevel) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full, topLevel);
+        } else {
+          const rel = full.slice(normalize(join(DATA_DIR, topLevel)).length + 1).split('\\').join('/');
+          if (rel.startsWith(rawPrefix)) keys.push(rel);
+        }
+      }
+    };
+    for (const topLevel of ['chunks', 'manifests']) {
+      const dir = join(DATA_DIR, topLevel);
+      if (existsSync(dir)) walk(dir, topLevel);
+    }
+    keys.sort();
+    send(res, 200, JSON.stringify({ keys }));
     return;
   }
 

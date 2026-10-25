@@ -496,27 +496,33 @@ test('putManifest：expectedGeneration 非负整数约束（负数/非整数 →
   assert.equal(calls.length, 1);
 });
 
-test('getManifest：200 → 解析为对象；404 → null', async () => {
-  const manifest = { generation: 3, headSeq: 9 };
+test('getManifest：200 → 原始字节（manifest 是加密字节，不做 JSON 解析）；404 → null', async () => {
+  // 真实环境修复：sync 层的 manifest 是【加密字节】，本层只做字节存取
+  const body = new TextEncoder().encode('sealed-manifest-bytes-不是JSON');
   const { store } = makeStore((url) => {
     if (url.endsWith('/cairn/s1/devices/d1/manifest.json')) {
-      return okResponse(JSON.stringify(manifest), { etag: `"${sha256Hex(JSON.stringify(manifest))}"` });
+      return okResponse(Buffer.from(body).toString('utf8'), { etag: `"${sha256Hex(Buffer.from(body))}"` });
     }
     return new Response(null, { status: 404 });
   });
-  assert.deepEqual(await store.getManifest('s1', 'd1'), manifest);
+  const got = await store.getManifest('s1', 'd1');
+  assert.ok(got instanceof Uint8Array);
+  assert.equal(Buffer.from(got).toString('utf8'), 'sealed-manifest-bytes-不是JSON');
   assert.equal(await store.getManifest('s1', 'ghost'), null);
 });
 
-test('getManifest：200 但非法 JSON → E_IO/obs_manifest_invalid', async () => {
-  const { store } = makeStore(() => okResponse('not-json{{{'));
-  const e = await store.getManifest('s1', 'd1').then(
-    () => null,
-    (err: unknown) => err,
-  );
-  const c = asCairn(e);
-  assert.equal(c.code, 'E_IO');
-  assert.equal(c.message, 'obs_manifest_invalid');
+test('putManifest：Uint8Array 原样上传（密文字节不 JSON 化）', async () => {
+  let sentBody: Buffer | null = null;
+  const { store } = makeStore((url, init) => {
+    if (init?.method === 'PUT') {
+      sentBody = Buffer.from(init.body as ArrayBuffer);
+      return okResponse(JSON.stringify({ ok: true }), { etag: `"${sha256Hex(sentBody!)}"` });
+    }
+    return new Response(null, { status: 404 });
+  });
+  const sealed = new TextEncoder().encode('sealed-manifest-bytes');
+  await store.putManifest('s1', 'd1', sealed, 1);
+  assert.equal(sentBody!.toString('utf8'), 'sealed-manifest-bytes');
 });
 
 test('manifest：(space, device) 含 / 或为空 → E_VALIDATION', async () => {

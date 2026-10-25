@@ -21,15 +21,21 @@ export class SyncdRemoteStore implements RemoteStore {
   ) {}
 
   private async req(method: string, path: string, body?: Uint8Array, headers: Record<string, string> = {}): Promise<{ status: number; body: Uint8Array; text: string }> {
-    const res = await this.fetchImpl(`${this.cfg.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.cfg.token}`,
-        ...(body ? { 'content-type': 'application/octet-stream' } : {}),
-        ...headers,
-      },
-      body: body ? Buffer.from(body) : undefined,
-    });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.cfg.baseUrl}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${this.cfg.token}`,
+          ...(body ? { 'content-type': 'application/octet-stream' } : {}),
+          ...headers,
+        },
+        body: body ? Buffer.from(body) : undefined,
+      });
+    } catch (e) {
+      // 网络层失败不透传原始堆栈（错误卫生）；不含 baseUrl/token
+      throw err('E_IO', 'syncd_network_error', { code: (e as { code?: string }).code ?? 'unknown' });
+    }
     const buf = new Uint8Array(await res.arrayBuffer());
     return { status: res.status, body: buf, text: Buffer.from(buf).toString('utf8') };
   }
@@ -50,11 +56,12 @@ export class SyncdRemoteStore implements RemoteStore {
     if (r.status !== 200) throw err('E_IO', 'syncd_remote_error', { status: r.status });
   }
 
-  async list(prefix: string, cursor?: string): Promise<{ keys: string[]; nextCursor?: string }> {
-    // syncd 首版不提供列举（拉取按已知设备 id 进行）；诚实返回空集而不是猜测
-    void prefix;
-    void cursor;
-    return { keys: [] };
+  async list(prefix: string, _cursor?: string): Promise<{ keys: string[]; nextCursor?: string }> {
+    const r = await this.req('GET', `/list?prefix=${encodeURIComponent(prefix)}`);
+    if (r.status === 401) throw err('E_FORBIDDEN', 'syncd_auth_failed');
+    if (r.status !== 200) throw err('E_IO', 'syncd_remote_error', { status: r.status });
+    const parsed = JSON.parse(r.text) as { keys: string[] };
+    return { keys: parsed.keys };
   }
 
   async getManifest(space: string, device: string): Promise<Uint8Array | null> {

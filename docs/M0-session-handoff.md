@@ -232,3 +232,38 @@ Engram/agentmemory 的归档均不完整；当前只有 26 个 size-matched 源�
 
 - 冷启动回归 4/4；concurrency.test.ts 单文件 6/6；全量 npm test 连续 5 轮全绿（见 git 记录）。
 - Node 22.22.2 已纳入验证（两轮独立验证均在 22 上执行）。
+
+
+# 2026-10-25 追加（三）：真实云同步变更 add-real-cloud-sync 完成并验证
+
+## 1. 一句话结论
+
+OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在用户真实环境完成验证：华为云 OBS 双设备同步 8 步 PASSED（含密文审计证明 local_only 物理未上行）、阿里云 ECS syncd 部署完成且 Windows↔Linux 跨平台双向同步 PASSED、密钥丢失场景 PASSED。全量测试 385 项绿（1 项真实云端用例按凭据门控跳过）。变更尚未 archive。
+
+## 2. 交付内容
+
+- OBS v2 签名客户端（对照官方 SDK 规则核实，中文 key URL 编码坑已锁进测试）；E2EE（@noble/ciphers XChaCha20-Poly1305，AAD 绑定，HKDF 空间密钥，恢复材料导出/导入）。
+- chunk/manifest 协议：内容寻址不可变 chunk、manifest 单写者 headSeq 防回退、先 chunk 后 manifest、断点续拉游标。
+- 拉取合并：内容哈希血统对齐跨设备记忆身份（本地 id 不可跨设备引用——真实环境暴露的核心修正）、幂等应用、等待依赖、冲突保留、遗忘传播。
+- worker sync_upstream 真实实现 + `cairn vault init-remote/import-key/status/export-key`、`cairn sync push/pull`；doctor remote 三态。
+- ECS syncd（零依赖单文件，Bearer + 代次 CAS + 防穿越，仅绑 Tailscale 接口），systemd 部署。
+- 文档：docs/cairn-sync.md；验收证据：artifacts/cloud-sync-2026-10-25/（不入库）。
+
+## 3. 真实环境验证记录
+
+| 验证 | 结果 |
+|---|---|
+| 真实 OBS 往返（selftest 对象） | PASSED |
+| 真实 OBS 双设备 8 步（含密文审计证明 local_only 未上行） | PASSED（real-obs-two-device-verification.json） |
+| ECS syncd 部署 + 本机↔ECS 契约 | PASSED |
+| 跨平台 Windows↔Linux 双向同步（3 条记忆互通） | PASSED |
+| 密钥丢失 pull | PASSED（E_VALIDATION 明确报错，不半还原） |
+| doctor 诚实分级 | PASSED（无凭据环境如实 configured_untested） |
+
+## 4. 边界与已知项
+
+- 首版仅同步 personal-global 空间；项目/自定义空间同步属后续。
+- syncd 单用户单 vault、无 TLS（只绑内网/Tailscale）；数据目录备份责任在运维。
+- ECS 自连 Tailscale IP 每请求有秒级开销（文档建议回环/内网直连）。
+- ECS 上曾修复 DNS（/etc/systemd/resolved.conf.d/cairn-verify-dns.conf，可逆）；OBS 主账号 AK/SK 经环境变量注入，建议后续换 IAM 子用户。
+- 全量测试曾出现的并发冷启动失败已在归档后修复（见追加二），本轮 5 连续全绿基线成立。
