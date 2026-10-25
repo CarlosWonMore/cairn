@@ -1,5 +1,7 @@
-// 解密核查：OBS cairn/ 前缀下全部 chunk 解密后不得包含指定金丝雀（argv[2]）。
+// 解密核查：OBS cairn/ 前缀下全部 chunk 解密【并解压】后不得包含指定金丝雀（argv[2]）。
+// chunk 明文是 gzip(JSON)——不解压直接搜字符串必然搜不到（第三轮验证 P1：恒真漏报）。
 // 需要 vault 密钥——从 argv[3]（recovery 材料）或环境 CAIRN_VERIFY_RECOVERY 读取。
+import { gunzipSync } from 'node:zlib';
 import { ObsRemoteStore } from '../src/sync/obs-store.js';
 import { importRecoveryMaterial, deriveSpaceKey, decryptObject } from '../src/sync/cryptoutil.js';
 
@@ -33,7 +35,6 @@ for (const key of all) {
   const bytes = await store.getObject(rel);
   if (!bytes) continue;
   if (rel.endsWith('/manifest.json')) {
-    // manifest 的 objectId 形如 manifest.json|<device>；从 rel 解析
     const m = rel.match(/devices\/([^/]+)\/manifest\.json$/);
     if (!m) continue;
     const plain = decryptObject(bytes, spaceKeyBytes, { vaultId: keys.vaultId, spaceId: 'personal-global', kind: 'manifest', objectId: `manifest.json|${m[1]}` });
@@ -45,8 +46,10 @@ for (const key of all) {
     continue;
   }
   const plain = decryptObject(bytes, spaceKeyBytes, { vaultId: keys.vaultId, spaceId: 'personal-global', kind: 'chunk', objectId: rel });
+  // chunk 明文是 gzip(JSON)：必须解压后再比对，否则恒不命中（漏报）
+  const unzipped = gunzipSync(Buffer.from(plain));
   checked++;
-  if (Buffer.from(plain).toString('utf8').includes(canary)) {
+  if (unzipped.toString('utf8').includes(canary)) {
     console.error('LEAK in chunk:', rel);
     process.exit(1);
   }

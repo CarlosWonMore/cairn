@@ -494,6 +494,8 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   plan create|show|list         治理计划（create 需 --items-file，零写入）
   approve <plan-id>             本地签发一次性审批（绑定 plan_hash，30 分钟有效）
   apply <plan-id> --approval X  消费审批并幂等应用计划
+  vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd）
+  sync push|pull                加密同步上行 / 下行（详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复
   doctor                        健康检查 [--host <agent>]（诚实分级，无模型无云端核心可用）
   status                        库状态摘要

@@ -31,7 +31,8 @@ export function buildRemoteStore(vault: VaultConfig): RemoteStore {
     if (!vault.syncd) throw err('E_VALIDATION', 'vault.json 缺少 syncd 配置');
     const token = env[ENV.syncdToken];
     if (!token) throw err('E_FORBIDDEN', `缺少环境变量 ${ENV.syncdToken}`);
-    return newSyncdStore({ baseUrl: vault.syncd.baseUrl, token });
+    // vault 段并入键空间（与 OBS 布局对齐）：同一 syncd 多 vault 互不可见
+    return newSyncdStore({ baseUrl: vault.syncd.baseUrl, token, prefix: `vaults/${vault.vaultId}/` });
   }
   throw err('E_VALIDATION', `未知 provider: ${String((vault as { provider?: string }).provider)}`);
 }

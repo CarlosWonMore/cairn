@@ -81,6 +81,8 @@ const server = createServer((req, res) => {
         if (entry.isDirectory()) {
           walk(full, topLevel);
         } else {
+          // 跳过旁路元数据与原子写残留：它们不是同步对象
+          if (entry.name.endsWith('.gen') || entry.name.includes('.tmp-')) continue;
           const rel = full.slice(normalize(join(DATA_DIR, topLevel)).length + 1).split('\\').join('/');
           if (rel.startsWith(rawPrefix)) keys.push(rel);
         }
@@ -125,14 +127,20 @@ const server = createServer((req, res) => {
       req.on('end', () => {
         const body = Buffer.concat(chunksIn);
         if (path.startsWith('/manifests/')) {
-          // 代次 CAS：X-Cairn-Generation 必须大于当前（回退 409）
+          // 代次 CAS：X-Cairn-Generation 必须大于当前（回退 409）。
+          // 当前代次读【旁路 .gen 文件】——真实客户端的 manifest 是加密字节，
+          // JSON.parse 恒抛会让 CAS 形同虚设（第三轮验证 P2）；.gen 缺失时
+          // 兼容尝试明文 JSON（仅历史遗留路径）。
           const genHeader = Number(req.headers['x-cairn-generation'] ?? '-1');
           if (!Number.isFinite(genHeader) || genHeader < 1) {
             send(res, 400, 'missing X-Cairn-Generation');
             return;
           }
+          const genFile = `${full}.gen`;
           let current = 0;
-          if (existsSync(full)) {
+          if (existsSync(genFile)) {
+            current = Number(readFileSync(genFile, 'utf8').trim()) || 0;
+          } else if (existsSync(full)) {
             try {
               current = JSON.parse(readFileSync(full, 'utf8')).generation ?? 0;
             } catch {
@@ -143,6 +151,14 @@ const server = createServer((req, res) => {
             send(res, 409, JSON.stringify({ error: 'generation_regression', current }), { 'content-type': 'application/json' });
             return;
           }
+          mkdirSync(dirname(full), { recursive: true });
+          // 原子写：tmp + rename；代次落旁路文件（正文可以是任意密文字节）
+          const tmp = `${full}.tmp-${process.pid}-${Date.now()}`;
+          writeFileSync(tmp, body);
+          renameSync(tmp, full);
+          writeFileSync(`${full}.gen`, String(genHeader));
+          send(res, 200, JSON.stringify({ ok: true, bytes: body.byteLength, generation: genHeader }), { 'content-type': 'application/json' });
+          return;
         }
         mkdirSync(dirname(full), { recursive: true });
         // 原子写：tmp + rename

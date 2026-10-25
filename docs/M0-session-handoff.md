@@ -267,3 +267,15 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 - ECS 自连 Tailscale IP 每请求有秒级开销（文档建议回环/内网直连）。
 - ECS 上曾修复 DNS（/etc/systemd/resolved.conf.d/cairn-verify-dns.conf，可逆）；OBS 主账号 AK/SK 经环境变量注入，建议后续换 IAM 子用户。
 - 全量测试曾出现的并发冷启动失败已在归档后修复（见追加二），本轮 5 连续全绿基线成立。
+
+
+# 2026-10-25 追加（四）：第三轮云同步验证问题修复
+
+第三轮独立验证（docs/verify-cloud-sync-2026-10-25.md）确认主线成立（冷启动修复有效、真实 OBS/syncd 可用），但发现 2 个 P1 + 1 个 P2 + 1 组 P3，全部已修复并复验：
+
+1. **P1 syncd 无 vault 隔离**：第二 vault 的存在会让 pull 整链 auth_tag_invalid。修复：vaults/<vaultId>/ 键前缀（与 OBS 对齐）+ pull 对外来/不可解密对象降级跳过并审计。现场复现验证通过（ECS 上双 vault 并存，vault1 同步不受影响、新事件照常流通）。
+2. **P1 泄漏审计恒真**：chunk 明文是 gzip(JSON)，不解压直接搜金丝雀必然搜不到。修复：审计解压后比对 + 反向注入对照用例（故意注入必须被检出）。
+3. **P2 代次 CAS 对真实密文失效**：服务器 JSON.parse 密文恒抛导致 CAS 形同虚设。修复：代次旁路 .gen 文件；二进制 body 回归锁定 409。
+4. **P3**：--help/README/AGENTS/cairn-sync.md 对齐；OBS 桶清理 12 个遗留验证对象，验证脚本增加收尾 purge（桶 cairn/ 现已清空）；ECS 按新布局重新部署。
+
+测试基线：388 项（新增 3 项第三轮回归）连续 3 轮全绿。syncd 键布局含 vaults/ 段为**破坏性变更**，旧验证数据已清空重建。变更仍未 archive，建议第四轮复核后再归档。

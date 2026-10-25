@@ -1,11 +1,12 @@
 import { test } from 'node:test';
+import { gunzipSync } from 'node:zlib';
 import assert from 'node:assert/strict';
 import { RemoteStore } from '../../src/jobs/remote.js';
 import { generateVaultKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys, decryptObject, deriveSpaceKey, encryptObject } from '../../src/sync/cryptoutil.js';
 import { VaultConfig } from '../../src/sync/vault.js';
 import { syncPush } from '../../src/sync/push.js';
 import { syncPull } from '../../src/sync/pull.js';
-import { packChunk } from '../../src/sync/events.js';
+import { packChunk, SyncEvent } from '../../src/sync/events.js';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
 import { openStore, CairnStore } from '../../src/store/open.js';
 import { sha256Hex, normalizeContent } from '../../src/core/hash.js';
@@ -227,27 +228,86 @@ test('协议：local_only 内容被物理排除（远端解密核查）', async 
       { id: 'j2', entityId: lm.id },
     ] });
     assert.ok(r && r.eventCount === 1, `只应打包 1 条，实际 ${r?.eventCount}`);
-    // 远端全部对象解密后不含 local_only 正文（chunk 与 manifest 都核查）
-    const spaceKeyBytes = deriveSpaceKey(a.keys.vaultKey, 'personal-global');
-    let chunkCount = 0;
-    for (const [key, bytes] of remote.objects) {
-      const rel = key; // MemRemote 键即相对形态
-      if (rel.endsWith('/manifest.json')) {
-        const device = rel.slice('personal-global/devices/'.length, rel.length - '/manifest.json'.length);
-        const manifest = JSON.parse(Buffer.from(decryptObject(bytes, spaceKeyBytes, { vaultId: vault.vaultId, spaceId: 'personal-global', kind: 'manifest', objectId: `manifest.json|${device}` })).toString('utf8')) as { chunks: unknown[] };
-        assert.ok(Array.isArray(manifest.chunks));
-        continue;
-      }
-      const plain = decryptObject(bytes, spaceKeyBytes, { vaultId: vault.vaultId, spaceId: 'personal-global', kind: 'chunk', objectId: rel.slice('personal-global/'.length) });
-      chunkCount++;
-      assert.ok(!Buffer.from(plain).toString('utf8').includes('SECRET-LOCAL-9f3a'), '远端 chunk 不含 local_only 正文');
-    }
-    assert.ok(chunkCount >= 1, '至少核查了一个 chunk');
+    // 远端全部对象解密【并解压】后不含 local_only 正文（chunk 与 manifest 都核查）。
+    // chunk 明文是 gzip(JSON)——不解压直接搜恒不命中（第三轮验证 P1 的恒真漏报）。
+    const audit = makeRemoteCanaryAudit(remote, a, vault);
+    const scan1 = audit('SECRET-LOCAL-9f3a');
+    assert.equal(scan1.chunkCount >= 1, true, '至少核查了一个 chunk');
+    assert.equal(scan1.hit, false, '远端 chunk 不含 local_only 正文');
   } finally {
     a.store.close();
     cleanupTestHome(a.home);
   }
 });
+
+test('协议：泄漏审计反向对照——故意注入 local_only 事件必须被检出（审计不是恒真）', async () => {
+  const remote = new MemRemote();
+  const a = newDevice();
+  const vault = vaultFor(a.keys);
+  try {
+    // 用与产品完全相同的打包/加密路径，构造一个【含金丝雀】的 chunk 放进远端
+    const canary = 'INJECTED-LOCAL-ONLY-c7e9';
+    const ev: SyncEvent = {
+      deviceId: 'dev-attacker',
+      seq: 1,
+      type: 'memory_upsert',
+      memoryId: 'mem-canary',
+      occurredAt: new Date().toISOString(),
+      payload: {
+        revisionId: 'rev-canary',
+        content: `假装被误打包的 local_only 内容 ${canary}`,
+        contentHash: contentHashOf(`假装被误打包的 local_only 内容 ${canary}`),
+        parentHash: null,
+        kind: 'fact',
+        authority: 'user_explicit',
+        scopeId: 'personal-global',
+        sensitivity: 'normal',
+        confidence: 1,
+        observedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        expiresAt: null,
+        sourceAgent: null,
+        createdBy: 'test',
+        reason: null,
+      },
+    };
+    const packed = packChunk('dev-attacker', [ev]);
+    remote.objects.set(`personal-global/${packed.meta.key}`, sealFor(a, packed.plaintext, packed.meta.key, 'chunk'));
+    const audit = makeRemoteCanaryAudit(remote, a, vault);
+    const scan = audit(canary);
+    assert.equal(scan.hit, true, '注入的金丝雀必须被检出——证明审计具备发现泄漏的能力');
+    assert.ok(scan.chunkCount >= 1);
+  } finally {
+    a.store.close();
+    cleanupTestHome(a.home);
+  }
+});
+
+/**
+ * 远端金丝雀审计（与 scripts/obs-no-local-leak.mts 同语义）：
+ * 解密 + 【gunzip】后搜索。返回命中与否与核查过的 chunk 数。
+ */
+function makeRemoteCanaryAudit(remote: MemRemote, device: Device, vault: VaultConfig): (canary: string) => { hit: boolean; chunkCount: number } {
+  return (canary: string) => {
+    const spaceKeyBytes = deriveSpaceKey(device.keys.vaultKey, 'personal-global');
+    let hit = false;
+    let chunkCount = 0;
+    for (const [key, bytes] of remote.objects) {
+      const rel = key;
+      if (rel.endsWith('/manifest.json')) {
+        const dev = rel.slice('personal-global/devices/'.length, rel.length - '/manifest.json'.length);
+        const plain = decryptObject(bytes, spaceKeyBytes, { vaultId: vault.vaultId, spaceId: 'personal-global', kind: 'manifest', objectId: `manifest.json|${dev}` });
+        if (Buffer.from(plain).toString('utf8').includes(canary)) hit = true;
+        continue;
+      }
+      const plain = decryptObject(bytes, spaceKeyBytes, { vaultId: vault.vaultId, spaceId: 'personal-global', kind: 'chunk', objectId: rel.slice('personal-global/'.length) });
+      chunkCount++;
+      const unzipped = gunzipSync(Buffer.from(plain));
+      if (unzipped.toString('utf8').includes(canary)) hit = true;
+    }
+    return { hit, chunkCount };
+  };
+}
 
 test('协议：依赖等待（parentHash 未知不应用、游标不推进）', async () => {
   const remote = new MemRemote();

@@ -118,3 +118,44 @@ test('syncd：Bearer 鉴权与路径穿越防护', async () => {
 });
 
 void makeTestHome;
+
+// ---------------------------------------------------------------------------
+// 第三轮验证回归
+// ---------------------------------------------------------------------------
+
+test('syncd 回归：真实密文 manifest 的代次 CAS（.gen 旁路，二进制 body 也必须 409）', async () => {
+  const s = await startSyncd();
+  try {
+    const key = 'v1/spaces/personal-global/devices/d1/manifest.json';
+    // 二进制密文 body——真实客户端路径（旧实现对 JSON.parse 恒抛的密文上 CAS 失效）
+    const blob1 = Buffer.from([0x01, 0xaa, 0xbb, 0xcc, 0x01, 0x02, 0x03, 0x04]);
+    const p1 = await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, blob1, { 'x-cairn-generation': '1' });
+    assert.equal(p1.status, 200);
+    const again = await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, Buffer.concat([blob1, Buffer.from([9])]), { 'x-cairn-generation': '1' });
+    assert.equal(again.status, 409, '同代次密文重放必须 409');
+    const g = await req(s.baseUrl, s.token, 'GET', `/manifests/${encodeURIComponent(key)}`);
+    assert.deepEqual(g.body.subarray(0, blob1.length), blob1, '被拒的重放没有覆盖原密文');
+    const adv = await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, Buffer.from([0x01, 0xdd]), { 'x-cairn-generation': '2' });
+    assert.equal(adv.status, 200);
+    const back = await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, blob1, { 'x-cairn-generation': '1' });
+    assert.equal(back.status, 409, '代次回退必须 409');
+    const zero = await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, blob1, { 'x-cairn-generation': '0' });
+    assert.equal(zero.status, 400, '代次 <1 视为缺省头（400），不进入 CAS');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('syncd 回归：/list 不泄漏 .gen 与 .tmp 残留', async () => {
+  const s = await startSyncd();
+  try {
+    const key = 'v1/devices/x/manifest.json';
+    await req(s.baseUrl, s.token, 'PUT', `/manifests/${encodeURIComponent(key)}`, Buffer.from('sealed'), { 'x-cairn-generation': '1' });
+    const l = await req(s.baseUrl, s.token, 'GET', `/list?prefix=${encodeURIComponent('v1/')}`);
+    const keys = (JSON.parse(l.body.toString('utf8')) as { keys: string[] }).keys;
+    assert.ok(keys.includes(key), 'manifest 在列');
+    assert.equal(keys.some((k) => k.endsWith('.gen') || k.includes('.tmp-')), false, '旁路文件不进列举');
+  } finally {
+    await s.stop();
+  }
+});

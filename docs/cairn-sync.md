@@ -5,7 +5,7 @@
 ## 模型
 
 - 本地 SQLite 永远是权威副本；云端只是【加密中继】——云端只见密文（XChaCha20-Poly1305，AAD 绑定 vault/space/对象标识），不存密钥。
-- 同步单位是每设备每空间的追加事件链：chunk 内容寻址不可变，manifest 单写者发布、headSeq 防回退；先传 chunk 后发布 manifest。
+- 同步单位是每设备每空间的追加事件链：chunk 内容寻址不可变，manifest 单写者发布、headSeq 防回退（syncd 侧另有服务器端代次 CAS）；先传 chunk 后发布 manifest。
 - local_only 与设备限定内容在打包前被物理排除（outbox 触发器 + 打包层双保险），可用"列举远端全部对象解密核查"独立验证。
 - 合并沿用修订链保守合并：已知修订幂等跳过；父哈希未知等待依赖；并发修改保留双方进入冲突队列；遗忘跨设备传播。
 - 同步退出会话关键路径：由显式命令 / `worker run-once` 触发，失败只留下可重试状态。
@@ -45,7 +45,8 @@ CAIRN_SYNCD_DATA=/var/lib/cairn-syncd node syncd/cairn-syncd.mjs
 npm run cli -- vault init-remote --provider syncd --base-url http://<内网IP>:8471
 ```
 
-- 单用户单 vault；chunk 幂等上传；manifest 代次 CAS（回退 409）；Bearer 鉴权；防路径穿越。
+- 单用户多 vault：每个 vault 的键空间互相隔离（`vaults/<vaultId>/` 前缀，与 OBS 布局对齐）；外来/不可解密的 manifest 在 pull 时降级为跳过 + 审计，不影响本 vault。
+- chunk 幂等上传；manifest 代次 CAS 经旁路 `.gen` 元数据执行（对真实密文同样生效，回退 409）；Bearer 鉴权；防路径穿越。
 - 数据目录备份由运维负责；云端（OBS/syncd）损坏可从本地权威库全量重推。
 - 提示：syncd 所在主机上的客户端建议配置独立监听或使用回环地址——自连 Tailscale IP 每次请求有秒级开销（实测）。
 

@@ -24,6 +24,8 @@ export interface PullDeviceResult {
   appliedBefore: number;
   outcome: ApplyOutcome | null;
   waited: number;
+  /** 该设备被跳过的原因（外来 vault / 密文不可解密），不致命。 */
+  skippedReason?: string;
 }
 
 export interface PullResult {
@@ -99,7 +101,20 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
     const sealed = await remote.getManifest(spaceKey, deviceId);
     if (!sealed) continue;
     if (!(sealed instanceof Uint8Array)) throw err('E_VALIDATION', '远端 manifest 不是字节对象');
-    const manifest = decryptManifestDoc(sealed, keys.vaultKey, vault.vaultId, spaceKey, deviceId);
+    // 第三轮验证 P1：外来 vault / 密钥不匹配的 manifest 解密必然失败——
+    // 降级为跳过 + 审计（不是密钥损坏，不能让本 vault 的同步停摆）
+    let manifest: ManifestDoc;
+    try {
+      manifest = decryptManifestDoc(sealed, keys.vaultKey, vault.vaultId, spaceKey, deviceId);
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === 'E_VALIDATION') {
+        store.audit.record('sync', 'manifest_skipped', { type: 'system', id: deviceId }, { reason: 'foreign_vault_or_undecryptable' });
+        results.push({ deviceId, headSeq: 0, appliedBefore: 0, outcome: null, waited: 0, skippedReason: 'foreign_vault_or_undecryptable' });
+        continue;
+      }
+      throw e;
+    }
     const cursor = getCursor(store, spaceKey, deviceId);
     if (manifest.headSeq <= cursor) {
       results.push({ deviceId, headSeq: manifest.headSeq, appliedBefore: 0, outcome: null, waited: 0 });
@@ -108,6 +123,7 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
     // 取 (cursor, headSeq] 覆盖的 chunk
     const chunks: ChunkMeta[] = manifest.chunks.filter((c) => c.seqTo > cursor && c.seqFrom <= manifest.headSeq).sort((a, b) => a.seqFrom - b.seqFrom);
     const events: SyncEvent[] = [];
+    let chunkSkip = false;
     for (const meta of chunks) {
       const sealedChunk = await remote.getObject(chunkObjectKey(spaceKey, meta));
       if (!sealedChunk) {
@@ -115,7 +131,22 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
         store.audit.record('sync', 'chunk_missing', { type: 'system', id: meta.key }, { device: deviceId });
         break;
       }
-      events.push(...decryptChunk(sealedChunk, keys.vaultKey, vault.vaultId, spaceKey, meta, deviceId));
+      try {
+        events.push(...decryptChunk(sealedChunk, keys.vaultKey, vault.vaultId, spaceKey, meta, deviceId));
+      } catch (e) {
+        const code = (e as { code?: string }).code;
+        if (code === 'E_VALIDATION') {
+          // 单个 chunk 不可解密（外来/损坏）：跳过该设备本轮，不拖垮整链
+          store.audit.record('sync', 'chunk_skipped', { type: 'system', id: meta.key }, { device: deviceId, reason: 'undecryptable' });
+          chunkSkip = true;
+          break;
+        }
+        throw e;
+      }
+    }
+    if (chunkSkip) {
+      results.push({ deviceId, headSeq: manifest.headSeq, appliedBefore: 0, outcome: null, waited: 0, skippedReason: 'undecryptable_chunk' });
+      continue;
     }
     // 按序应用
     events.sort((a, b) => a.seq - b.seq);

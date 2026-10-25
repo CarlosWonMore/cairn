@@ -47,3 +47,18 @@
 - OBS getManifest 把密文当 JSON 解析 / putManifest 把字节 JSON 化 → 改为原始字节语义；manifest 键补 devices/ 段。
 - syncd /list 虚拟键空间（chunks/ manifests/ 物理分目录合并）；syncd 网络错误卫生（syncd_network_error）。
 - putImmutable hash 参数语义 = 传输字节哈希；syncPush 失败复位已领取任务为 pending。
+
+
+## 第三轮独立验证后的修复（2026-10-25，docs/verify-cloud-sync-2026-10-25.md）
+
+| 问题 | 修复 | 回归证据 |
+|---|---|---|
+| P1 syncd 无 vault 隔离（第二 vault 使 pull 整链 auth_tag_invalid） | 客户端把 vaults/<vaultId>/ 并入 syncd 键空间（与 OBS 布局对齐，list 返回相对键）；pull 对不可解密 manifest/chunk 降级为跳过+审计（skippedReason），不再整链失败 | tests/sync/syncd-multivault.test.ts（真实服务器进程，双 vault 互不可见、pull 不受干扰） |
+| P1 local_only 密文审计恒真（gzip 未解压） | 审计脚本与 protocol 测试改为解密后 gunzip 再比对；新增【反向注入对照】：故意打进金丝雀的 chunk 必须被检出 | tests/sync/protocol.test.ts 泄漏审计反向对照用例 |
+| P2 syncd 代次 CAS 在真实密文下失效（JSON.parse 恒抛） | 代次落旁路 .gen 文件（服务器端，不依赖 body 可解析；.gen/.tmp 不进 /list） | tests/sync/syncd.test.ts 真实密文二进制 body 的 409 回归 |
+| P3 文档/命令面漂移 | --help 补 vault/sync；README/AGENTS 状态行更新；cairn-sync.md 更新 CAS 与多 vault 语义 | 人工核对 |
+| P3 OBS 遗留对象 | obs-purge-prefix.mts（带 cairn/ 护栏）清理 12 个遗留对象；verify-real-obs.mts 增加步骤 8 teardown-purge（验证对象跑完即清） | 重跑 9 步全绿，桶 cairn/ 前缀清空 |
+
+- 修复后真实验证：OBS 9 步 PASSED（含修复后审计与收尾清理）；ECS 重新部署（新布局）后跨平台双向 PASSED；**P1 场景现场复现**：同 syncd 上创建第二个 vault 并推送后，vault1 的 ECS pull 照常成功且新事件持续流通（third-round-fix-live-verification.json）。
+- 全量测试 388 项（388/0/1 skip），连续 3 轮 exit 0。
+- 布局变更说明：syncd 键空间现含 vaults/ 段；旧布局数据已随重新部署清空（验证数据抛弃型）。

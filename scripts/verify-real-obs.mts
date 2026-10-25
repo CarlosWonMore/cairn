@@ -123,6 +123,14 @@ try {
   if (d.remoteProvider !== 'obs') fail('doctor-provider', `期望 obs，实际 ${String(d.remoteProvider)}`);
   results.push({ step: 'doctor-verified', ok: true, remote: d.remote, provider: d.remoteProvider });
 
+  // 步骤 8：收尾清理——删除本轮 vault 的全部远端对象（第三轮验证 P3：
+  // 反复验证会在桶里堆积遗留 vault；验证数据是抛弃型的，跑完即清）
+  const purgeScript = join(ROOT, 'scripts', 'obs-purge-prefix.mts');
+  r = spawnSync(process.execPath, ['--import', 'tsx', purgeScript, vaultPrefix], { encoding: 'utf8', env: { ...process.env, ...obsEnv, OBS_PREFIX: vaultPrefix } });
+  if (r.status !== 0) fail('teardown-purge', (r.stdout ?? '') + (r.stderr ?? ''));
+  const purged = JSON.parse(r.stdout) as { deleted: number };
+  results.push({ step: 'teardown-purge', ok: true, deleted: purged.deleted });
+
   console.log(JSON.stringify({ verified: true, results }, null, 2));
 } finally {
   // 清理本地临时目录；远端 cairn/ 对象保留（由用户决定清理时机）

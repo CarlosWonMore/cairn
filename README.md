@@ -12,7 +12,7 @@
 
 ## 状态
 
-**本地 MVP 已实现；296 项测试全部通过（npm test exit 0），经两轮独立验证复核（第一轮发现的问题已修复，第二轮确认并发冷启动缺陷并已修复，详见 `docs/M0-session-handoff.md` §7）。OpenSpec 变更 `add-local-first-memory-mvp` 已归档（2026-10-25），规格见 `openspec/specs/`。**无模型、无云端、单机。
+**本地 MVP 已实现并归档（`add-local-first-memory-mvp`，规格见 `openspec/specs/`）；云同步变更 `add-real-cloud-sync` 已实现并在真实环境验证（华为云 OBS + 阿里云 ECS，见 `docs/cairn-sync.md` 与 `docs/M0-session-handoff.md`）。全量测试 385 项（1 项真实云端门控用例），经三轮独立验证复核。**无模型依赖；云端为可选加密中继。
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
 - 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。
