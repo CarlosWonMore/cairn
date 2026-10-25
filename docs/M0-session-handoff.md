@@ -279,3 +279,12 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 4. **P3**：--help/README/AGENTS/cairn-sync.md 对齐；OBS 桶清理 12 个遗留验证对象，验证脚本增加收尾 purge（桶 cairn/ 现已清空）；ECS 按新布局重新部署。
 
 测试基线：388 项（新增 3 项第三轮回归）连续 3 轮全绿。syncd 键布局含 vaults/ 段为**破坏性变更**，旧验证数据已清空重建。变更仍未 archive，建议第四轮复核后再归档。
+
+
+# 2026-10-25 追加（五）：add-real-cloud-sync 归档
+
+第四轮归档门禁（docs/verify-cloud-sync-round4-2026-10-25.md，自验性质已注明）：全量测试连续 5 轮 388/0/1 全绿；专项回归（双 vault 隔离、密文 CAS、泄漏审计反对照、冷启动）3 轮全绿；ECS syncd 健康；OBS cairn/ 前缀无遗留。`add-real-cloud-sync` 已归档为 `archive/2026-10-25-add-real-cloud-sync`，cloud-sync 规格落入 `openspec/specs/`（6 份规格 strict 校验全过）。
+
+归档时已知边界（未消失）：仅同步 personal-global 空间；macOS 未验证；syncd `vaults/` 键布局为破坏性变更（旧部署需清目录重建 vault）；第四轮为修复会话自验，独立性弱于前三轮外部复核。
+
+仓库状态：main 分支干净，全部推送至 CarlosWonMore/cairn（私有）。
