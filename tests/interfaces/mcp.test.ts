@@ -18,6 +18,7 @@ const SERVER_LOADER = serverTarget.loader;
 interface Probe {
   proc: ChildProcess;
   stdoutText: string;
+  stderrText: string;
   send(obj: unknown): void;
   wait(ms: number): Promise<void>;
   stdoutLines(): unknown[];
@@ -31,6 +32,7 @@ function startServer(home: string): Probe {
   const probe: Probe = {
     proc: p,
     stdoutText: '',
+    stderrText: '',
     send(obj) {
       p.stdin!.write(JSON.stringify(obj) + '\n');
     },
@@ -53,9 +55,19 @@ function startServer(home: string): Probe {
     },
   };
   p.stdout!.on('data', (c) => (probe.stdoutText += String(c)));
-  // stderr 输出只进测试诊断，不进 stdout 断言
-  p.stderr!.on('data', (c) => process.stderr.write(`[mcp-stderr] ${String(c).trim()}\n`));
+  // stderr 收集用于就绪判断与诊断（协议输出只走 stdout，stderr 不进纯净断言）
+  p.stderr!.on('data', (c) => (probe.stderrText += String(c)));
   return probe;
+}
+
+/** 等待子进程 stdio 就绪（stderr ready 标记），消除 Windows 管道首写竞态。 */
+async function waitReady(probe: Probe, timeoutMs = 15000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    if (probe.stderrText.includes('stdio server ready')) return;
+    if (Date.now() - start > timeoutMs) throw new Error(`MCP 服务器启动超时；stderr=${probe.stderrText.slice(0, 200)}`);
+    await probe.wait(20);
+  }
 }
 
 function initialize(probe: Probe): void {
@@ -79,13 +91,15 @@ test('MCP：initialize → tools/list → tools/call；stdout 每行均为合法
   const home = makeTestHome();
   const probe = startServer(home);
   try {
+    await waitReady(probe);
     initialize(probe);
     probe.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-    await probe.wait(400);
     probe.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory_add', arguments: { content: '合同测试的记忆内容', kind: 'fact' } } });
     probe.send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory_search', arguments: { query: '合同测试' } } });
     probe.send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'memory_propose', arguments: { content: '推断候选：看起来用户使用 Node 24' } } });
-    await probe.wait(600);
+    // 等全部响应到达（轮询而非固定睡眠；慢启动环境不竞态）
+    const init = await responseOf(probe, 1) as { result?: { serverInfo?: { name?: string } } };
+    for (const id of [2, 3, 4, 5]) await responseOf(probe, id);
 
     // stdout 纯净：每行都是合法 JSON（无日志/警告/异常文本混入）
     const lines = probe.stdoutLines();
@@ -94,7 +108,6 @@ test('MCP：initialize → tools/list → tools/call；stdout 每行均为合法
       const parsed = JSON.parse(String(l)); // 抛错即失败
       assert.ok('jsonrpc' in parsed || parsed !== null);
     }
-    const init = await responseOf(probe, 1) as { result?: { serverInfo?: { name?: string } } };
     assert.equal(init.result?.serverInfo?.name, 'cairn');
     const list = await responseOf(probe, 2) as { result?: { tools?: { name: string }[] } };
     const names = (list.result?.tools ?? []).map((t) => t.name);
@@ -121,10 +134,10 @@ test('MCP：秘密内容 → isError 工具结果且不回显；非法工具名�
   const home = makeTestHome();
   const probe = startServer(home);
   try {
+    await waitReady(probe);
     initialize(probe);
     probe.send({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'memory_add', arguments: { content: 'api_key = "sk-live-abcdef123456"' } } });
     probe.send({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'no_such_tool', arguments: {} } });
-    await probe.wait(600);
     const refused = await responseOf(probe, 10) as { result?: { isError?: boolean; content?: { text: string }[] } };
     assert.equal(refused.result?.isError, true, '治理拒绝标记为工具错误');
     const body = JSON.parse(refused.result!.content![0]!.text) as { code?: string };
@@ -155,9 +168,13 @@ test('MCP：客户端断开后服务器退出，本地库仍可被 CLI 使用（
     });
 
   const probe = startServer(home);
+  await waitReady(probe);
   initialize(probe);
   probe.send({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'memory_add', arguments: { content: 'MCP 会话期间写入的记忆' } } });
-  await probe.wait(500);
+  // 等写入响应确认落库后再断开（固定睡眠在慢启动环境会杀死尚未发生的写入）
+  const added = await responseOf(probe, 20) as { result?: { content?: { text: string }[] } };
+  const addBody = JSON.parse(added.result!.content![0]!.text) as { id: string };
+  assert.ok(addBody.id, 'memory_add 已确认');
   const exited = probe.kill();
   await exited;
   assert.ok(true, '服务器随客户端断开退出（kill 路径）');
@@ -174,9 +191,9 @@ test('MCP：无批次时不暴露 onboarding 工具（按需工具面）', async
   const home = makeTestHome();
   const probe = startServer(home);
   try {
+    await waitReady(probe);
     initialize(probe);
     probe.send({ jsonrpc: '2.0', id: 30, method: 'tools/list' });
-    await probe.wait(400);
     const list = await responseOf(probe, 30) as { result?: { tools?: { name: string }[] } };
     const names = (list.result?.tools ?? []).map((t) => t.name);
     assert.ok(!names.includes('onboarding_next_batch'), '空库不暴露 onboarding 工具');

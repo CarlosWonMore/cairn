@@ -97,7 +97,7 @@ MVP 采用 Node 22 自带 `node:sqlite`，要求经过当前 Node 小版本验�
 
 ### D9：MCP 是短生命周期接口，独立 worker 拥有后台任务
 
-MCP stdio 只执行有界本地读写和任务入队，退出前不要求完成同步、抽取或维护。`ai-memory worker run-once` 与显式 CLI 后续处理 outbox；默认不安装 SessionStart/SessionEnd 同步 hook。
+MCP stdio 只执行有界本地读写和任务入队，退出前不要求完成同步、抽取或维护。`cairn worker run-once` 与显式 CLI 后续处理 outbox；默认不安装 SessionStart/SessionEnd 同步 hook。
 
 所有外部等待在未来都必须有 AbortSignal、超时、重试上限和退避；本变更先用故障注入 worker 验证崩溃、超时与进程退出不会影响模拟 Agent 会话。stdio stdout 仅由 MCP SDK 写协议，应用日志统一走 stderr/文件。
 

@@ -12,7 +12,7 @@
 
 ## 状态
 
-**本地 MVP 已实现并通过全部测试**（OpenSpec 变更 `add-local-first-memory-mvp`，无模型、无云端、单机）。
+**本地 MVP 已实现并通过全部测试（296 项，npm test exit 0，经独立验证报告复核）**（OpenSpec 变更 `add-local-first-memory-mvp`，无模型、无云端、单机）。
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
 - 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。

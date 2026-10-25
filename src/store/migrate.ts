@@ -31,6 +31,8 @@ function setVersion(db: CairnDb, v: number): void {
 /**
  * 版本化迁移（任务 1.2）：每个迁移独立事务，失败回滚，
  * 数据库停留在旧版本且可再次执行；绝不留下半迁移库。
+ * 并发安全：BEGIN IMMEDIATE 取到写锁【之后】重读版本号，
+ * 多进程同时打开同一新库时只有一方真正建表，另一方幂等跳过。
  * schema 版本高于已知实现时拒绝打开（防旧代码写新库）。
  */
 export function runMigrations(db: CairnDb, migrations: readonly Migration[] = MIGRATIONS): MigrationResult {
@@ -47,12 +49,21 @@ export function runMigrations(db: CairnDb, migrations: readonly Migration[] = MI
   for (const m of migrations) {
     if (m.version <= v) continue;
     try {
+      let appliedThis = false;
       db.transaction(() => {
+        // 持写锁后重读：并发进程可能已在本事务排队期间完成该迁移
+        const current = currentVersion(db);
+        if (m.version <= current) return;
         db.exec(m.sql);
         setVersion(db, m.version);
+        appliedThis = true;
       });
-      applied.push(m.version);
-      v = m.version;
+      if (appliedThis) {
+        applied.push(m.version);
+        v = m.version;
+      } else {
+        v = Math.max(v, m.version);
+      }
     } catch (e) {
       throw err('E_MIGRATION_FAILED', `迁移 ${m.version} (${m.name}) 失败: ${(e as Error).message}`, {
         version: m.version,

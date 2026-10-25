@@ -19,4 +19,5 @@ artifacts/
 
 # 工具本地状态
 .codebuddy/
+.workbuddy/
 .zcode/

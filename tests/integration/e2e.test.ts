@@ -155,45 +155,102 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
       env: { ...process.env, CAIRN_AGENT_ID: agentId },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    const cleanup = (): void => {
+      try { p.stdin?.destroy(); p.stdout?.destroy(); p.stderr?.destroy(); p.unref(); } catch { /* 已销毁 */ }
+    };
     let out = '';
+    let err = '';
     p.stdout!.on('data', (c) => (out += String(c)));
-    p.stderr!.on('data', () => {});
+    p.stderr!.on('data', (c) => (err += String(c)));
+    p.on('error', (e) => (err += `[spawn-error] ${e.message} `));
+    p.stdin!.on('error', (e) => {
+      if (process.env['CAIRN_TEST_DEBUG']) process.stderr.write(`[stdin-error ${agentId}] ${(e as NodeJS.ErrnoException).code}\n`);
+    });
+    p.on('close', (c, sig) => {
+      if (process.env['CAIRN_TEST_DEBUG']) process.stderr.write(`[server ${agentId}] closed code=${c} sig=${sig} stderr=${err.slice(0, 300)}
+`);
+    });
     return {
       p,
       send: (o: unknown) => p.stdin!.write(JSON.stringify(o) + '\n'),
       out: () => out,
+      stderr: () => err,
       wait: (ms: number) => new Promise((r) => setTimeout(r, ms)),
       stop: () => new Promise<void>((r) => {
-        if (p.exitCode !== null || p.signalCode !== null) { r(); return; }
-        p.once('close', () => r());
+        if (p.exitCode !== null || p.signalCode !== null) { cleanup(); r(); return; }
+        p.once('close', () => { cleanup(); r(); });
         p.kill();
+        // 双保险：Windows 上 close 可能延迟，销毁 stdio 并 unref，避免 runner 挂在管道上
+        setTimeout(() => { cleanup(); r(); }, 3000);
       }),
     };
   };
   const a = start('agent-a');
+  // 串行启动：等 a 就绪再拉起 b，避免两个进程同时冷启动争用（迁移已并发安全，这里只减噪）
   const b = start('agent-b');
   const cli = (args: string[]) => runCli(['--home', home, '--json', ...args]);
   const resp = (text: string, id: number) => {
-    const line = text.trim().split('\n').map((l) => String(l)).find((l) => (JSON.parse(l) as { id?: number }).id === id);
-    return line ? (JSON.parse(line) as { result?: { content?: { text: string }[] } }) : null;
+    // 只解析【完整行】（末尾未换行的部分行丢弃）：半截响应 JSON.parse 会崩
+    const lines = text.split('\n').slice(0, -1).filter(Boolean);
+    const line = lines.find((l) => {
+      try {
+        return (JSON.parse(l) as { id?: number }).id === id;
+      } catch {
+        return false;
+      }
+    });
+    try {
+      return line ? (JSON.parse(line) as { result?: { content?: { text: string }[] } }) : null;
+    } catch {
+      return null;
+    }
+  };
+  // 等待子进程 stdio 就绪（stderr 出现 ready 标记），消除 Windows 管道首写竞态
+  const waitReady = async (probe: { stderr?(): string; wait(ms: number): Promise<unknown> }, timeoutMs = 15000) => {
+    const start = Date.now();
+    let dbg = 0;
+    for (;;) {
+      const cur = probe.stderr?.() ?? '';
+      if (process.env['CAIRN_TEST_DEBUG'] && dbg++ < 3) process.stderr.write(`[waitReady] t=${Date.now() - start}ms stderr=${JSON.stringify(cur.slice(0, 120))}
+`);
+      if (cur.includes('stdio server ready')) return;
+      if (Date.now() - start > timeoutMs) throw new Error('MCP 服务器启动超时');
+      await probe.wait(20);
+    }
+  };
+  // 轮询等待指定响应到达（不使用固定睡眠；15s 上限防挂起）
+  const respWait = async (probe: { out(): string; stderr?(): string; wait(ms: number): Promise<unknown> }, id: number, timeoutMs = 15000) => {
+    const start = Date.now();
+    for (;;) {
+      const r = resp(probe.out(), id);
+      if (r) return r;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`等待 id=${id} 响应超时；server stderr=${probe.stderr?.() ?? ''} stdout=${probe.out().slice(0, 300)}`);
+      }
+      await probe.wait(50);
+    }
   };
   try {
+    await waitReady(a);
+    await waitReady(b);
     for (const c of [a, b]) {
       c.send({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
       c.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     }
-    await a.wait(600);
+    await respWait(a, 0);
+    await respWait(b, 0);
     // 客户端 A 写入
     a.send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_add', arguments: { content: '跨客户端共享的事实甲' } } });
     // 客户端 B 写入
     b.send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_add', arguments: { content: '跨客户端共享的事实乙' } } });
-    await a.wait(800);
+    await respWait(a, 1);
+    await respWait(b, 1);
     assert.ok(resp(a.out(), 1)?.result?.content?.[0]?.text, 'A 写入成功');
     assert.ok(resp(b.out(), 1)?.result?.content?.[0]?.text, 'B 写入成功（同一本地库）');
 
     // B 检索到 A 写入的记忆
     b.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_search', arguments: { query: '事实甲' } } });
-    await b.wait(500);
+    await respWait(b, 2);
     assert.ok(JSON.stringify(resp(b.out(), 2)).includes('事实甲'), 'B 能读到 A 的记忆');
 
     // CLI 也可见
@@ -203,7 +260,7 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
     // A 断开 → B 与 CLI 继续可用
     await a.stop();
     b.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory_status', arguments: {} } });
-    await b.wait(500);
+    await respWait(b, 3);
     assert.ok(resp(b.out(), 3), 'B 在 A 断开后继续可用');
     const add2 = await cli(['add', 'A 断开后 CLI 仍可写入']);
     assert.equal(add2.code, 0, add2.stderr);

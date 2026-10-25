@@ -1,7 +1,7 @@
 # AI Memory：M0 会话交接与实施入口
 
 日期：2026-10-24  
-项目目录：`D:\Project\AI Memory`  
+项目目录：`D:\Project\AI MemoryGLM`（2026-10-24 原文写为 AI Memory，迁移后为 AI MemoryGLM）  
 当前阶段：M0 本地可执行验证已完成；首个 OpenSpec 变更已规划，尚未进入产品实现。
 
 ## 1. 一句话结论
@@ -190,7 +190,7 @@ Engram/agentmemory 的归档均不完整；当前只有 26 个 size-matched 源�
 | tests/integration（E2E 3 + 并发 1） | 4 pass |
 | npm pack 全新目录安装 | CLI init/add/search + bin shim + MCP initialize 全通过 |
 
-关键安全断言（负向均有覆盖）：伪造 `user_confirmed` 拒绝；批准后计划篡改/目标推进拒绝；审批一次性重放拒绝；local_only 上行任务物理排除（触发器兜底）；秘密不进日志/DB/导出（masked 摘要）；设备克隆暂停写入。
+关键安全断言（负向均有覆盖）：伪造 `user_confirmed` 拒绝；批准后计划篡改/目标推进拒绝；已应用计划的审批重放幂等短路（alreadyApplied，不消耗审批）；未应用计划的重放拒绝（E_APPROVAL_REPLAY）；local_only 上行任务物理排除（触发器兜底）；秘密不进日志/DB/导出（masked 摘要）；设备克隆暂停写入。
 
 ## 4. 保留的外部边界（不虚标）
 
