@@ -20,7 +20,7 @@ try {
         ok++;
         break;
       } catch (e) {
-        if ((e as { code?: string }).code === 'E_DB_LOCKED' && attempt < 10) {
+        if (['E_DB_LOCKED','E_IO','E_READONLY'].includes((e as { code?: string }).code ?? '') && attempt < 10) {
           await sleep(150 * attempt);
           continue;
         }

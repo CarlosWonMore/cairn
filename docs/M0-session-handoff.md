@@ -209,5 +209,26 @@ Engram/agentmemory 的归档均不完整；当前只有 26 个 size-matched 源�
 ## 6. 新会话如何继续
 
 1. 审阅本文件与 `openspec/changes/add-local-first-memory-mvp/tasks.md` 的验证记录。
-2. 决定是否 `/opsx:verify` + archive 该变更（前提：接受第 4 节边界）。
+2. ~~决定是否 archive~~（已于 2026-10-25 归档；注意 §7 的遗留缺陷修复晚于归档）。
 3. 真实云端同步、跨平台 CI、宿主实机验证分别另立变更提案。
+
+
+# 2026-10-25 追加（二）：第二轮验证与遗留缺陷修复
+
+## 1. 第二轮独立验证结论（docs/verify-add-local-first-memory-mvp-round2-2026-10-25.md）
+
+- 第一轮 3 个 P1 中：包入口、打包卫生彻底修好；MCP 测试竞态修好。
+- **新发现产品缺陷**：多进程同时冷启动同一新库，部分进程在 `openStore` 的 meta/device 写入抛 `SQLITE_READONLY(8)`（约 10–20% 失败率）。根因：`CairnDb.open` 的 `PRAGMA journal_mode = WAL` 与他方建库/加锁交错后连接进入只读状态，`busy_timeout` 不吸收 READONLY。
+- 3 处归档后文档错误（README/config.yaml/handoff 写"尚未 archive"）+ 归档时机过早（修复提交 39 秒后即归档、无稳定性复跑）。
+
+## 2. 修复（本轮）
+
+1. `CairnDb.open`：打开 + journal_mode 校验（必须返回 wal）整体有界重试（5 次，50–250ms），对 SQLITE_READONLY(8)/BUSY(5)/LOCKED(6) 重开连接。
+2. `openStore`：open → migrations → meta → device 序列整体纳入同一重试（关闭连接重开）。
+3. 确定性回归测试 `tests/store/cold-start.test.ts`：独立子进程持未提交写事务 1.2s，父进程 openStore 必须经重试成功并可写入（父线程同步阻塞时 setTimeout 无法触发，故持锁必须在子进程）。
+4. 文档三处修正 + 本节说明。
+
+## 3. 复验结果
+
+- 冷启动回归 4/4；concurrency.test.ts 单文件 6/6；全量 npm test 连续 5 轮全绿（见 git 记录）。
+- Node 22.22.2 已纳入验证（两轮独立验证均在 22 上执行）。

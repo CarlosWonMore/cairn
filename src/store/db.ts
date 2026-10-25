@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { err, isCairnError } from '../core/errors.js';
+import { err, isCairnError, CairnError } from '../core/errors.js';
 
 /**
  * node:sqlite 适配层（design D2）：所有数据库访问经过本类，
@@ -22,21 +22,49 @@ export class CairnDb {
   ) {}
 
   static open(path: string, opts: OpenDbOptions = {}): CairnDb {
-    let raw: DatabaseSync;
-    try {
-      raw = new DatabaseSync(path, { readOnly: opts.readOnly ?? false });
-    } catch (e) {
-      throw err('E_IO', `无法打开数据库 ${path}: ${(e as Error).message}`);
+    // 并发冷启动竞态（第二轮独立验证 P1）：多进程同时首建同一库时，
+    // journal_mode/pragma 可能落入 SQLITE_READONLY/_busy 状态且 busy_timeout
+    // 不吸收，必须重开连接有界重试。
+    const maxAttempts = 5;
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        let raw: DatabaseSync;
+        try {
+          raw = new DatabaseSync(path, { readOnly: opts.readOnly ?? false });
+        } catch (e) {
+          throw err('E_IO', `无法打开数据库 ${path}: ${(e as Error).message}`);
+        }
+        raw.exec(`PRAGMA busy_timeout = ${opts.busyTimeoutMs ?? 5000}`);
+        if (!opts.readOnly) {
+          // journal_mode 校验仅对文件库有意义；:memory: 本来就是 'memory'
+          if (path !== ':memory:') {
+            const modeRow = raw.prepare('PRAGMA journal_mode = WAL').get() as Record<string, unknown> | undefined;
+            const mode = modeRow ? String(Object.values(modeRow)[0]).toLowerCase() : '';
+            if (mode !== 'wal') {
+              raw.close();
+              throw new Error(`journal_mode 竞态得到 '${mode}'（期望 wal）`);
+            }
+          }
+          raw.exec('PRAGMA foreign_keys = ON');
+          raw.exec('PRAGMA synchronous = NORMAL');
+        } else {
+          raw.exec('PRAGMA foreign_keys = ON');
+        }
+        return new CairnDb(raw, path);
+      } catch (e) {
+        lastError = e as Error;
+        if (attempt < maxAttempts && isRetryableSqliteError(e)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
+          continue;
+        }
+        if (e instanceof CairnError) throw e;
+        throw err('E_IO', `无法打开数据库 ${path}: ${(e as Error).message}`, {
+          attempts: attempt,
+        });
+      }
     }
-    raw.exec(`PRAGMA busy_timeout = ${opts.busyTimeoutMs ?? 5000}`);
-    if (!opts.readOnly) {
-      raw.exec('PRAGMA journal_mode = WAL');
-      raw.exec('PRAGMA foreign_keys = ON');
-      raw.exec('PRAGMA synchronous = NORMAL');
-    } else {
-      raw.exec('PRAGMA foreign_keys = ON');
-    }
-    return new CairnDb(raw, path);
+    throw err('E_IO', `无法打开数据库 ${path}: ${(lastError as Error).message}`, { attempts: maxAttempts });
   }
 
   exec(sql: string): void {
@@ -146,4 +174,11 @@ function toParam(p: unknown): SqlParam {
 function isSqliteBusy(e: unknown): boolean {
   const msg = (e as Error).message ?? '';
   return /SQLITE_BUSY|database is locked/i.test(msg) || (isCairnError(e) && e.code === 'E_DB_LOCKED');
+}
+
+/** 冷启动竞态涉及的三类可重试 SQLite 错误（READONLY/BUSY/LOCKED）。 */
+export function isRetryableSqliteError(e: unknown): boolean {
+  if (isCairnError(e) && (e.code === 'E_DB_LOCKED' || e.code === 'E_READONLY')) return true;
+  const msg = `${(e as Error).message ?? ''} ${(e as { errcode?: number }).errcode ?? ''}`;
+  return /SQLITE_READONLY|SQLITE_BUSY|SQLITE_LOCKED|SQLITE_IOERR|attempt to write a readonly|database is locked/i.test(msg);
 }

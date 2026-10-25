@@ -5,7 +5,7 @@ context: |
   All artifacts must be written in zh-CN.
   Keep OpenSpec structural headings and SHALL/MUST keywords in English.
   Project: AI Memory 是面向个人、多设备、多 Agent 的本地优先记忆主权层，不是规格驱动业务平台。
-  Stage: add-local-first-memory-mvp 已完成实现并通过独立验证（296 项测试）；尚未 archive。
+  Stage: add-local-first-memory-mvp 已实现、通过两轮独立验证并归档（2026-10-25）；下一变更为真实 OBS/ECS 云同步。
   Tech stack: TypeScript, Node.js 22+, SQLite/FTS5, MCP stdio, CLI, npm 发布与 npx 试用。
   Evidence: docs/ 保存开发方案与交接结论；artifacts/m0/ 保存探针、测试、CLI 日志和有限范围审计。
   Local authority: 每台设备的本地 SQLite 是可写权威副本；云端仅是可选加密中继与备份。
