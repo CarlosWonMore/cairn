@@ -2,10 +2,10 @@
 
 ## 当前入口
 
-- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 实现完成记录）。
-- `add-local-first-memory-mvp` 已按 tasks 完成实现并通过全部测试（296 项测试）；尚未 archive。
-- 下一入口候选（需用户决定）：OpenSpec verify/archive；真实 ECS/OBS 同步变更；macOS/Linux CI；宿主真实 CLI 验证。
-- 使用文档在 `docs/cairn-usage.md` 与 `docs/cairn-security.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
+- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录）。
+- 两个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）与 `add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）。当前无活跃变更。
+- 下一入口候选（需用户决定）：macOS 平台 CI；宿主真实 CLI 验证；项目/自定义空间的云同步扩展；公开发布准备（private→public、npm 发包、`@cairn/memory` 包名核查）。
+- 使用文档在 `docs/cairn-usage.md`、`docs/cairn-security.md`、`docs/cairn-sync.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
 
 ## 产品与技术边界
 
