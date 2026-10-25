@@ -28,7 +28,8 @@ const VALUE_FLAGS = new Set([
   'home', 'kind', 'scope', 'scope-id', 'project', 'project-name', 'agent', 'agent-id', 'ttl-days',
   'expires', 'status', 'limit', 'out', 'format', 'reason', 'host', 'home-root', 'project-root',
   'mode', 'plan-file', 'mcp-command', 'mcp-args', 'max', 'expected-revision', 'approval', 'ttl',
-  'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch',
+  'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
+  'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
@@ -287,6 +288,12 @@ async function main(): Promise<void> {
           out({ vaultId: r.vault!.vaultId, provider: r.vault!.provider, recovery: r.recovery, warning: '恢复材料请抄写到安全位置；密钥丢失 = 云端数据不可恢复' }, flags);
         } else if (sub === 'status') {
           out(service.vaultStatus(), flags);
+        } else if (sub === 'import-key') {
+          const file = str(flags, 'recovery-file');
+          if (!file) throw new CairnError('E_VALIDATION', '用法: cairn vault import-key --recovery-file <material.txt>');
+          const { readFileSync } = await import('node:fs');
+          service.vaultImportKey(readFileSync(file, 'utf8').trim());
+          out({ imported: true }, flags);
         } else if (sub === 'export-key') {
           const recovery = service.vaultExportKey();
           out({ recovery, warning: '不要提交到任何仓库或发送给他人；密钥丢失 = 云端数据不可恢复' }, flags);

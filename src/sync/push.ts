@@ -40,14 +40,9 @@ export interface PushResult {
   jobs: number;
 }
 
-/** manifest 在远端的 (space, device) 寻址段：`<vaultId>/spaces/<spaceKey>`。 */
-export function manifestSpacePath(vaultId: string, spaceKey: string): string {
-  return `${vaultId}/spaces/${spaceKey}`;
-}
-
-/** chunk 对象的远端相对 key。 */
-function chunkObjectKey(vaultId: string, spaceKey: string, meta: ChunkMeta): string {
-  return `${manifestSpacePath(vaultId, spaceKey)}/${meta.key}`;
+/** chunk 对象的远端相对 key：`<spaceKey>/devices/<dev>/chunks/<seq>-<hash>.bin`。 */
+function chunkObjectKey(spaceKey: string, meta: ChunkMeta): string {
+  return `${spaceKey}/${meta.key}`;
 }
 
 interface PendingJob {
@@ -160,9 +155,8 @@ export async function syncPush(store: CairnStore, remote: RemoteStore, vault: Va
   const spaceKeyBytes = deriveSpaceKey(keys.vaultKey, spaceKey);
 
   // 读自身 manifest（密文，AAD 绑定逻辑标识）
-  const spacePath = manifestSpacePath(vault.vaultId, spaceKey);
   let current: ManifestDoc = emptyManifest(vault.vaultId, spaceKey, device);
-  const sealedManifest = await remote.getManifest(`${spacePath}/devices`, device);
+  const sealedManifest = await remote.getManifest(spaceKey, device);
   if (sealedManifest) {
     if (!(sealedManifest instanceof Uint8Array)) throw err('E_VALIDATION', '远端 manifest 不是字节对象');
     current = decryptManifestDoc(sealedManifest, keys.vaultKey, vault.vaultId, spaceKey, device);
@@ -184,7 +178,7 @@ export async function syncPush(store: CairnStore, remote: RemoteStore, vault: Va
       kind: 'chunk',
       objectId: meta.key,
     });
-    await remote.putImmutable(chunkObjectKey(vault.vaultId, spaceKey, meta), sealed, meta.plaintextSha256);
+    await remote.putImmutable(chunkObjectKey(spaceKey, meta), sealed, meta.plaintextSha256);
     publishedChunks.push(meta);
   }
 
@@ -196,7 +190,7 @@ export async function syncPush(store: CairnStore, remote: RemoteStore, vault: Va
       kind: 'manifest',
       objectId: `manifest.json|${device}`,
     });
-    await remote.putManifest(`${spacePath}/devices`, device, new Uint8Array(sealedNext), next.generation);
+    await remote.putManifest(spaceKey, device, new Uint8Array(sealedNext), next.generation);
     store.db.transaction(() => {
       for (const ev of events) {
         if (ev.type !== 'memory_upsert' || !ev.payload || !('revisionId' in ev.payload)) continue;

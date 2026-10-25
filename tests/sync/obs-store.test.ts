@@ -465,7 +465,7 @@ test('保密：list 403 与 putManifest 错误路径同样不泄密', async () =
 
 // ---- putManifest / getManifest ------------------------------------------
 
-test('putManifest：PUT 到 cairn/<space>/<device>/manifest.json，body 为 JSON，签名含 Content-MD5', async () => {
+test('putManifest：PUT 到 cairn/<space>/devices/<device>/manifest.json，body 为 JSON，签名含 Content-MD5', async () => {
   const manifest = { generation: 7, headSeq: 42, chunks: [{ key: 'a.bin', seqFrom: 1, seqTo: 2 }] };
   const { store, calls } = makeStore((url, init) => {
     const body = init.body as Uint8Array;
@@ -473,7 +473,7 @@ test('putManifest：PUT 到 cairn/<space>/<device>/manifest.json，body 为 JSON
   });
   await store.putManifest('s1', 'd1', manifest, 6);
   const call = calls[0]!;
-  assert.equal(call.url, `${ORIGIN}/cairn/s1/d1/manifest.json`);
+  assert.equal(call.url, `${ORIGIN}/cairn/s1/devices/d1/manifest.json`);
   const sent = new TextDecoder().decode(call.init.body as Uint8Array);
   assert.equal(sent, JSON.stringify(manifest));
   const bodyBytes = new TextEncoder().encode(sent);
@@ -481,7 +481,7 @@ test('putManifest：PUT 到 cairn/<space>/<device>/manifest.json，body 为 JSON
   assert.equal(h['content-type'], 'application/octet-stream');
   assert.equal(
     h['authorization'],
-    expectAuth('PUT', createHash('md5').update(bodyBytes).digest('base64'), 'application/octet-stream', '/cairn-selftest-bucket/cairn/s1/d1/manifest.json'),
+    expectAuth('PUT', createHash('md5').update(bodyBytes).digest('base64'), 'application/octet-stream', '/cairn-selftest-bucket/cairn/s1/devices/d1/manifest.json'),
   );
 });
 
@@ -499,7 +499,7 @@ test('putManifest：expectedGeneration 非负整数约束（负数/非整数 →
 test('getManifest：200 → 解析为对象；404 → null', async () => {
   const manifest = { generation: 3, headSeq: 9 };
   const { store } = makeStore((url) => {
-    if (url.endsWith('/cairn/s1/d1/manifest.json')) {
+    if (url.endsWith('/cairn/s1/devices/d1/manifest.json')) {
       return okResponse(JSON.stringify(manifest), { etag: `"${sha256Hex(JSON.stringify(manifest))}"` });
     }
     return new Response(null, { status: 404 });

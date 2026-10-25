@@ -84,7 +84,9 @@ export function initRemote(store: CairnStore, input: { provider: 'obs' | 'syncd'
     keys = generateVaultKeys();
     saveKeys(store.paths.dataDir, keys);
   }
-  const vault = saveVaultConfig(store.paths.dataDir, { provider: input.provider, obs: input.obs, syncd: input.syncd, vaultId: keys.vaultId });
+  // vault 前缀并入 store prefix（OBS store 的 space/device 必须是单路径段）
+  const obs = input.obs ? { endpoint: input.obs.endpoint, bucket: input.obs.bucket, prefix: `${input.obs.prefix}vaults/${keys.vaultId}/` } : undefined;
+  const vault = saveVaultConfig(store.paths.dataDir, { provider: input.provider, obs, syncd: input.syncd, vaultId: keys.vaultId });
   store.audit.record('sync', 'remote_initialized', { type: 'system', id: vault.vaultId }, { provider: vault.provider });
   return { vault, recovery: exportRecoveryMaterial(keys) };
 }

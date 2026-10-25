@@ -20,7 +20,7 @@
  *
  * key 语义：调用方传入的 key / list prefix / (space, device) 均相对配置的公共 prefix，
  * 本类只做 `prefix + key` 拼接与 URL 编码；chunk/manifest 的协议语义由调用方适配
- * （getManifest(space, device) = getObject(`${space}/${device}/manifest.json`)，putManifest 同理）。
+ * （getManifest(space, device) = getObject(`${space}/devices/${device}/manifest.json`)，putManifest 同理）。
  * OBS 无条件写、无服务端 CAS：manifest 防代次回退由调用方先 GET 自检（design D2）。
  */
 import { createHash, createHmac } from 'node:crypto';
@@ -316,17 +316,12 @@ export class ObsRemoteStore implements RemoteStore {
     return nextCursor === undefined ? { keys } : { keys, nextCursor };
   }
 
-  async getManifest(space: string, device: string): Promise<unknown | null> {
+  async getManifest(space: string, device: string): Promise<Uint8Array | null> {
     this.#assertSegment(space, 'space');
     this.#assertSegment(device, 'device');
-    const manifestKey = `${space}/${device}/manifest.json`;
-    const bytes = await this.getObject(manifestKey);
-    if (bytes === null) return null;
-    try {
-      return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-    } catch {
-      throw err('E_IO', 'obs_manifest_invalid', { key: manifestKey });
-    }
+    // manifest 在调用方（sync 层）是【加密字节】——本层只做字节存取，不做 JSON 解析
+    const manifestKey = `${space}/devices/${device}/manifest.json`;
+    return this.getObject(manifestKey);
   }
 
   async putManifest(space: string, device: string, manifest: unknown, expectedGeneration: number): Promise<void> {
@@ -337,8 +332,8 @@ export class ObsRemoteStore implements RemoteStore {
     }
     // OBS 无条件写、无服务端 CAS：expectedGeneration 仅作契约校验，
     // 防代次回退由调用方先 GET 自检后调用（design D2「自防回退」）。
-    const bytes = new TextEncoder().encode(JSON.stringify(manifest));
-    await this.putImmutable(`${space}/${device}/manifest.json`, bytes, sha256Hex(toBuffer(bytes)));
+    const bytes = manifest instanceof Uint8Array ? manifest : new TextEncoder().encode(JSON.stringify(manifest));
+    await this.putImmutable(`${space}/devices/${device}/manifest.json`, bytes, sha256Hex(toBuffer(bytes)));
   }
 
   /**

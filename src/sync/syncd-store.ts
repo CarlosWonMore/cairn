@@ -58,7 +58,7 @@ export class SyncdRemoteStore implements RemoteStore {
   }
 
   async getManifest(space: string, device: string): Promise<Uint8Array | null> {
-    const key = `${space}/${device}/manifest.json`;
+    const key = `${space}/devices/${device}/manifest.json`;
     const r = await this.req('GET', `/manifests/${encodeURIComponent(key)}`);
     if (r.status === 404) return null;
     if (r.status === 401) throw err('E_FORBIDDEN', 'syncd_auth_failed');
@@ -66,9 +66,9 @@ export class SyncdRemoteStore implements RemoteStore {
     return r.body;
   }
 
-  async putManifest(space: string, device: string, manifest: unknown, expectedGeneration: number): Promise<void> {
-    const key = `${space}/${device}/manifest.json`;
-    const bytes = Buffer.from(manifest as Uint8Array);
+  async putManifest(space: string, device: string, manifest: Uint8Array, expectedGeneration: number): Promise<void> {
+    const key = `${space}/devices/${device}/manifest.json`;
+    const bytes = Buffer.from(manifest);
     const r = await this.req('PUT', `/manifests/${encodeURIComponent(key)}`, new Uint8Array(bytes), {
       'x-cairn-generation': String(expectedGeneration),
     });

@@ -80,16 +80,15 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
   const spaceKey = PERSONAL_SPACE_KEY;
   const keys = loadKeys(store.paths.dataDir);
   if (!keys) throw err('E_VALIDATION', '未找到 vault 密钥（keys.json）；请先 cairn vault init-remote 或导入恢复材料');
-  const spacePath = `${vault.vaultId}/spaces/${spaceKey}`;
   const myDevice = store.identity.deviceId;
 
-  // 发现远端设备：列举 devices/<id>/manifests/manifest.json
-  const listing = await remote.list(`${spacePath}/devices/`);
+  // 发现远端设备：列举 <spaceKey>/devices/<id>/manifest.json
+  const listing = await remote.list(`${spaceKey}/devices/`);
   const manifestSuffix = '/manifest.json';
   const deviceIds = new Set<string>();
   for (const k of listing.keys) {
     if (!k.endsWith(manifestSuffix)) continue;
-    const rel = k.slice(`${spacePath}/devices/`.length);
+    const rel = k.slice(`${spaceKey}/devices/`.length);
     const d = rel.slice(0, rel.indexOf('/'));
     if (d && d !== myDevice) deviceIds.add(d);
   }
@@ -97,7 +96,7 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
   const results: PullDeviceResult[] = [];
   let totalApplied = 0;
   for (const deviceId of deviceIds) {
-    const sealed = await remote.getManifest(`${spacePath}/devices`, deviceId);
+    const sealed = await remote.getManifest(spaceKey, deviceId);
     if (!sealed) continue;
     if (!(sealed instanceof Uint8Array)) throw err('E_VALIDATION', '远端 manifest 不是字节对象');
     const manifest = decryptManifestDoc(sealed, keys.vaultKey, vault.vaultId, spaceKey, deviceId);
@@ -110,7 +109,7 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
     const chunks: ChunkMeta[] = manifest.chunks.filter((c) => c.seqTo > cursor && c.seqFrom <= manifest.headSeq).sort((a, b) => a.seqFrom - b.seqFrom);
     const events: SyncEvent[] = [];
     for (const meta of chunks) {
-      const sealedChunk = await remote.getObject(chunkObjectKey(vault.vaultId, spaceKey, meta));
+      const sealedChunk = await remote.getObject(chunkObjectKey(spaceKey, meta));
       if (!sealedChunk) {
         // chunk 缺失（上传中断于 manifest 之前的孤儿引用）：跳过该 chunk，游标不越过它
         store.audit.record('sync', 'chunk_missing', { type: 'system', id: meta.key }, { device: deviceId });
@@ -142,6 +141,6 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
   return { devices: results, totalApplied };
 }
 
-function chunkObjectKey(vaultId: string, spaceKey: string, meta: ChunkMeta): string {
-  return `${vaultId}/spaces/${spaceKey}/${meta.key}`;
+function chunkObjectKey(spaceKey: string, meta: ChunkMeta): string {
+  return `${spaceKey}/${meta.key}`;
 }

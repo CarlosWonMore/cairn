@@ -22,7 +22,7 @@ import { registerDefaultHandlers, runOnce, RunOnceSummary } from '../jobs/worker
 import { getRemoteStore } from '../jobs/remote.js';
 import { scanText } from '../core/secrets.js';
 import { loadVaultConfig } from '../sync/vault.js';
-import { loadKeys, exportRecoveryMaterial } from '../sync/cryptoutil.js';
+import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } from '../sync/cryptoutil.js';
 import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
@@ -466,6 +466,12 @@ export class AppService {
       syncd: vault?.syncd ?? null,
       keysPresent: keys,
     };
+  }
+
+  vaultImportKey(recovery: string): void {
+    const keys = importRecoveryMaterial(recovery);
+    saveKeys(this.store.paths.dataDir, keys);
+    this.store.audit.record('sync', 'keys_imported', { type: 'system', id: keys.vaultId }, {});
   }
 
   vaultExportKey(): string {
