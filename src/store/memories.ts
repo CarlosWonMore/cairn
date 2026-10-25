@@ -353,6 +353,67 @@ export class MemoryRepository extends WriteGuardMixin {
     return row ? mapMemory(row) : null;
   }
 
+  /** 跨设备记忆身份对齐：任一修订内容哈希命中即视为同一记忆（本地 id 不可跨设备引用）。 */
+  findMemoryIdByRevisionHashes(hashes: string[]): string | null {
+    if (hashes.length === 0) return null;
+    const placeholders = hashes.map(() => '?').join(',');
+    const row = this.db.get(
+      `SELECT memory_id FROM memory_revision WHERE content_hash IN (${placeholders}) LIMIT 1`,
+      ...hashes,
+    );
+    return row ? (row.memory_id as string) : null;
+  }
+
+  /** 修订级内容哈希查找（同步对账用：远端事件的 parent_hash 对齐到本地修订）。 */
+  findRevisionByContentHash(memoryId: string, hash: string): RevisionRecord | null {
+    const row = this.db.get(
+      'SELECT * FROM memory_revision WHERE memory_id = ? AND content_hash = ? ORDER BY seq DESC LIMIT 1',
+      memoryId,
+      hash,
+    );
+    return row ? mapRevision(row) : null;
+  }
+
+  /**
+   * 应用远端修订（同步拉取专用）：插入为该记忆的下一条本地修订，
+   * 不推进 current_revision_id——推进与否由冲突/快进判定决定
+   * （sync 层随后显式 revise 或记录冲突）。
+   */
+  insertRemoteRevision(memoryId: string, input: {
+    content: string;
+    contentHash: string;
+    author: string;
+    reason: string | null;
+    parentLocalRevisionId: string | null;
+    baseRevisionId: string | null;
+  }, deviceId: string): RevisionRecord {
+    this.checkWritable();
+    const mem = this.require(memoryId);
+    const at = nowIso();
+    const seqRow = this.db.get('SELECT MAX(seq) AS s FROM memory_revision WHERE memory_id = ?', memoryId);
+    const seq = Number(seqRow?.s ?? 0) + 1;
+    const revId = uuidv7();
+    this.db.run(
+      `INSERT INTO memory_revision (id, memory_id, seq, parent_revision_ids, content, content_hash, scope_id,
+         status, authority, author, device_id, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+      revId,
+      memoryId,
+      seq,
+      JSON.stringify(input.parentLocalRevisionId ? [input.parentLocalRevisionId] : []),
+      input.content,
+      input.contentHash,
+      mem.scopeId,
+      mem.authority,
+      input.author,
+      deviceId,
+      input.reason,
+      at,
+    );
+    void input.baseRevisionId;
+    return this.requireRevision(revId);
+  }
+
   countsByStatus(): Record<MemoryStatus, number> {
     const out = Object.fromEntries(MEMORY_STATUSES.map((s) => [s, 0])) as Record<MemoryStatus, number>;
     for (const r of this.db.all('SELECT status, COUNT(*) AS n FROM memory GROUP BY status')) {

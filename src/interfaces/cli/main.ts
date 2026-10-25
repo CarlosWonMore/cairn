@@ -61,6 +61,10 @@ function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
   return { flags, positional };
 }
 
+function throwUsage(message: string): string {
+  throw new CairnError('E_VALIDATION', message);
+}
+
 function str(flags: Flags, key: string): string | undefined {
   const v = flags[key];
   return typeof v === 'string' ? v : undefined;
@@ -263,6 +267,45 @@ async function main(): Promise<void> {
 
       case 'status': {
         out(service.status(), flags);
+        break;
+      }
+
+      case 'vault': {
+        const sub = args[0];
+        if (sub === 'init-remote') {
+          const provider = str(flags, 'provider') as 'obs' | 'syncd' | undefined;
+          if (provider !== 'obs' && provider !== 'syncd') throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote --provider obs|syncd [--endpoint URL --bucket B --prefix cairn/] [--base-url URL]');
+          const r = service.vaultInitRemote({
+            provider,
+            obs: provider === 'obs' ? {
+              endpoint: str(flags, 'endpoint') ?? 'https://obs.cn-east-3.myhuaweicloud.com',
+              bucket: str(flags, 'bucket') ?? throwUsage('--bucket 必填'),
+              prefix: str(flags, 'prefix') ?? 'cairn/',
+            } : undefined,
+            syncd: provider === 'syncd' ? { baseUrl: str(flags, 'base-url') ?? throwUsage('--base-url 必填') } : undefined,
+          });
+          out({ vaultId: r.vault!.vaultId, provider: r.vault!.provider, recovery: r.recovery, warning: '恢复材料请抄写到安全位置；密钥丢失 = 云端数据不可恢复' }, flags);
+        } else if (sub === 'status') {
+          out(service.vaultStatus(), flags);
+        } else if (sub === 'export-key') {
+          const recovery = service.vaultExportKey();
+          out({ recovery, warning: '不要提交到任何仓库或发送给他人；密钥丢失 = 云端数据不可恢复' }, flags);
+        } else {
+          throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote|status|export-key');
+        }
+        break;
+      }
+
+      case 'sync': {
+        const sub = args[0];
+        if (sub === 'push') {
+          const r = await service.syncPushCmd();
+          out(r ?? { pushed: false, note: '没有待上行任务' }, flags);
+        } else if (sub === 'pull') {
+          out(await service.syncPullCmd(), flags);
+        } else {
+          throw new CairnError('E_VALIDATION', '用法: cairn sync push|pull');
+        }
         break;
       }
 

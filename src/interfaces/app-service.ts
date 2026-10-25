@@ -21,6 +21,10 @@ import { exportData, ExportInput, ExportOutput } from '../retrieval/export.js';
 import { registerDefaultHandlers, runOnce, RunOnceSummary } from '../jobs/worker.js';
 import { getRemoteStore } from '../jobs/remote.js';
 import { scanText } from '../core/secrets.js';
+import { loadVaultConfig } from '../sync/vault.js';
+import { loadKeys, exportRecoveryMaterial } from '../sync/cryptoutil.js';
+import { nowIso } from '../core/time.js';
+import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
 import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
 import { proposePlan, ProposedItem } from '../governance/propose.js';
@@ -88,7 +92,8 @@ export interface DoctorReport {
     outboxByStatus: Record<string, number>;
     openConflicts: number;
   };
-  remote: 'not_configured';
+  remote: 'not_configured' | 'configured_untested' | 'verified';
+  remoteProvider?: string;
   model: 'not_configured';
   problems: string[];
   notes: string[];
@@ -97,6 +102,15 @@ export interface DoctorReport {
 export class AppService {
   private constructor(public readonly store: CairnStore) {
     registerDefaultHandlers();
+    // vault 已配置时，用真实上行 handler 覆盖诚实失败 handler
+    if (loadVaultConfig(store.paths.dataDir)) {
+      try {
+        const ctx = syncContext(store);
+        if (ctx) registerSyncWorker(store, ctx.remote, ctx.vault);
+      } catch {
+        // 环境变量缺失等：保持诚实失败 handler，doctor 会如实报告
+      }
+    }
   }
 
   static open(home?: string): AppService {
@@ -391,7 +405,24 @@ export class AppService {
       plansByStatus[String(r.status)] = Number(r.n);
     }
     const archiveCounts = store.archives.counts();
-    notes.push('模型未配置（本变更无模型路径）；云端未配置（remote=not_configured）。核心功能不依赖二者。');
+    // remote 三态：not_configured / configured_untested / verified（首次成功往返后置 verified）
+    let remote: DoctorReport['remote'] = 'not_configured';
+    let remoteProvider: string | undefined;
+    const vault = loadVaultConfig(store.paths.dataDir);
+    if (vault) {
+      remoteProvider = vault.provider;
+      try {
+        syncContext(store);
+        const okRow = store.db.get("SELECT value FROM meta WHERE key = 'sync_last_ok'");
+        remote = okRow ? 'verified' : 'configured_untested';
+      } catch (e) {
+        notes.push(`远端已配置但当前不可用：${(e as Error).message.slice(0, 120)}`);
+        remote = 'configured_untested';
+      }
+    }
+    if (remote === 'not_configured') {
+      notes.push('模型未配置（本变更无模型路径）；云端未配置（remote=not_configured）。核心功能不依赖二者。');
+    }
 
     return {
       ok: problems.length === 0,
@@ -408,11 +439,63 @@ export class AppService {
         outboxByStatus: store.outbox.counts(),
         openConflicts: store.conflicts.countOpen(),
       },
-      remote: 'not_configured',
+      remote,
+      remoteProvider,
       model: 'not_configured',
       problems,
       notes,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // 云同步（OpenSpec: add-real-cloud-sync）
+  // -------------------------------------------------------------------------
+
+  vaultInitRemote(input: { provider: 'obs' | 'syncd'; obs?: { endpoint: string; bucket: string; prefix: string }; syncd?: { baseUrl: string } }): { vault: ReturnType<typeof loadVaultConfig>; recovery: string } {
+    return initRemote(this.store, input);
+  }
+
+  vaultStatus(): Record<string, unknown> {
+    const vault = loadVaultConfig(this.store.paths.dataDir);
+    const keys = vault ? Boolean(loadKeys(this.store.paths.dataDir)) : false;
+    return {
+      configured: vault != null,
+      vaultId: vault?.vaultId ?? null,
+      provider: vault?.provider ?? null,
+      obs: vault?.obs ?? null,
+      syncd: vault?.syncd ?? null,
+      keysPresent: keys,
+    };
+  }
+
+  vaultExportKey(): string {
+    const keys = loadKeys(this.store.paths.dataDir);
+    if (!keys) throw err('E_VALIDATION', '未找到 vault 密钥');
+    return exportRecoveryMaterial(keys);
+  }
+
+  async syncPushCmd(): Promise<unknown> {
+    const ctx = this.requireSyncContext();
+    const r = await syncPush(this.store, ctx.remote, ctx.vault);
+    if (r && r.publishedChunks.length > 0) this.markSyncOk();
+    return r;
+  }
+
+  async syncPullCmd(): Promise<unknown> {
+    const ctx = this.requireSyncContext();
+    const r = await syncPull(this.store, ctx.remote, ctx.vault);
+    this.markSyncOk();
+    return r;
+  }
+
+  private requireSyncContext(): SyncContext {
+    const ctx = syncContext(this.store);
+    if (!ctx) throw err('E_VALIDATION', '未配置云端：请先 cairn vault init-remote');
+    return ctx;
+  }
+
+  private markSyncOk(): void {
+    this.store.db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_last_ok', ?)", nowIso());
   }
 
   status(): Record<string, unknown> {
