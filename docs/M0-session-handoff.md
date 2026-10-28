@@ -2,7 +2,7 @@
 
 日期：2026-10-24  
 项目目录：`D:\Project\AI MemoryGLM`（2026-10-24 原文写为 AI Memory，迁移后为 AI MemoryGLM）  
-当前阶段：M0 本地可执行验证已完成；首个 OpenSpec 变更已规划，尚未进入产品实现。
+当前阶段：本文 §1–§5 为 2026-10-24 的规划原文，保留不改；实际进展见文末「追加」各节——两个 OpenSpec 变更均已实现并归档（2026-10-25），2026-10-28 完成宿主 MCP 接入自检。
 
 ## 1. 一句话结论
 
@@ -288,3 +288,21 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 归档时已知边界（未消失）：仅同步 personal-global 空间；macOS 未验证；syncd `vaults/` 键布局为破坏性变更（旧部署需清目录重建 vault）；第四轮为修复会话自验，独立性弱于前三轮外部复核。
 
 仓库状态：main 分支干净，全部推送至 CarlosWonMore/cairn（私有）。
+
+# 2026-10-28 追加（六）：宿主 MCP 接入自检与假绿脚本修复
+
+背景：ZCode 会话积分耗尽中断在「真实 HOME 冒烟」这一步，代码零改动、结论零记录。本轮由 WorkBuddy 独立接续复核，报告见 `docs/verify-host-mcp-2026-10-28.md`。
+
+结论：MCP 接入本身可用——8 工具全链路 12 项断言全过（add→search→get→context→status→update→propose 只落 candidate→forget 墓碑且检索归零），全量测试 389/389 连续 2 轮全绿（Node 22.22.2），`cairn-mcp.cmd` 真实入口 initialize 正常。
+
+修掉的证据缺陷：中断会话留下的 `scripts/mcp-smoke.mjs` 是假绿——按 `body.results` 取值（真实字段是 `items`）必然抛错，而 `finally` 里 `process.exit(0)` 把异常和退出码一起吞掉，表现恒为「零输出 + 退出码 0」。已重写：默认只读真实库、按真实字段取值、退出码分级 0/1/2、`--write` 必须显式 `--home`（写真实库另需 `--allow-real-write`）、新增 `npm run mcp:smoke`。另补 `tests/interfaces/mcp-roundtrip.test.ts`，锁定修订留痕（更正后保留 2 条修订）、墓碑含 reason、遗忘后检索归零，并显式断言 `memory_search` 不再出现 `results` 别名。
+
+待决（未改）：
+- `npm test` 现在会真实访问 OBS（凭据在用户环境变量里，门控用例从 skip 变执行，总数 388→389）。若要保持纯本地可复现，建议改为显式开关 `CAIRN_TEST_REAL_OBS=1`，而非仅凭环境变量存在与否。
+- `memory_propose` 收单个 `{content,kind}`，`onboarding_propose` 收 `items[]`，误用报错为「content 不能为空」，易误判为产品 bug。
+- 宿主注册仍 `blocked`（WorkBuddy 只有 UI 自定义连接器，无公开配置路径），需用户手动或显式授权。
+- 真实库 `~/.cairn` 保留 1 条 active 记忆与 1 条 pending outbox（未配置远端，不上行）——用户确认保留。
+
+下一入口候选（需用户决定）：macOS 平台 CI；项目/自定义空间云同步扩展；`npm test` 与真实云端解耦；公开发布准备（private→public、发包、`@cairn/memory` 包名核查）。
+
+仓库状态：本轮新增冒烟脚本、1 项回归用例与验证报告，已提交推送。

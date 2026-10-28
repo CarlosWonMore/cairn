@@ -12,7 +12,9 @@
 
 ## 状态
 
-**本地 MVP 已实现并归档（`add-local-first-memory-mvp`，规格见 `openspec/specs/`）；云同步变更 `add-real-cloud-sync` 已实现、经三轮外部独立验证 + 第四轮归档门禁并**已归档**（2026-10-25，规格见 `openspec/specs/cloud-sync/`；真实环境：华为云 OBS + 阿里云 ECS）。全量测试 388 项（1 项真实云端门控用例），连续 5 轮全绿。**无模型依赖；云端为可选加密中继。
+**本地 MVP 已实现并归档（`add-local-first-memory-mvp`，规格见 `openspec/specs/`）；云同步变更 `add-real-cloud-sync` 已实现、经三轮外部独立验证 + 第四轮归档门禁并**已归档**（2026-10-25，规格见 `openspec/specs/cloud-sync/`；真实环境：华为云 OBS + 阿里云 ECS）。全量测试 389 项，连续 2 轮全绿（第五轮宿主接入复核，见 `docs/verify-host-mcp-2026-10-28.md`）。**无模型依赖；云端为可选加密中继。
+
+> 测试基线说明：其中 1 项是真实云端门控用例——环境变量 `OBS_*` 齐全时执行，否则显式 skip（总数变 388）。因此该用例在配好凭据的机器上会真实访问 OBS 并自清理。
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
 - 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。
@@ -24,10 +26,11 @@
 
 ```bash
 npm install
-npm run build          # Node.js 22.5+（当前验证环境 Node 24 / Windows x64）
+npm run build          # Node.js 22.5+（已验证 Node 22.22.2 / Windows x64 与 Linux/Ubuntu 22.04）
 npm run cli -- doctor  # 健康检查（无模型、无云端核心可用）
 npm run cli -- add "项目的构建约定是 pnpm"
 npm run cli -- search "构建约定"
+npm run mcp:smoke      # MCP 接入自检：默认只读真实库（--write --home <临时目录> 才写入）
 ```
 
 **Windows 提醒：不要直接运行/双击 `.ts` 或 `.js` 文件**（会弹出"选择打开方式"）。始终使用 `npm run cli --`、`cairn.cmd`（仓库根目录启动器）或 `npm link` 后的全局 `cairn` 命令。详见 `docs/cairn-usage.md` 第 1 节。
