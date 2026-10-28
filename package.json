@@ -28,6 +28,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && tsx --test --test-concurrency=2 \"tests/**/*.test.ts\"",
     "test:module": "node --import tsx --test",
+    "mcp:smoke": "npm run build && node scripts/mcp-smoke.mjs",
     "smoke:pack": "npm run build && npm pack --dry-run"
   },
   "dependencies": {

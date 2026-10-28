@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -186,8 +186,9 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
     };
   };
   const a = start('agent-a');
-  // 串行启动：等 a 就绪再拉起 b，避免两个进程同时冷启动争用（迁移已并发安全，这里只减噪）
-  const b = start('agent-b');
+  // 串行启动：等 a 就绪再拉起 b。两个进程同时对同一个新建库冷启动会争用迁移锁，
+  // 全量并发（--test-concurrency=2）下曾出现 b 启动超时；串行化与注释原意一致。
+  let stopB: (() => Promise<void>) | undefined;
   const cli = (args: string[]) => runCli(['--home', home, '--json', ...args]);
   const resp = (text: string, id: number) => {
     // 只解析【完整行】（末尾未换行的部分行丢弃）：半截响应 JSON.parse 会崩
@@ -205,16 +206,19 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
       return null;
     }
   };
-  // 等待子进程 stdio 就绪（stderr 出现 ready 标记），消除 Windows 管道首写竞态
-  const waitReady = async (probe: { stderr?(): string; wait(ms: number): Promise<unknown> }, timeoutMs = 15000) => {
+  // 等待子进程 stdio 就绪（stderr 出现 ready 标记），消除 Windows 管道首写竞态。
+  // 必须同时观察退出码：进程启动即失败时若只看 stderr，会白等满超时且拿不到证据。
+  const waitReady = async (probe: { p: ChildProcess; stderr(): string; wait(ms: number): Promise<unknown> }, timeoutMs = 15000) => {
     const start = Date.now();
-    let dbg = 0;
     for (;;) {
-      const cur = probe.stderr?.() ?? '';
-      if (process.env['CAIRN_TEST_DEBUG'] && dbg++ < 3) process.stderr.write(`[waitReady] t=${Date.now() - start}ms stderr=${JSON.stringify(cur.slice(0, 120))}
-`);
+      const cur = probe.stderr();
       if (cur.includes('stdio server ready')) return;
-      if (Date.now() - start > timeoutMs) throw new Error('MCP 服务器启动超时');
+      if (probe.p.exitCode !== null) {
+        throw new Error(`MCP 服务器启动即退出（code=${probe.p.exitCode}）；stderr=${cur.slice(0, 500)}`);
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`MCP 服务器启动超时（${timeoutMs}ms，进程仍存活）；stderr=${cur.slice(0, 500)}`);
+      }
       await probe.wait(20);
     }
   };
@@ -232,6 +236,8 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
   };
   try {
     await waitReady(a);
+    const b = start('agent-b');
+    stopB = b.stop;
     await waitReady(b);
     for (const c of [a, b]) {
       c.send({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
@@ -266,7 +272,7 @@ test('E2E 双客户端：两个 MCP 进程 + CLI 共用同一本地库，断开�
     assert.equal(add2.code, 0, add2.stderr);
   } finally {
     await a.stop().catch(() => {});
-    await b.stop().catch(() => {});
+    await stopB?.().catch(() => {});
     cleanupTestHome(home);
   }
 });
