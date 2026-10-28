@@ -338,7 +338,7 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 **剩余边界**
 
 - macOS 平台未验证（用户本轮明确暂缓）。
-- 宿主注册后的端到端闭环，还需要用户在自己的宿主会话里手动调一次 `memory_add` 并确认落库。
+- **宿主端到端闭环已完成（2026-10-28 18:46）**：宿主会话直接经 MCP 调用 `memory_add` 落库一条 `instruction`（id `01a1821e-a66b-7458-b5b2-34040057d8f5`，scope `personal-global`，authority `user_explicit`），`memory_get` 读回完整内容与 1 条 revision、`memory_search` 由 fts 命中、`active` 计数 1→2。说明信任已生效、stdio 通道可用，不再是待办。
 - `npm test` 从此恒为 389 通过 / 1 skip，README 已按此对齐。
 
-仓库状态：本轮改动（README、handoff、AGENTS、`obs-store.test.ts` 门控、`package.json`、`scripts/test-real-obs.mjs`）待提交推送。
+仓库状态：第七轮改动（README、handoff、AGENTS、`obs-store.test.ts` 门控、`package.json`、`scripts/test-real-obs.mjs`）已提交并推送至 `origin/main`（`2323ae6`）。推送曾因 git 未走本机 `127.0.0.1:7890` 代理而间歇超时，用 `git -c http.proxy=... push` 解决，未改全局配置。
