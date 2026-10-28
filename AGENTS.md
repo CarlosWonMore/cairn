@@ -2,10 +2,11 @@
 
 ## 当前入口
 
-- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录与 2026-10-28 追加第六节）。
+- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录与 2026-10-28 追加第六、七节）。
 - 两个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）与 `add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）。当前无活跃变更。
-- 宿主 MCP 接入已于 2026-10-28 自检通过（见 `docs/verify-host-mcp-2026-10-28.md`）；日常自检用 `npm run mcp:smoke`（默认只读真实库，写库须 `--write --home <临时目录>`）。宿主**注册**仍属 `blocked`，需用户手动 UI 安装或显式授权。
-- 下一入口候选（需用户决定）：macOS 平台 CI；项目/自定义空间的云同步扩展；`npm test` 与真实云端解耦（加显式开关）；公开发布准备（private→public、npm 发包、`@cairn/memory` 包名核查）。
+- 宿主 MCP 接入已于 2026-10-28 自检通过并完成配置写入（见 `docs/verify-host-mcp-2026-10-28.md`）：`~/.workbuddy/mcp.json` 已加入 `cairn` 条目，指向 `dist/src/interfaces/mcp/server.js`，**改 `src/` 后须 `npm run build` 才对新会话生效**；信任状态需用户在连接器 UI 确认。日常自检用 `npm run mcp:smoke`（默认只读真实库，写库须 `--write --home <临时目录>`）。
+- 测试基线：`npm test` 默认不联网，恒 390 项 / 389 通过 / 1 显式 skip；真实云端往返用 `npm run test:real`（需 `OBS_*` 五个变量齐全，缺任一即 exit 2，不静默 skip）。
+- 下一入口候选（需用户决定）：macOS 平台 CI（用户 2026-10-28 明确暂缓）；项目/自定义空间的云同步扩展；公开发布准备（private→public、npm 发包、`@cairn/memory` 包名核查）。
 - 使用文档在 `docs/cairn-usage.md`、`docs/cairn-security.md`、`docs/cairn-sync.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
 
 ## 产品与技术边界

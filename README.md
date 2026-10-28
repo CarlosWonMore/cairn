@@ -12,9 +12,9 @@
 
 ## 状态
 
-**本地 MVP 已实现并归档（`add-local-first-memory-mvp`，规格见 `openspec/specs/`）；云同步变更 `add-real-cloud-sync` 已实现、经三轮外部独立验证 + 第四轮归档门禁并**已归档**（2026-10-25，规格见 `openspec/specs/cloud-sync/`；真实环境：华为云 OBS + 阿里云 ECS）。全量测试 389 项，连续 2 轮全绿（第五轮宿主接入复核，见 `docs/verify-host-mcp-2026-10-28.md`）。**无模型依赖；云端为可选加密中继。
+**本地 MVP 已实现并归档（`add-local-first-memory-mvp`，规格见 `openspec/specs/`）；云同步变更 `add-real-cloud-sync` 已实现、经三轮外部独立验证 + 第四轮归档门禁并**已归档**（2026-10-25，规格见 `openspec/specs/cloud-sync/`；真实环境：华为云 OBS + 阿里云 ECS）。全量测试 390 项 / 389 通过 / 0 失败 / 1 显式 skip（第五轮宿主接入复核，见 `docs/verify-host-mcp-2026-10-28.md`）。**无模型依赖；云端为可选加密中继。
 
-> 测试基线说明：其中 1 项是真实云端门控用例——环境变量 `OBS_*` 齐全时执行，否则显式 skip（总数变 388）。因此该用例在配好凭据的机器上会真实访问 OBS 并自清理。
+> 测试基线说明：`npm test` 默认**不联网**。唯一涉及真实云端的用例需要显式 `CAIRN_TEST_REAL_OBS=1`，未设置时显式 skip（因此本地与 CI 恒为 389 通过 / 1 skip，不因机器上是否有凭据而变化）。要跑该项用 `npm run test:real`：要求 `OBS_ENDPOINT/OBS_BUCKET/OBS_PREFIX/OBS_ACCESS_KEY_ID/OBS_SECRET_ACCESS_KEY` 齐全，缺任一即 exit 2 并明确报错，不会静默跳过（design D6：不虚报真实验证）。
 
 - 设计契约：`docs/AI-Memory-development-plan.md`（完整方案快照）与 `docs/AI Memory 系统构想.md`（原始构想）。
 - 流程事实源：`openspec/`（proposal / 5 份 specs / design / tasks 及实现验证记录）。

@@ -306,3 +306,39 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 下一入口候选（需用户决定）：macOS 平台 CI；项目/自定义空间云同步扩展；`npm test` 与真实云端解耦；公开发布准备（private→public、发包、`@cairn/memory` 包名核查）。
 
 仓库状态：本轮新增冒烟脚本、1 项回归用例与验证报告，已提交为 2 个本地提交（`fix(mcp):` 与 `docs:`），**尚未推送**，等用户确认后再 push。
+
+# 2026-10-28 追加（七）：测试与云端解耦、宿主 MCP 注册、推送补完
+
+用户本轮决定：① 由我直接写入宿主 MCP 配置，用户自行点信任；② 同意把 npm test 与真实云端解耦；③ macOS 暂不验证；④ 复测推送。
+
+**1) 推送补完（上一轮判断有误）**
+
+上一轮判定「GitHub 连接被重置、推不上去」是误判。`git ls-remote` 与 `git push` 均正常，三个本地提交已推送，`main` 已建立 upstream（`6bad7cd..5a28554`）。当时失败的真实原因是 `2>/dev/null` 丢掉了 stderr、且分支没有 upstream 引用，不是网络问题。
+
+**2) 宿主 MCP 注册已完成**
+
+在 `~/.workbuddy/mcp.json` 的 `mcpServers` 下新增 `cairn` 条目（`command: node`，`args: ["D:/Project/AI MemoryGLM/dist/src/interfaces/mcp/server.js"]`），原有 `jira` / `agentctl` 未改动。按该配置原样拉起实测：initialize 成功（cairn 0.1.0）、`tools/list` 返回 8 个工具、`memory_status` 只读调用正常、stdout 无非 JSON 行。
+
+注意两点：一是该配置指向 `dist/`，改动 `src/` 后必须 `npm run build` 才对新会话生效；二是信任状态需用户在连接器 UI 点击确认后才激活。
+
+**3) npm test 与真实云端解耦**
+
+`tests/sync/obs-store.test.ts` 的真实云端用例改为**显式开关** `CAIRN_TEST_REAL_OBS=1`。原实现只要机器上存在 `OBS_*` 凭据就自动联网，后果是同一份代码在不同机器上跑出 389 与 390 两个数、网络抖动会被伪装成测试失败。
+
+新增 `npm run test:real`（`scripts/test-real-obs.mjs`）：在子进程内设置开关再 spawn，绕开 Windows cmd.exe 不识别 `VAR=value` 前缀的问题；五个 `OBS_*` 缺任一即 exit 2 并明确报出缺哪几个，不静默 skip。
+
+实测三种情况：
+
+| 命令 | 条件 | 结果 |
+|---|---|---|
+| `npm test` | 默认（不联网） | 390 项 / 389 通过 / 0 失败 / **1 skip** |
+| `npm run test:real` | `OBS_*` 齐全 | 47/47 通过 / 0 skip（真实 OBS 往返约 4s） |
+| `npm run test:real` | 缺凭据 | exit 2，明确列出缺失变量 |
+
+**剩余边界**
+
+- macOS 平台未验证（用户本轮明确暂缓）。
+- 宿主注册后的端到端闭环，还需要用户在自己的宿主会话里手动调一次 `memory_add` 并确认落库。
+- `npm test` 从此恒为 389 通过 / 1 skip，README 已按此对齐。
+
+仓库状态：本轮改动（README、handoff、AGENTS、`obs-store.test.ts` 门控、`package.json`、`scripts/test-real-obs.mjs`）待提交推送。
