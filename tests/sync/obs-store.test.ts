@@ -1,8 +1,9 @@
 /**
  * ObsRemoteStore（Huawei OBS S3 兼容 RemoteStore）测试。
  *
- * 凭据纪律：本文件只使用测试现造的合成 AK/SK；真实云端用例仅在 OBS_* 环境变量
- * 齐全时执行，缺失时显式 skip 并注明（design D6：不虚报真实验证）。
+ * 凭据纪律：本文件只使用测试现造的合成 AK/SK；真实云端用例仅在显式
+ * CAIRN_TEST_REAL_OBS=1 且 OBS_* 齐全时执行，否则显式 skip 并注明
+ * （design D6：不虚报真实验证，也不让默认测试隐含网络依赖）。
  * 固定向量签名测试在测试内用 node:crypto 按文档化规则独立复算期望值。
  */
 import { test } from 'node:test';
@@ -637,9 +638,16 @@ test('deleteObject：500 → E_IO/obs_remote_error', async () => {
   assert.equal(asCairn(e).message, 'obs_remote_error');
 });
 
-// ---- 真实环境门（env 齐全才跑，缺失显式 skip） --------------------------
+// ---- 真实环境门（须显式 CAIRN_TEST_REAL_OBS=1 且 OBS_* 齐全，否则显式 skip）----
+//
+// 默认关闭：npm test 必须离线可复现。仅凭「机器上恰好存在凭据」就自动联网，
+// 会让同一份代码在不同机器上跑出不同结果（389 vs 390），并把网络故障伪装成
+// 测试失败。要跑真实往返请用 npm run test:real（design D6：不虚报真实验证）。
+
+const REAL_OBS_ENABLED = process.env['CAIRN_TEST_REAL_OBS'] === '1';
 
 const REAL_ENV: ObsRemoteConfig | null = (() => {
+  if (!REAL_OBS_ENABLED) return null;
   const e = (name: string): string | undefined => process.env[name];
   const endpoint = e('OBS_ENDPOINT');
   const bucket = e('OBS_BUCKET');
@@ -650,9 +658,13 @@ const REAL_ENV: ObsRemoteConfig | null = (() => {
   return { endpoint, bucket, prefix, accessKeyId, secretAccessKey };
 })();
 
+const REAL_SKIP_REASON = REAL_OBS_ENABLED
+  ? 'CAIRN_TEST_REAL_OBS=1 但 OBS_ENDPOINT/OBS_BUCKET/OBS_PREFIX/OBS_ACCESS_KEY_ID/OBS_SECRET_ACCESS_KEY 不齐全，跳过真实云端往返（不虚报真实验证）'
+  : '未设置 CAIRN_TEST_REAL_OBS=1，跳过真实云端往返（npm test 默认离线可复现；跑真实往返用 npm run test:real）';
+
 test(
   '真实环境：OBS 往返 put/get/list/delete（selftest/<uuid>，测试后清理）',
-  { skip: REAL_ENV ? false : 'OBS_ENDPOINT/OBS_BUCKET/OBS_PREFIX/OBS_ACCESS_KEY_ID/OBS_SECRET_ACCESS_KEY 未配置，跳过真实云端往返（不虚报真实验证）' },
+  { skip: REAL_ENV ? false : REAL_SKIP_REASON },
   async () => {
     assert.ok(REAL_ENV, '真实环境变量必须存在才会进入本用例');
     const store = new ObsRemoteStore(REAL_ENV);
