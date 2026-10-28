@@ -305,4 +305,4 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 
 下一入口候选（需用户决定）：macOS 平台 CI；项目/自定义空间云同步扩展；`npm test` 与真实云端解耦；公开发布准备（private→public、发包、`@cairn/memory` 包名核查）。
 
-仓库状态：本轮新增冒烟脚本、1 项回归用例与验证报告，已提交推送。
+仓库状态：本轮新增冒烟脚本、1 项回归用例与验证报告，已提交为 2 个本地提交（`fix(mcp):` 与 `docs:`），**尚未推送**，等用户确认后再 push。
