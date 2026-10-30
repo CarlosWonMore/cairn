@@ -9,6 +9,9 @@ import {
 import { AppService } from '../app-service.js';
 import { CairnError, isCairnError, ExitCode } from '../../core/errors.js';
 import { MemoryKind, MEMORY_KINDS } from '../../core/types.js';
+import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
+import { parseJudgement } from '../../onboarding/judgement.js';
+import { runAutoOnboarding } from '../../onboarding/auto.js';
 
 /**
  * Cairn MCP stdio 服务器（任务 5.2）：
@@ -30,6 +33,9 @@ const TOOL_NAMES = [
 ] as const;
 
 const ONBOARDING_TOOLS = ['onboarding_status', 'onboarding_next_batch', 'onboarding_propose', 'onboarding_apply'] as const;
+
+/** AI 复核通道：与 CLI 的 `cairn review pack|submit|list` 共用同一实现与校验。 */
+const REVIEW_ACTIONS = ['pack', 'submit', 'list'] as const;
 
 function toolDef(
   name: string,
@@ -84,13 +90,25 @@ export function createServer(home?: string): Server {
       toolDef('memory_get', '读取一条记忆的完整内容、修订历史与证据。', { id: { type: 'string' } }, ['id']),
       toolDef(
         'memory_add',
-        '显式新增记忆。只在用户明确要求"记住/更正"时调用；写入内容成为 user_explicit 活动记忆。',
+        '显式新增记忆。只在用户明确要求"记住/更正"时调用；写入内容成为 user_explicit 活动记忆。建议随写入一并给出 judgement：你已在上下文里，判断比事后复查更准，也不额外多一轮会话。',
         {
           content: { type: 'string' },
           kind: { type: 'string', enum: [...MEMORY_KINDS] },
           sensitive: { type: 'boolean' },
           scope_preset: { type: 'string', description: '默认 personal-global；device-local/project-global 等' },
           project_id: { type: 'string' },
+          judgement: {
+            type: 'object',
+            description:
+              '写入时判断（建议，非授权）：只能影响"值不值得记"，不能改敏感度/作用域，也不构成审批。同作用域已有相同正文时默认并入既有记忆而不新建；判为不值得记（verdict=skip 且 confidence=high）则本次不写入。',
+            properties: {
+              verdict: { type: 'string', description: 'keep | skip | merge_into:<记忆id>' },
+              confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+              rationale: { type: 'string', description: '一句话理由，不能为空' },
+              dedupe: { type: 'string', enum: ['merge', 'keep_both'], description: '默认 merge；keep_both 表示显式要求两条并存' },
+            },
+            required: ['verdict', 'confidence', 'rationale'],
+          },
         },
         ['content'],
       ),
@@ -156,8 +174,66 @@ export function createServer(home?: string): Server {
           { plan_id: { type: 'string' }, approval_id: { type: 'string' } },
           ['plan_id', 'approval_id'],
         ),
+        toolDef(
+          'memory_review',
+          'AI 复核通道：pack 生成复核包（会把条目正文交给模型读取，返回条数与字符量）、submit 写回你的判定（任一不合法即整批拒绝）、list 查看已写回的建议。动作取值同治理层：promote/merge/keep_both/skip/needs_human。',
+          {
+            action: { type: 'string', enum: [...REVIEW_ACTIONS] },
+            batch_id: { type: 'string', description: '默认当前活跃批次' },
+            out_file: { type: 'string', description: 'pack 的输出路径' },
+            max_chars_per_item: { type: 'number', description: 'pack 单条正文字符上限，默认 1200' },
+            run_id: { type: 'string', description: 'submit 时带上 pack 返回的 runId' },
+            items: {
+              type: 'array',
+              description: 'submit 的判定数组',
+              items: {
+                type: 'object',
+                properties: {
+                  itemId: { type: 'string' },
+                  action: { type: 'string', enum: ['promote', 'merge', 'keep_both', 'skip', 'needs_human'] },
+                  reason: { type: 'string' },
+                  targetMemoryId: { type: 'string' },
+                },
+                required: ['itemId', 'action'],
+              },
+            },
+            item_id: { type: 'string', description: 'list 可按条目过滤' },
+          },
+          ['action'],
+        ),
       );
     }
+    // 自动整理通道：常驻暴露，因为 auto 可对指定批次运行，不依赖"当前有活跃批次"。
+    tools.push(
+      toolDef(
+        'memory_decide',
+        '自动整理通道（只服务没有在场写入方的存量导入条目）：next 取下一包待判断条目，submit 写回判断（含 confidence），auto 按已签发策略应用、其余转人工。本工具不能签发策略——策略只能在 cairn policy sign 或本机控制台签发；也不接受 channel 参数。',
+        {
+          action: { type: 'string', enum: ['next', 'submit', 'auto'] },
+          batch_id: { type: 'string', description: '默认当前活跃批次' },
+          limit: { type: 'number', description: 'next 的条目上限，默认 10' },
+          items: {
+            type: 'array',
+            description: 'submit 的判断数组',
+            items: {
+              type: 'object',
+              properties: {
+                itemId: { type: 'string' },
+                action: { type: 'string', enum: ['promote', 'merge', 'keep_both', 'skip', 'needs_human'] },
+                reason: { type: 'string' },
+                targetMemoryId: { type: 'string' },
+                confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: '默认 low；策略的 minConfidence 依赖它' },
+              },
+              required: ['itemId', 'action', 'reason'],
+            },
+          },
+          model: { type: 'string', description: 'submit 时记录产出模型' },
+          policy_id: { type: 'string', description: 'auto 必填：本机已签发的策略 id' },
+          dry_run: { type: 'boolean', description: 'auto 只分档不写库' },
+        },
+        ['action'],
+      ),
+    );
     return { tools };
   });
 
@@ -234,16 +310,37 @@ async function handleTool(service: AppService, name: string, args: Record<string
     }
 
     case 'memory_add': {
-      const m = service.addMemory({
-        content: String(args['content'] ?? ''),
-        kind: args['kind'] as MemoryKind | undefined,
-        sensitivity: args['sensitive'] === true ? 'sensitive' : 'normal',
-        scope: {
-          preset: args['scope_preset'] as never,
-          projectId: args['project_id'] as string | undefined,
+      const judgementRaw = args['judgement'];
+      const judgement = judgementRaw == null ? null : parseJudgement(judgementRaw);
+      const r = service.addMemory(
+        {
+          content: String(args['content'] ?? ''),
+          kind: args['kind'] as MemoryKind | undefined,
+          sensitivity: args['sensitive'] === true ? 'sensitive' : 'normal',
+          scope: {
+            preset: args['scope_preset'] as never,
+            projectId: args['project_id'] as string | undefined,
+          },
         },
-      });
-      return { id: m.id, status: m.status, authority: m.authority };
+        { judgement },
+      );
+      if (r.action === 'skip') {
+        return {
+          written: false,
+          action: r.action,
+          basis: r.basis,
+          note: '按判断未写入。判断是建议：如需写入，改用 verdict=keep 重新提交。',
+        };
+      }
+      const m = r.memory!;
+      return {
+        id: m.id,
+        status: m.status,
+        authority: m.authority,
+        action: r.action,
+        basis: r.basis,
+        duplicateOf: r.duplicateOf,
+      };
     }
 
     case 'memory_propose': {
@@ -312,6 +409,74 @@ async function handleTool(service: AppService, name: string, args: Record<string
       if (!planId || !approvalId) throw new CairnError('E_VALIDATION', '需要 plan_id 与 approval_id（approval 由本地 CLI cairn approve 签发）');
       const r = service.applyPlan(planId, approvalId);
       return { ...r, note: '已按一次性审批应用；调用方声明的 user_confirmed 不构成授权' };
+    }
+
+    case 'memory_decide': {
+      // 刻意不接受策略内容、不接受 channel：签发能力不在这条通道上。
+      const action = String(args['action'] ?? '');
+      const batchId = args['batch_id'] ? String(args['batch_id']) : undefined;
+      if (action === 'next') {
+        const batch = batchId ?? service.activeBatchId();
+        if (!batch) return { batchId: null, items: [], note: '没有待整理的批次' };
+        const chunk = service.batchChunk(batch, args['limit'] != null ? Number(args['limit']) : 10);
+        return {
+          batchId: batch,
+          items: chunk,
+          note: '判断完用 action=submit 写回（记得给 confidence）；全部判断完再 action=auto 按策略应用。',
+        };
+      }
+      if (action === 'submit') {
+        const items = Array.isArray(args['items']) ? (args['items'] as unknown[]) : [];
+        return reviewSubmit(service.store, {
+          items,
+          producer: 'mcp',
+          model: args['model'] ? String(args['model']) : null,
+        });
+      }
+      if (action === 'auto') {
+        const policyId = args['policy_id'] ? String(args['policy_id']) : '';
+        if (!policyId) {
+          throw new CairnError('E_VALIDATION', 'auto 需要 policy_id；策略只能用 cairn policy sign 或本机控制台签发');
+        }
+        return runAutoOnboarding(service.store, {
+          policyId,
+          batchId,
+          dryRun: args['dry_run'] === true,
+        });
+      }
+      throw new CairnError('E_VALIDATION', 'action 只允许 next / submit / auto');
+    }
+
+    case 'memory_review': {
+      const action = String(args['action'] ?? '');
+      const batchId = args['batch_id'] ? String(args['batch_id']) : undefined;
+      if (action === 'pack') {
+        const r = reviewPackForBatch(service.store, {
+          batchId,
+          outFile: args['out_file'] ? String(args['out_file']) : undefined,
+          maxCharsPerItem: args['max_chars_per_item'] != null ? Number(args['max_chars_per_item']) : undefined,
+        });
+        return {
+          ...r,
+          note: '接下来你会读到这些条目正文；判断完用 action=submit 写回。写回只是建议，晋升仍需本地审批。',
+        };
+      }
+      if (action === 'submit') {
+        const items = Array.isArray(args['items']) ? (args['items'] as unknown[]) : [];
+        const r = reviewSubmit(service.store, {
+          items,
+          producer: `mcp:${service.caller.agentId}`,
+          runId: args['run_id'] ? String(args['run_id']) : undefined,
+        });
+        return { ...r, note: '已写回建议层；不影响规则层结论，也不产生任何晋升。' };
+      }
+      if (action === 'list') {
+        return readReviews(service.store, {
+          batchId,
+          itemId: args['item_id'] ? String(args['item_id']) : undefined,
+        });
+      }
+      throw new CairnError('E_VALIDATION', `action 必须是 ${REVIEW_ACTIONS.join('/')}`);
     }
 
     default:

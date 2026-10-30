@@ -11,6 +11,13 @@ import {
   ConfigMode,
 } from '../../agents/config.js';
 import { backupDatabase, restoreFromBackup } from '../../store/backup.js';
+import { openStore } from '../../store/open.js';
+import { startConsoleServer } from '../console/server.js';
+import { exportConsoleHtml, normalizePersonalName } from '../console/export.js';
+import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
+import { judgementFromFlags } from '../../onboarding/judgement.js';
+import { loadPolicy, listPolicies, revokePolicy, signPolicy } from '../../onboarding/policy.js';
+import { revokeByPolicy, runAutoOnboarding } from '../../onboarding/auto.js';
 import { join } from 'node:path';
 
 /**
@@ -29,7 +36,8 @@ const VALUE_FLAGS = new Set([
   'expires', 'status', 'limit', 'out', 'format', 'reason', 'host', 'home-root', 'project-root',
   'mode', 'plan-file', 'mcp-command', 'mcp-args', 'max', 'expected-revision', 'approval', 'ttl',
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
-  'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file',
+  'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
+  'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
@@ -118,6 +126,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  // ui 全程只读：连 AppService 都不打开，确保"只看一眼"在数据目录层面零写入。
+  if (command === 'ui') {
+    await runUi(flags, home);
+    return;
+  }
+
   const service = AppService.open(home);
   try {
     switch (command) {
@@ -130,15 +144,35 @@ async function main(): Promise<void> {
 
       case 'add': {
         const content = args.join(' ');
-        if (!content) throw new CairnError('E_VALIDATION', '用法: cairn add "内容" [--kind fact] [--scope personal-global|project-global|device-local|project-device|agent-private|session-ephemeral]');
-        const m = service.addMemory({
-          content,
-          kind: str(flags, 'kind') as never,
-          sensitivity: flags['sensitive'] === true ? 'sensitive' : 'normal',
-          expiresAt: str(flags, 'expires') ?? null,
-          scope: scopeSelectionFrom(flags),
-        });
-        out({ id: m.id, status: m.status, authority: m.authority, kind: m.kind, scopeId: m.scopeId }, flags);
+        if (!content) throw new CairnError('E_VALIDATION', '用法: cairn add "内容" [--kind fact] [--scope ...] [--judgement keep|skip|merge_into:<id> --confidence high|medium|low --rationale "..."] [--dedupe merge|keep_both]');
+        const r = service.addMemory(
+          {
+            content,
+            kind: str(flags, 'kind') as never,
+            sensitivity: flags['sensitive'] === true ? 'sensitive' : 'normal',
+            expiresAt: str(flags, 'expires') ?? null,
+            scope: scopeSelectionFrom(flags),
+          },
+          { judgement: judgementFromFlags(flags) },
+        );
+        if (r.action === 'skip') {
+          out({ skipped: true, basis: r.basis, note: '按判断未写入；判断是建议，需要写入可去掉 --judgement skip' }, flags);
+          break;
+        }
+        const m = r.memory!;
+        out(
+          {
+            id: m.id,
+            status: m.status,
+            authority: m.authority,
+            kind: m.kind,
+            scopeId: m.scopeId,
+            action: r.action,
+            basis: r.basis,
+            duplicateOf: r.duplicateOf,
+          },
+          flags,
+        );
         break;
       }
 
@@ -378,6 +412,38 @@ async function main(): Promise<void> {
         break;
       }
 
+      case 'review': {
+        const sub = args[0] ?? 'list';
+        if (sub === 'pack') {
+          const r = reviewPackForBatch(service.store, {
+            batchId: str(flags, 'batch'),
+            outFile: str(flags, 'out'),
+          });
+          out(r, flags);
+          diag(`复核包已写入 ${r.outFile}`);
+          diag('下一步：把该文件交给当前 Agent 会话逐条判断，产出 { runId, items:[{itemId,action,reason,targetMemoryId}] }，再 cairn review submit --input <file>');
+          diag('注意：这一步会把条目正文交给模型读取；范围与字符量见上面的 itemCount / totalChars。');
+        } else if (sub === 'submit') {
+          const input = str(flags, 'input');
+          if (!input) throw new CairnError('E_VALIDATION', '用法: cairn review submit --input <reviews.json>（{ items: [...] }）');
+          const { readFileSync } = await import('node:fs');
+          const parsed = JSON.parse(readFileSync(input, 'utf8')) as { items?: unknown[]; runId?: string; model?: string };
+          const items = Array.isArray(parsed.items) ? parsed.items : Array.isArray(parsed as unknown) ? (parsed as unknown as unknown[]) : [];
+          const r = reviewSubmit(service.store, {
+            items,
+            producer: str(flags, 'proposed-by') ?? 'cli',
+            model: parsed.model ?? null,
+            runId: parsed.runId,
+          });
+          out(r, flags);
+        } else if (sub === 'list') {
+          out(readReviews(service.store, { batchId: str(flags, 'batch'), itemId: str(flags, 'item') }), flags);
+        } else {
+          throw new CairnError('E_VALIDATION', '用法: cairn review pack|submit|list [--batch] [--out] [--input]');
+        }
+        break;
+      }
+
       case 'discover': {
         const homeDir = str(flags, 'home-dir') ?? home ?? service.store.paths.home;
         const projectRoots = str(flags, 'project-root') ? [str(flags, 'project-root')!] : undefined;
@@ -417,8 +483,98 @@ async function main(): Promise<void> {
           const chunk = service.batchChunk(batchId, flags['limit'] != null ? Number(flags['limit']) : 10);
           out({ batchId, items: chunk }, flags);
           diag('把以下条目交给当前 Agent 生成 add/merge/keep_both/skip 建议，然后 cairn plan create。');
+        } else if (sub === 'auto') {
+          const policyId = str(flags, 'policy');
+          if (!policyId) {
+            throw new CairnError('E_VALIDATION', '用法: cairn onboarding auto --policy <id> [--batch <id>] [--scope ...] [--dry-run] [--redo] [--items a,b]');
+          }
+          const itemList = str(flags, 'items');
+          const r = runAutoOnboarding(service.store, {
+            policyId,
+            batchId: str(flags, 'batch'),
+            scope: scopeSelectionFrom(flags),
+            dryRun: flags['dry-run'] === true,
+            // --redo：已晋升的条目也重新判；--items：只处理点名的几条（同样视为显式重做）。
+            redo: flags['redo'] === true,
+            itemIds: itemList != null ? itemList.split(',').map((s) => s.trim()).filter((s) => s.length > 0) : undefined,
+          });
+          out(r, flags);
+          diag(
+            `策略 ${r.policyId}(${r.policyHashPrefix})：自动 ${r.auto} 条 / 人工 ${r.manual} 条；` +
+              `应用 ${r.applied}、跳过 ${r.skipped}、失败 ${r.failed}`,
+          );
+          if (r.dryRun) diag('这是 dry-run：没有写入任何记忆。去掉 --dry-run 才会真正应用。');
+          if (!r.balanced) {
+            throw new CairnError('E_INTERNAL', `汇总不自洽：applied ${r.applied} + skipped ${r.skipped} + failed ${r.failed} + manual ${r.manual} ≠ total ${r.totalItems}`);
+          }
+          if (r.applied === 0 && r.skipped > 0 && r.failed === 0) {
+            diag('全部跳过：通常是内容已全部在库中（已并入或已存在），这是正常结局；要重新判一遍加 --redo。');
+          }
+          if (r.manual > 0) {
+            const top = Object.entries(r.byCondition).sort((a, b) => b[1] - a[1]).slice(0, 3);
+            diag(`转人工的首要原因：${top.map(([k, v]) => `${k} ${v} 条`).join('、') || '无'}（用 cairn ui 查看明细）`);
+          }
+        } else if (sub === 'revoke') {
+          // 撤销"结果"与撤销"授权"是两件事：
+          //   policy revoke        → 这把钥匙作废，不能再用于未来的自动整理
+          //   onboarding revoke    → 把已经写进去的记忆转墓碑，回滚这次整理
+          const policyId = str(flags, 'policy') ?? args[1];
+          if (!policyId) {
+            throw new CairnError('E_VALIDATION', '用法: cairn onboarding revoke --policy <id> [--batch <id>]');
+          }
+          const r = revokeByPolicy(service.store, policyId, { batchId: str(flags, 'batch') });
+          out(r, flags);
+          diag(`已撤销 ${r.tombstoned} 条记忆（转墓碑，不物理删除，修订与来源仍在）。撤销是粘的：普通重跑不会把它们写回来，要重做须 --redo。`);
         } else {
-          throw new CairnError('E_VALIDATION', '用法: cairn onboarding status|next [--batch <id>]');
+          throw new CairnError('E_VALIDATION', '用法: cairn onboarding status|next|auto|revoke [--batch <id>] [--policy <id>] [--dry-run] [--redo]');
+        }
+        break;
+      }
+
+      case 'policy': {
+        const sub = args[0] ?? 'list';
+        if (sub === 'sign') {
+          const file = str(flags, 'file');
+          let raw: unknown;
+          if (file) {
+            const { readFileSync } = await import('node:fs');
+            raw = JSON.parse(readFileSync(file, 'utf8'));
+          } else {
+            const id = str(flags, 'id');
+            if (!id) {
+              throw new CairnError(
+                'E_VALIDATION',
+                '用法: cairn policy sign --file <policy.json> [--force]；或 cairn policy sign --id <名字> --scopes a,b [--max-sensitivity normal|sensitive] [--min-confidence 0-1] [--allow-create] [--require-ai-agreement] [--note 备注] [--force]',
+              );
+            }
+            // 命令行拼装时保持保守默认：不新建、不因"没判断"就放行。
+            raw = {
+              id,
+              allowedScopes: (str(flags, 'scopes') ?? '').split(',').map((x) => x.trim()).filter(Boolean),
+              maxSensitivity: str(flags, 'max-sensitivity') ?? 'normal',
+              requireAiAgreement: flags['require-ai-agreement'] === true,
+              allowCreate: flags['allow-create'] === true,
+              minConfidence: flags['min-confidence'] != null ? Number(str(flags, 'min-confidence')) : 0.6,
+              note: str(flags, 'note') ?? '',
+            };
+          }
+          const signed = signPolicy(service.store.paths.home, raw, { via: 'cli', force: flags['force'] === true });
+          out({ id: signed.spec.id, policyHash: signed.policyHash, signedAt: signed.signedAt, via: signed.signedVia, spec: signed.spec }, flags);
+          diag(`策略 ${signed.spec.id} 已签发，哈希 ${signed.policyHash.slice(0, 8)}。改动策略内容后必须重新签发。`);
+        } else if (sub === 'list') {
+          out(listPolicies(service.store.paths.home), flags);
+        } else if (sub === 'show') {
+          const id = args[1] ?? str(flags, 'id');
+          if (!id) throw new CairnError('E_VALIDATION', '用法: cairn policy show <id>');
+          out(loadPolicy(service.store.paths.home, id), flags);
+        } else if (sub === 'revoke') {
+          const id = args[1] ?? str(flags, 'id');
+          if (!id) throw new CairnError('E_VALIDATION', '用法: cairn policy revoke <id>');
+          const r = revokePolicy(service.store.paths.home, id);
+          out({ id: r.spec.id, revokedAt: r.revokedAt }, flags);
+          diag(`策略 ${id} 已撤销：这把钥匙不能再用于 onboarding auto；它已经写进去的记忆不受影响，要回滚结果请用 cairn onboarding revoke --policy ${id}。`);
+        } else {
+          throw new CairnError('E_VALIDATION', '用法: cairn policy sign|list|show|revoke');
         }
         break;
       }
@@ -475,6 +631,91 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * `cairn ui`：只读打开。全流程不构造 AppService，因此"只看一眼"不会写 meta/device。
+ *
+ * 两种形态共用同一套装配层与前端资源，差异只在传输方式：
+ * - 默认：回环 HTTP 服务（工作台，可审批/同步）；
+ * - `--export`：单文件 HTML（预览，纯只读，可双击打开或离线分享）。
+ */
+async function runUi(flags: Flags, home: string | undefined): Promise<void> {
+  const exportTarget = str(flags, 'export');
+  const redact = flags['redact'] === true;
+
+  if (exportTarget != null) {
+    const store = openStore({ home, readOnly: true });
+    try {
+      const outFile = normalizePersonalName(exportTarget);
+      const r = exportConsoleHtml(store, { outFile, redact });
+      out(
+        {
+          written: r.outFile,
+          bytes: r.bytes,
+          counts: r.counts,
+          redacted: r.redacted,
+          degradedItems: r.degradedItems,
+          warnings: r.warnings,
+        },
+        flags,
+      );
+      // 三层告知的第 3 层：stdout。前两层是文件名后缀与文件头警示。
+      if (!r.redacted) {
+        diag(
+          `产物含明文本地记忆（${r.counts.memories} 条记忆 / ${r.counts.items} 条快照条目，${r.bytes} 字节）：请勿外传；需要外发请加 --redact。`,
+        );
+      } else {
+        diag('已按 --redact 输出：sensitive 记忆正文已掩码。');
+      }
+      for (const w of r.warnings) diag(w);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  const portFlag = str(flags, 'port');
+  const port = portFlag != null ? Number(portFlag) : undefined;
+  if (port != null && (!Number.isInteger(port) || port < 0 || port > 65535)) {
+    throw new CairnError('E_VALIDATION', '--port 必须是 0-65535 的整数');
+  }
+  const handle = await startConsoleServer({ home, port });
+  if (flags['json'] === true) {
+    console.log(JSON.stringify({ url: handle.url, tokenUrl: handle.tokenUrl, port: handle.port, host: handle.host }, null, 2));
+  } else {
+    console.log(`控制台已启动：${handle.tokenUrl}`);
+    console.log('令牌随进程一次性有效；按 Ctrl+C 停止服务。');
+  }
+  const noOpen = flags['no-open'] === true;
+  if (!noOpen) openBrowser(handle.tokenUrl);
+  await new Promise<void>((resolve) => {
+    const stop = () => {
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
+      void handle.close().then(() => resolve());
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  });
+}
+
+/** best-effort 打开浏览器：失败不影响服务可用，用户可复制 stdout 里的 URL。 */
+function openBrowser(url: string): void {
+  void (async () => {
+    try {
+      const { spawn } = await import('node:child_process');
+      const cmd = process.platform === 'win32' ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+      const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+      const child = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', () => {
+        /* 无浏览器环境：URL 已在 stdout */
+      });
+      child.unref();
+    } catch {
+      /* 同上 */
+    }
+  })();
+}
+
 const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主权层
 
 用法: cairn <command> [args] [options]
@@ -483,8 +724,11 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   init                          初始化数据目录并执行首次体检
   discover                      元数据发现（不读正文） [--home-dir] [--project-root]
   import <文件...>              不可变快照导入（imported_unverified + local_only） [--agent-kind]
-  onboarding status|next        分批进度与待整理条目 [--batch] [--limit]
+  onboarding status|next|auto   分批进度与待整理条目 [--batch] [--limit]
+                                auto: 按已签发策略自动整理 [--policy <id>] [--dry-run] [--redo] [--items a,b]
+                                revoke: 回滚某策略写进去的记忆（转墓碑）[--policy <id>] [--batch <id>]
   add "内容"                    显式新增记忆 [--kind] [--scope] [--project] [--sensitive]
+                                [--judgement keep|skip|merge_into:<id> --confidence --rationale]
   search "关键词"               作用域约束检索 [--status] [--scope-id] [--include-expired]
   show <id>                     记忆详情（修订/证据/冲突）
   update <id> "新内容"          用户更正（新修订，历史保留）
@@ -494,6 +738,10 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   plan create|show|list         治理计划（create 需 --items-file，零写入）
   approve <plan-id>             本地签发一次性审批（绑定 plan_hash，30 分钟有效）
   apply <plan-id> --approval X  消费审批并幂等应用计划
+  review pack|submit|list       双层建议的复核包与写回 [--batch] [--out] [--input]
+  policy sign|list|show|revoke  自动整理策略（签发只在终端或本机控制台）[--file] [--id] [--force]
+  ui                            只读控制台（回环 HTTP；端口默认 7767，占用则随机）
+                                [--port N] [--no-open] [--export <file.html>] [--redact]
   vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd）
   sync push|pull                加密同步上行 / 下行（详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复
