@@ -342,3 +342,232 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 - `npm test` 从此恒为 389 通过 / 1 skip，README 已按此对齐。
 
 仓库状态：第七轮改动（README、handoff、AGENTS、`obs-store.test.ts` 门控、`package.json`、`scripts/test-real-obs.mjs`）已提交并推送至 `origin/main`（`2323ae6`）。推送曾因 git 未走本机 `127.0.0.1:7890` 代理而间歇超时，用 `git -c http.proxy=... push` 解决，未改全局配置。
+
+# 2026-10-28 追加（八）：WorkBuddy/CodeBuddy 记忆导入与工作台提案
+
+**1) 导入完成（用户授权范围：用户级 4 份 + 江南大学 47 份）**
+
+共 51 份、全部落在 `imported_unverified + local_only`，源文件零改动（8 份待定文件的 sha256 导入前后逐个 `sha256sum -c` 全 OK）。库终态：`import_archive` 51、`import_item` 533（clean 488 / blocked 45）、`memories` active 2 / candidate 0、`outbox` pending 2、`doctor` 报 `ok:true`（integrity ok、FK 违例 0、FTS5 ok）。导入前备份 `~/.cairn/backups/cairn-pre-import8-20261028-194407.db`。
+
+两点实测结论：
+
+- `cairn import` 输出的 `itemCount` 是净落库条数，`skippedItems` 就是被判 blocked 的数量；剩余 8 份的 237/26 与事先用临时库试导的预估数字逐项吻合，说明导入是确定性的。
+- batch 粒度是**每文件一批**（51 文件 = 51 批）。`onboarding status` 不带 `--batch` 只显示 `activeBatchId()` 一个批次（当前显示 total 7，那是 `reference_teamai_mcp_reconcile_drift.md`），不是数据丢失。CLI 缺"列出全部批次"的入口，这是本轮提案的直接动因之一。
+
+**2) 新变更 `add-memory-workbench`（已 propose，未 apply）**
+
+用户要求：命令行发起，静态页或 webui 皆可；预览页只读；工作台要能看层级/状态/快照/批次/审批、能操作审批、突出待处理并给处理建议、能触发同步；风格参考本机 Archify。
+
+第二轮修订按用户五点意见收敛：端口不固定（默认 7767，占用即换）；Archify 已安装故改用其真实 token；建议改为「规则层打底 + AI 层叠加」；静态导出默认输出完整记忆正文；页面支持检索状态恢复与摘要/全文切换。
+
+产物（5 个 spec、28 tasks，`openspec validate` 与 `--strict` 均通过）：
+
+- `proposal.md`：定位为薄壳视图层，不新增治理语义；非目标排除"网页改/删记忆"与远程访问。
+- `design.md`：D1 双形态共用装配层、D2 零新增依赖、D3 API 契约（21 端点，全部映射既有 `AppService`）、D4 双层建议、D5 审批通道参数化、D6 安全边界、D7 视觉系统（Archify 真实 token）、D8 静态导出完整正文、D9 只读并发、D10 可恢复视图状态。
+- `specs/local-console/spec.md`：新能力，13 条 Requirement。
+- `specs/memory-review/spec.md`：新能力，6 条 Requirement（来源可追溯、人工发起、整批校验、无执行权、分歧不自动裁决、陈旧失效）。
+- `specs/agent-interfaces/spec.md`、`specs/memory-governance/spec.md`：两个 delta。
+
+设计取向上有三处明确取舍：**AI 判断只能在 Agent 会话内产生**（控制台不持凭据、不外发记忆，复核包 → 会话 → 写回闭环）；**不提供记忆正文编辑与删除接口**（避免把"能开网页"变成"能改历史"）；**不新增数据库表**（AI 建议落 `~/.cairn/console/`，否则 `user_version` 推到 3 会让旧版 cairn 拒绝打开、回滚从"删目录"变成"恢复备份"）。
+
+**3) Archify 参考的来源**
+
+用户于 22:15 安装，`~/.workbuddy/skills/archify` 是指向 `D:/DevelopEnvironment/skills/archify` 的符号链接（首轮排查时尚未安装，故当时判定"未检出"）。色值直接取自其 `assets/template.html` 的 `[data-theme]` 块（第 173–257 行）：7 类箭头色（cyan/emerald/violet/amber/rose/orange/slate）+ 双主题面板色，一一映射为 cairn 的语义色（amber=待处理、emerald=健康、violet=待审、cyan=层级、rose=敏感、orange=同步、slate=次要）。字体沿用其系统栈，但不内嵌 JetBrains Mono，省体积给正文。
+
+下一入口：等用户审阅提案 → `/opsx:apply add-memory-workbench`。四个待决项已由用户定：端口不固定、Archify 用已装版本、建议采用双层叠加、导出含完整正文。
+
+# 2026-10-29 追加（九）：`add-memory-workbench` 实施完成
+
+用户拍板「默认包含；继续推进」后从 `tasks.md` 1.1 起实施完毕：**28 项中 24 项完成**，剩 7.1–7.4 四件收尾（7.1/7.3/7.4 本轮已实跑，见下）。`npm test` 三连跑全绿：510 项 / 509 通过 / 0 失败 / 1 显式 skip；`npm run typecheck` 干净；`npm pack --dry-run` 202 文件 / 281.2 kB（解包 1.1 MB）。
+
+**1) 代码落点**
+
+- `src/interfaces/console/`：`model.ts`（只读装配）、`security.ts`（令牌/Host/Origin/掩码）、`server.ts`（21 端点 + `normalizeProposedItems`）、`suggestions.ts`（8 条规则 + inbox）、`review-store.ts`（复核包/写回/陈旧）、`export.ts`（单文件导出）、`assets/{page,ui-css,ui-js,url-state,text}.ts`。
+- CLI：`cairn ui [--port N] [--no-open] [--json] [--export <file>] [--redact]`、`cairn review pack|submit|list`。
+- MCP：新增 `memory_review`（`action: pack|submit|list`），与 CLI 共用 `review-store` 同一实现与校验。
+- `AppService.approve(planId, { channel })`：审计 action 参数化为 `issued_via_<channel>`，默认 `cli`（回归安全）。
+
+**2) 测试增量（新增 13 个文件、120 项：基线 390 → 510）**
+
+`tests/console/{model,security,server,suggestions,review-store,export,assets,url-state,render,workbench,cli-ui}.test.ts` 与 `tests/interfaces/{approval-channel,review-cli}.test.ts`。其中 server（18 项）、cli-ui（8 项）、workbench（7 项）、review-cli（4 项）走真实进程/真实 HTTP，不用桩。
+
+**3) 实施期发现并修掉的真问题**
+
+- **写服务句柄悬空**：`getWriter()` 缓存的 `AppService` 在每请求 `finally` 里被 close，第二次写操作命中已关闭的库（`database is not open` → 500）。改为常驻到服务关闭；test 13 覆盖。
+- **UI 草稿与计划层字段不匹配**：页面提交 `opType`（promote/merge/keep_both/skip）与 `content: null`，而 `ProposeItem` 要 `opHint` + `content`，直接提交会被整批判空。新增 `normalizeProposedItems()`：动作词表映射 + 按 `itemId` 从 `import_item` 回填权威正文（页面因此不必回传正文，摘要模式下也没得回传）。
+- **URL 状态双实现**：`readUrl/writeUrl` 原本内联在 42KB 脚本里无法测。抽出 `assets/url-state.ts`（`URL_STATE_SRC` 源码字符串，页面原样嵌入，测试实例化同一字符串），9 项断言覆盖往返/默认视图/mode 优先级/中文与 `__proto__` 注入。
+- **S-NUMERIC-CONFLICT 永不命中**（轮次内已修）：冲突判定必须早于近似重复，否则数值不同但 trigram ≥0.8 的条目会被判成 merge。
+- 前端补 `data-action="mode"`（控件与快捷键共用 `toggleMode` 的机械标识）。
+
+**4) 真实库只读冒烟（任务 7.3）**
+
+`node scripts/smoke-console.mjs`：对 `~/.cairn` 起 `cairn ui --port 0 --no-open`，打 10 个只读端点 + 两个负向用例（无令牌→401、`GET /api/sync/push`→404），前后对 `cairn.db` 做字节级 sha256 与 9 张表行数比对。结论 **PASS**：sha256 前后一致（`9266cde6e359e339…`），零表变化，端点全 200。报告 `artifacts/console-smoke-2026-10-28.json`（不入库）。全程未发任何 POST、未生成复核包、未导出明文产物。
+
+**5) 两条必须留档的事实**
+
+- **blocked 条目原文物理不可得**：`import.ts` 在入库前就把被判拦截的正文替换成 `[blocked:<kind>]`，原文从未写库。因此「导出含 blocked 正文」在当前数据模型下无法实现——不是开关问题。预览页如实标注"原文未入库"，`--redact` 只是附加掩码。用户要求"默认包含"已在能包含的范围内落实（记忆含 sensitive 默认全量输出、`--redact` 为唯一反向开关、取消 `--include-blocked` 以免组合歧义）。
+- **真实库 45 条 blocked 中 42 条是 `exfiltrate_all_memories` 正则误报**（另有 2 条 `escalate_scope`、1 条 `fake_approval`），无一条是真实秘密；误报来源是中文叙述里"导出……全部记忆"这类邻近匹配。修它会改动既有扫描器行为与 45 条既有数据的语义，属独立变更，**未在本轮动手**，待用户决定。
+
+**6) 两处既有行为（本轮未改，但要说清）**
+
+- `applyPlan` 对 `plan.status==='applied'` 直接返回 `alreadyApplied: true` 的空报告（幂等重试语义），不是报错。workbench 测试按此断言"不得产生新副作用、记忆不得复制成两条"。
+- 计划哈希绑定只比对 `approval.plan_hash` 与 `plan.plan_hash` 两处存量值，不重算 `plan_operation`；签发后手工改库不会被识别为篡改。改它动治理层，属独立变更。
+
+下一入口：用户决定是否（a）归档 `add-memory-workbench`（先补 7.2 收尾核对）、（b）修 `exfiltrate_all_memories` 误报的正则、（c）统一 `plan_operation` 重算校验。
+
+# 2026-10-29 追加（十）：`add-memory-workbench` 归档 + `add-auto-onboarding` 立提案
+
+用户对上一轮评估的拍板是三点：先归档再开新变更、自动应用走策略预授权、重复导入界面去重且「处理完成归档后只有一条」。本轮完成归档并立了新提案，**代码未改动**。
+
+**1) 归档结果**
+
+`add-memory-workbench` 按 OpenSpec 归档流程走完：`status` 显示 4/4 制品 `done`、`list` 显示 28/28 tasks、delta 与主规格先同步再移动。
+
+- 同步后主规格：`agent-interfaces` 6→7（新增「本地控制台入口」）、`memory-governance` 6 条不变（「计划绑定真实审批」整块替换，补入浏览器通道与缺少有效审批两个场景）、`local-console` 0→13（新建）、`memory-review` 0→6（新建）。
+- `openspec validate --specs --strict` 8/8 通过；`validate --all --strict` 同步通过。
+- 变更移至 `openspec/changes/archive/2026-10-29-add-memory-workbench/`，`openspec/changes/` 下已无 active change（立提案前）。
+- 归档前核对：`npm test` 510/509/0/1 三连绿、`tsc --noEmit` 干净、`npm pack --dry-run` 202 文件 281.2 kB、真实库只读冒烟 PASS。
+
+**2) 归档时补做的真实库实测（本轮新增证据）**
+
+对 `~/.cairn` 只读查询得到四组此前没有的数字：
+
+- **533 条里只有 329 条是实质正文（127,332 字）**；其余 204 条为结构残片 143（frontmatter/标题/`---`，其中 `---` 单独成条 18 次）、blocked 占位符 45（**42 份是同一个字符串** `[blocked:exfiltrate_all_memories]`）、碎片 3、加粗小标题 13。长度分布：1–50 字 139 条、51–200 字 157 条、201–800 字 205 条、801–2000 字 31 条、2000+ 1 条。
+- **规则引擎对全库跑完只要 74 ms**，结果 `promote 342 / skip 191 / needs_human 0 / merge 0`。342 条 promote **全部来自兜底规则 `S-CLEAN-DEFAULT`、置信度一律 medium**，即规则层没有给出判断，只是没话可说时的默认值。因此「补规则就能自动处理」不成立——补规则最多再砍 13 条（2%）。
+- **重复量**：51 个档案只有 49 个不重复来源（`codebuddy:MEMORY.md` 导了 3 次，合计 64,924 B）；跨档案正文完全重复 23 组、冗余 79 条；与已有 4 条记忆正文重复 0 条。
+- **晋升路径没有按内容查重**：`memory` 表无内容唯一约束，`apply` 的 `add` 分支直接 `memories.add()`，插入前不查同作用域是否已有相同正文。这意味着同一段正文从多个快照分别晋升会变成多条 active 记忆——用户要求的「只有一条」当前不成立。
+
+**3) 新提案 `add-auto-onboarding` 的范围**
+
+三个 capability delta：
+
+- `auto-onboarding`（新，7 条需求）：策略签发与内容哈希绑定、条件逐条判定、自动应用不改变确定性审批约束、结果可撤销、例外集中上报、AI 层分派回收、不在会话关键路径运行。
+- `memory-governance`（ADDED 1 条）：「内容重复不产生重复记忆」——生成时合并同哈希条目、应用时 `add` 前查重。
+- `local-console`（MODIFIED 1 条 + ADDED 4 条）：批次进度行并入快照信息、抽屉式详情、抽屉内批量处理、来源折叠、自动整理结果呈现。
+
+**4) 四个关键设计决策（详见 `design.md`）**
+
+- **策略怎么签**：复用 `approved_by='local_cli'` + `channel='policy:<id>:<hash8>'`。`approval.approved_by` 有 CHECK 枚举，SQLite 加枚举值要重建表；而 `channel` 是自由 TEXT，天然能承载策略标识。配套三条约束：签发路径唯一（只有 `policyAutoApply()` 能写 `policy:` 前缀）、审计强制带 `policyHash`、负向用例验证伪造 channel 被拒。
+- **去重放两处**：生成时合并解决「一次计划内重复」，应用时查重解决「跨计划重复 + 重试幂等」。只做一处都达不到用户要的结果。
+- **不用唯一索引**：`UNIQUE(scope_id, normalized_content) WHERE status='active'` 会与 `keep_both` 直接冲突（用户显式要求两条矛盾并存时可能同内容），历史修订也会让 normalized_content 在 active/superseded 间交错。改为非唯一索引 `memory_scope_content` 加速，判定留代码里。
+- **MCP 不能签发策略**：`memory_decide` 只有 `next|submit|auto`，不接受策略内容、不接受 channel 参数。签发只能 `cairn policy sign`（终端）或工作台（回环 + 令牌）。这样"谁能授权自动化"始终在人手里。
+
+**5) 状态**
+
+`openspec validate add-auto-onboarding` 与 `--strict` 均 valid，4/4 制品齐全，38 项 tasks 未开始（`openspec list` 计数）。**按 AGENTS.md 约定，propose 后须用户审阅才 apply，本轮未动任何 `src/`、`tests/`。**
+
+下一入口：等用户审阅提案。审阅通过后从 tasks 1.1 起实施，建议顺序 1（策略层）→ 3（去重）→ 2（自动编排）→ 4（导入视图）→ 5/6（CLI/MCP）→ 7（验收）。
+
+# 2026-10-29 追加（十一）：`add-auto-onboarding` 实施完成
+
+## 1. 一句话结论
+
+43/43 tasks 完成，全量测试 **606 项 / 605 通过 / 0 失败 / 1 显式 skip**，只读冒烟 18 个端点全绿且数据目录字节级 sha256 前后一致。产品上多了三件东西：**写入时判断**（Agent 在场时顺手给结论）、**策略预授权**（一份能核对哈希的授权，决定"哪些能自动过"）、**导入工作台**（一条来源一次导入一行的单表 + 抽屉 + 撤销入口）。
+
+## 2. 两处方案在实施中被改掉
+
+### 2.1 「AI 判断」从"事后分派"改成"写入时优先"（用户提出）
+
+原方案把 AI 判断放在"打包 → 判断 → 回收"里。用户 2026-10-29 指出：WorkBuddy 这类 Agent 的记忆本来就是 Agent 自己在管，**判断应该在写入那一刻就做完**，而不是事后单看一段脱了上下文的文本。这一点成立，方案据此改写：
+
+- 写入时（`memory_add` / `cairn add` 带 `judgement`）与存量导入（`memory_decide` 三步闭环）**共享同一套判定与落库路径**；
+- 落成 design 的 **D10 权力边界表**：`judgement` 只影响"这条值不值得记"，不能改敏感度、不能扩作用域、不构成审批凭证；
+- spec 增加 6 个 Scenario，其中「两个通道结论冲突」专门钉住"后写的不覆盖先写的"。
+
+### 2.2 「撤销」的语义（实施中撞出来的）
+
+原计划里撤销只是"转 tombstone"。测试暴露出两个真问题：
+
+1. **撤销后重新整理拿不到建议**。`computeSuggestions` 按"存在 `item_promoted` 审计"过滤已处理条目，撤销不抵消这条审计，于是重新整理时规则层一律返回 `needs_human`，`applied=0`——重做变成空转。
+   → 修法不是放宽撤销，而是给 `computeSuggestions` 加 `includePromoted`，**只在 `--redo` 时打开**。只放宽选择不放宽规则层，等于什么都没做。
+2. **撤销必须"粘"**。如果撤销让条目自动回到待整理，一次定时任务或一次续跑就会把用户刚撤销的记忆写回来。所以默认重跑恒定 `applied=0`，重做必须显式 `--redo`（同时放宽选择与规则层两处）。
+
+配套两条实现事实：
+
+- `markItemPromoted` 允许"原目标已被遗忘时改挂到新记忆"并追加审计（旧映射留在历史里）。否则条目会永远卡在"已晋升到一条不存在的记忆"。只认明确的 tombstone：记忆行不存在时宁可报冲突，不猜。
+- `revoked` 审计补 `batchIds` 数组。整策略撤销时 `batchId=null`，不记 `batchIds` 的话界面与排查都无法把撤销挂回某个批次，表现为"撤了但看不出撤过"。
+
+## 3. 「已晋升」谓词曾经写在 6 个地方
+
+`EXISTS (… item_promoted …)` 这个子句在 `batches.ts` / `auto.ts` / `app-service.ts` / `review-store.ts` / `model.ts` / `suggestions.ts` / `server.ts` 里各写了一份。撤销语义就是在其中一处漏掉的——**同一判定写 N 份，改的时候一定漏**。
+
+现在只有一处：`src/onboarding/batches.ts` 的 `promotedPredicate(alias)`，其余 6 处全部改调它（`model.ts` 用 `%ALIAS%` 占位符）。这条已写进 AGENTS.md，别再手写。
+
+顺带修掉一个静默降级：`auto.ts` 生成 merge op 时用 `findDuplicate(content)` 取目标，而规则层的 merge 建议针对"语义近似但正文不同"的条目——按正文查重根本查不到，结果 merge 被静默降级成 add，多出一条重复记忆。现在取规则层给的 `targetMemoryId`。
+
+## 4. 实施顺序与实际
+
+建议顺序是 1（策略）→ 3（去重）→ 2（编排）→ 4（视图）→ 5/6（CLI/MCP）→ 7（验收）；实际按 **3 → 1 → 2 → 5/6 → 4 → 7** 推进。把去重提到最前是因为它不依赖策略层，且直接对应"同一段正文会变成多条 active 记忆"这个已实测的缺陷。
+
+## 5. 交付清单
+
+**新增源码**：`governance/dedup.ts`、`onboarding/judgement.ts`、`onboarding/policy.ts`、`onboarding/auto.ts`。
+
+**修改**：`app-service.ts`（`addMemory` 接受 `judgement`，四个写分支）、`governance/propose.ts`（写入查重 + 批内 `repeatOf:` 前缀）、`store/schema.ts` + `migrate.ts`（迁移 `003_dedup_v1` 非唯一索引）、`console/model.ts`（`buildImportRows` + `AutoRunView`）、`console/server.ts`（`/api/imports`、`/api/policies`、`/api/onboarding/{auto,revoke}`）、`console/assets/{ui-js,ui-css,url-state}.ts`（单表 + 抽屉 + 折叠 + 批量 + 地址字段）、`cli/main.ts`（`policy sign|list|show|revoke`、`onboarding auto|revoke`、`--redo`/`--items`）、`mcp/server.ts`（`memory_add.judgement`、`memory_decide`）。
+
+**新增测试**：`judgement`(19) / `dedup`(10) / `write-judgement`(10) / `policy`(14) / `auto`(13) / `policy-cli`(11) / `decide-mcp`(5)，加 console 侧 imports/抽屉/地址往返/端点 共 22 项。测试从 510 → 606。
+
+**文档**：新增 `docs/cairn-auto-onboarding.md`（策略字段 / 条件顺序与理由 / 撤销路径 / `judgement` 权力边界 / 出错对照表）。
+
+## 6. 状态与下一步
+
+- `openspec/changes/add-auto-onboarding/`：**43/43 tasks 打勾**，4/4 制品齐全，`validate` 与 `--strict` 均 valid。
+- 只读冒烟：`node scripts/smoke-console.mjs` → `verdict PASS`，18 端点全 ok，`bytesIdentical true`，`changedTables []`（报告在 `artifacts/console-smoke-2026-10-29.json`，不入库）。
+- 合成 HOME 端到端（新增 `npm run test:e2e` → `scripts/e2e-onboarding.mjs`，`verdict PASS`）：
+
+  | 项 | 实测 |
+  | --- | --- |
+  | 灌入 | 533 条 / 63,049 B（143 结构残片、45 blocked、23 组重复共 79 条） |
+  | 导入后 | total 533 / clean 488 / blocked 45 |
+  | dry-run | auto 488、manual 45、applied 0、balanced true |
+  | 正式跑 | applied 336、skipped 152、**failed 0**、balanced true |
+  | 人工队列 | 45（两位数） |
+  | 收敛 | 336 条 active 对应 336 个不同正文，`maxPerContent = 1` |
+
+  这张表回答了归档前悬着的那个问题：**"重复正文会变成多条 active 记忆"确实被修掉了**，而且人工队列从 533 降到 45。
+- 未做：浏览器端点击级验证（抽屉/折叠/批量只有源码级断言 + 真服务接口冒烟 + 端到端脚本；没有 jsdom，也不值得为此引一个前端测试栈）。
+- 归档前需要用户确认一件事：是否接受"撤销是粘的、重做必须 `--redo`"这个语义。
+
+## 7. 2026-10-30 浏览器点击级验收（补上第六节"未做"那一项）
+
+第六节收尾时留了一句"浏览器端点击级验证没做"。这次补上了，并且**一补就连着抓出三个真缺陷**——都是"源码看着对、真点下去不对"的类型，源码级断言看不见。
+
+做法：`scripts/e2e-console-ui.mjs`（`npm run test:ui`），Playwright 驱动**系统已装的 Chrome**（`channel: 'chrome'`，不下载 Chromium），临时 HOME 里造"同路径导两次 + 自动整理"的场景，跑完自删。playwright 作为一次性依赖 `npm i --no-save --no-package-lock`，**故意不写进 package.json**；缺它时脚本 exit 2 并打印安装命令，不静默跳过。
+
+### 抓到的三个缺陷
+
+| 缺陷 | 症状 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| 摘令牌时清掉整个 query | 分享出去的链接打开永远回到概览；`&drawer=` 打不开抽屉 | 页面拿到 `?t=` 后执行 `history.replaceState(null,'',location.pathname)`，把 `view`/`drawer`/`q` 一起抹了 | 只 `keep.delete('t')`，其余参数原样写回 |
+| 切视图不关抽屉 | 抽屉里"确认生成计划"跳审批后整页点不动，后续任何点击都超时 | 抽屉是整页遮罩，`go()` 只改 `state.view` 不 `closeDrawer()` | `go()` 里切视图先清 `drawer`/`item` 再 `closeDrawer()` |
+| 策略下拉不记选择 | 预演完直接点真跑，只得到"先选一个策略"，像是按钮坏了 | 预演后 `load()` 重建整块 `autoBar`，`select` 选中值没存进 state | 加 `state.policy`，`change` 时写回、重建时恢复 |
+
+前两个是**功能坏了**（分享失效、界面锁死），第三个是**流程断了**（预演→真跑这条最自然的路径走不通）。三个都留了形状断言在 `tests/console/assets.test.ts`，以后重构退化会直接红。
+
+### 覆盖范围（46 项，全通过）
+
+- 无令牌访问 `/api/status` → 401
+- 导航只剩 5 个视图，`snapshots`/`batches`/`inbox` 已不存在
+- 同源折叠：`details` 初始 `open=false`、历史行**不可见**；展开后可见（要断言可见性，历史行一直在 DOM 里，数行数没意义）
+- 抽屉：`role=dialog` + `aria-modal` + `aria-label`；打开后焦点落在「关闭」上；`Esc`/遮罩/按钮三入口都能关；`Esc` 关完焦点**还回「查看」按钮**；关闭后地址不再带 `drawer`
+- 带 `drawer=` 刷新能自动还原抽屉（这条以前是坏的）
+- 批量面板：先摊开「确认生成计划（5 项）」与动作分布，**不直接执行**；无人判断时不出现"需人判断 0（不纳入）"这种噪音；确认后跳审批、抽屉已收、地址不带旧 `drawer`
+- 自动整理：只列已签发策略、页面无签发入口、「只预演」真的零写入（`应用 0`）、真跑后出现「按策略撤销」、撤销前确认文案说明"转墓碑"、取消确认不执行
+- 静态预览页（`ui --export`）：文件名带 `-personal` 后缀、无「自动整理」与「按策略撤销」、能看单表、点「查看」仍能开抽屉、无脚本异常
+- 工作台全程零脚本错误
+
+### 验收数字
+
+- `npm test`：**609 项 / 608 通过 / 0 失败 / 1 skip**（从 606 涨到 609：三条形状断言）
+- `npm run test:ui`：46/46，报告 `artifacts/console-ui-2026-10-30.json`
+- `openspec validate add-auto-onboarding --strict`：valid；tasks 43/43 + 追加 8.1–8.5
+
+### 仍然没做的
+
+- 没有 Firefox/Safari 覆盖，只验证了 Chrome（`role`/`aria` 与焦点行为是标准 API，风险不高但没测）。
+- 没做视觉回归（像素比对），版式改动不会报警。
+
+### 需要用户确认的两件事（沿用第六节）
+
+1. 是否接受"撤销是粘的、重做必须 `--redo`"这个语义。
+2. 改动已按变更拆成 commit，是否要合并推送。

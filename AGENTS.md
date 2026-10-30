@@ -3,11 +3,18 @@
 ## 当前入口
 
 - 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录与 2026-10-28 追加第六、七节）。
-- 两个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）与 `add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）。当前无活跃变更。
+- 三个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）、`add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）、`add-memory-workbench`（本地控制台：预览页 + 工作台 + 双层建议 + 静态导出；28/28 tasks，2026-10-29 归档，主规格新增 `local-console` 与 `memory-review`）。
+- **归档时的一条实测结论**：真实库 533 条快照里只有 329 条是实质正文（127 KB），其余 204 条是结构残片（143）、blocked 占位符（45）、碎片（3）与加粗小标题（13）。规则引擎对这 533 条已跑到天花板——判 191 条 skip、342 条判 `promote` 但**全部来自兜底规则 `S-CLEAN-DEFAULT`、置信度一律 medium**，等于没有判断。因此「再补规则就能自动处理」不成立，语义判断必须交给 AI 层。
+- **当前有一个已实现待归档的变更 `add-auto-onboarding`（策略预授权的自动整理 + 写入时判断与查重 + 导入工作台抽屉化）：43/43 tasks 完成，4/4 制品齐全。** 方案要点见 `openspec/changes/add-auto-onboarding/design.md`，使用说明见 `docs/cairn-auto-onboarding.md`。四条不许退让的边界：策略复用 `approved_by='local_cli'` + `channel='policy:<id>:<hash8>'`（不改 CHECK 枚举）；`judgement` 只能影响"值不值得记"，不能改敏感度/扩作用域/当审批；查重是 `findDuplicate` 一个函数三个调用点（写入 / 计划生成 / 计划应用）；`memory_decide` 不能签发策略。
+- **"已晋升"这个谓词只有一处出处：`src/onboarding/batches.ts` 的 `promotedPredicate()`。** 它曾经在 6 个文件里各写一份，撤销语义就是在其中一处漏掉的——别再手写 `EXISTS (… item_promoted …)`。
+- **撤销是粘的**：`onboarding revoke` 把记忆转墓碑，普通重跑**不会**把它们写回来；要重做必须显式 `--redo`（同时放宽选择与规则层两处）。撤销"结果"（`onboarding revoke`）与撤销"授权"（`policy revoke`）是两件不同的事。
+- 控制台（`cairn ui`）入口与边界见 `docs/cairn-console.md`；只读冒烟脚本 `node scripts/smoke-console.mjs`（对真实库前后做字节级 sha256 与表行数比对，报告落 `artifacts/console-smoke-<date>.json`，不入库；已覆盖 `/api/imports`、`/api/policies`、抽屉的 archive items 与"GET 打写端点必须 404"）。
+- 端到端验收 `npm run test:e2e`（`scripts/e2e-onboarding.mjs`）：临时 HOME 里灌一份与真实库同构的 533 条 fixture（143 结构残片 / 45 blocked / 23 组重复正文），跑完整自动整理，断言"人工队列两位数 + 同内容只留一条 active"。**不碰真实库，跑完自删**（`CAIRN_KEEP_E2E=1` 保留样本）。2026-10-29 实测：applied 336 / skipped 152 / failed 0，`maxPerContent = 1`。
 - 宿主 MCP 接入已于 2026-10-28 自检通过并完成配置写入（见 `docs/verify-host-mcp-2026-10-28.md`）：`~/.workbuddy/mcp.json` 已加入 `cairn` 条目，指向 `dist/src/interfaces/mcp/server.js`，**改 `src/` 后须 `npm run build` 才对新会话生效**；信任状态需用户在连接器 UI 确认。日常自检用 `npm run mcp:smoke`（默认只读真实库，写库须 `--write --home <临时目录>`）。
-- 测试基线：`npm test` 默认不联网，恒 390 项 / 389 通过 / 1 显式 skip；真实云端往返用 `npm run test:real`（需 `OBS_*` 五个变量齐全，缺任一即 exit 2，不静默 skip）。
+- 浏览器点击级验收 `npm run test:ui`（`scripts/e2e-console-ui.mjs`，Playwright + 系统 Chrome，`channel: 'chrome'` 不下载 Chromium）：真点导航/抽屉/折叠/批量/静态页，断言 `role=dialog`、焦点移入与归还、Esc·遮罩·按钮三入口、地址往返还原、只读预览页无写入口。**依赖是一次性的，未写入 package.json**：缺 playwright 时脚本 exit 2 并给出 `npm i --no-save --no-package-lock playwright`，不静默跳过。2026-10-30 实测 46/46，报告落 `artifacts/console-ui-<date>.json`。
+- 测试基线：`npm test` 默认不联网，恒 609 项 / 608 通过 / 0 失败 / 1 显式 skip（2026-10-30 起）；真实云端往返用 `npm run test:real`（需 `OBS_*` 五个变量齐全，缺任一即 exit 2，不静默 skip）。
 - 下一入口候选（需用户决定）：macOS 平台 CI（用户 2026-10-28 明确暂缓）；项目/自定义空间的云同步扩展；公开发布准备（private→public、npm 发包、`@cairn/memory` 包名核查）。
-- 使用文档在 `docs/cairn-usage.md`、`docs/cairn-security.md`、`docs/cairn-sync.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
+- 使用文档在 `docs/cairn-usage.md`、`docs/cairn-security.md`、`docs/cairn-sync.md`、`docs/cairn-console.md`、`docs/cairn-auto-onboarding.md`；运行入口见 README"快速开始"（Windows 不要直接运行 .ts/.js 文件）。
 
 ## 产品与技术边界
 

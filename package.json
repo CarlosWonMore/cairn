@@ -30,7 +30,9 @@
     "test:module": "node --import tsx --test",
     "test:real": "node scripts/test-real-obs.mjs",
     "mcp:smoke": "npm run build && node scripts/mcp-smoke.mjs",
-    "smoke:pack": "npm run build && npm pack --dry-run"
+    "smoke:pack": "npm run build && npm pack --dry-run",
+    "test:e2e": "npm run build && node scripts/e2e-onboarding.mjs",
+    "test:ui": "npm run build && node scripts/e2e-console-ui.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",
