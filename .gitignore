@@ -21,3 +21,4 @@ artifacts/
 .codebuddy/
 .workbuddy/
 .zcode/
+*.cairn-backup

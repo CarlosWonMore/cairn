@@ -56,7 +56,7 @@ const INJECTION_RULES: InjectionRule[] = [
   {
     kind: 'exfiltrate_memory',
     rule: 'exfiltrate_all_memories',
-    re: /导出|上传|发送|输出|泄露.{0,6}(?:全部|所有|整个)(?:记忆|库|数据)|export\s+(?:all|the\s+entire)\s+(?:memor|data|vault)|dump\s+all\s+memor/i,
+    re: /(?:把|将)?(?:全部|所有|整个)(?:记忆|库|数据).{0,6}(?:导出|上传|发送|输出|泄露)|(?:导出|上传|发送|输出|泄露).{0,6}(?:全部|所有|整个)(?:记忆|库|数据)|export\s+(?:all|the\s+entire)\s+(?:memor|data|vault)|dump\s+all\s+memor/i,
   },
   {
     kind: 'escalate_scope',
