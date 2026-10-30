@@ -14,10 +14,7 @@ import { err } from '../core/errors.js';
  * - schema 已冻结（design Migration Plan），不能给 import_item 加晋升列；
  * - 晋升映射写入 audit_event：category='onboarding'、action='item_promoted'、
  *   subject={type:'import_item', id:itemId}、detail={"itemId","memoryId"}；
- * - batchProgress / nextBatchChunk 用 SQLite json_extract 过滤已晋升条目：
- *     SELECT COUNT(*) FROM audit_event
- *      WHERE category='onboarding' AND action='item_promoted'
- *        AND json_extract(detail,'$.itemId') = ?
+ * - 所有"这条还需要处理吗"的判断统一走 promotedPredicate()（审计存在即已晋升）；
  * - 好处：晋升动作本身永远是可审计事件（谁在何时晋升了哪条到哪条记忆），
  *   状态与审计天然一致，且跨会话持久。
  */
@@ -25,16 +22,33 @@ import { err } from '../core/errors.js';
 const PROMOTED_CATEGORY = 'onboarding';
 const PROMOTED_ACTION = 'item_promoted';
 
-/** SQL 谓词（category/action 为模块内常量，batchId/itemId 一律走位置参数）。 */
-const PROMOTED_EXISTS = `EXISTS (
+/**
+ * 「这条导入条目已经晋升过了吗」的唯一出处。
+ *
+ * 语义刻意只认审计事实：**晋升过就是晋升过**，与目标记忆后来变成 active、
+ * archived 还是 tombstoned 无关。
+ *
+ * 为什么不能跟着记忆状态走：撤销（policy revoke）会把记忆转 tombstone。如果
+ * 谓词随之失效，条目就自动回到"待整理"，下一次普通运行会**把用户刚撤销的
+ * 记忆重新写回来**——撤销于是变成一次性的，定时任务或续跑都能把它翻掉。
+ * 真正的"重做"必须显式：`onboarding auto --redo`（选条目 + 规则层都重新判）。
+ *
+ * 调用方一律用它，不要自己手写 EXISTS 子句：这个谓词曾经在 6 个文件里各写一遍，
+ * 改语义时漏掉任何一处，各处行为就会互相矛盾。
+ */
+export function promotedPredicate(alias = 'i'): { exists: string; notExists: string } {
+  // 允许 console/model.ts 的 %ALIAS% 占位符（它做字符串替换后再拼接）。
+  if (alias !== '%ALIAS%' && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) {
+    throw err('E_VALIDATION', `非法 SQL 别名: ${alias}`);
+  }
+  const exists = `EXISTS (
   SELECT 1 FROM audit_event a
-   WHERE a.category = ? AND a.action = ?
-     AND json_extract(a.detail, '$.itemId') = i.id)`;
+   WHERE a.category = '${PROMOTED_CATEGORY}' AND a.action = '${PROMOTED_ACTION}'
+     AND json_extract(a.detail, '$.itemId') = ${alias}.id)`;
+  return { exists, notExists: `NOT ${exists}` };
+}
 
-const PROMOTED_NOT_EXISTS = `NOT EXISTS (
-  SELECT 1 FROM audit_event a
-   WHERE a.category = ? AND a.action = ?
-     AND json_extract(a.detail, '$.itemId') = i.id)`;
+const { exists: PROMOTED_EXISTS, notExists: PROMOTED_NOT_EXISTS } = promotedPredicate('i');
 
 export interface BatchProgress {
   batchId: string;
@@ -83,14 +97,12 @@ export function batchProgress(store: CairnStore, batchId: string): BatchProgress
   const clean = toCount(store.db.scalar(`SELECT COUNT(*) ${where} AND i.scan_state = 'clean'`, batchId));
   const blocked = toCount(store.db.scalar(`SELECT COUNT(*) ${where} AND i.scan_state = 'blocked'`, batchId));
   const promoted = toCount(
-    store.db.scalar(`SELECT COUNT(*) ${where} AND ${PROMOTED_EXISTS}`, batchId, PROMOTED_CATEGORY, PROMOTED_ACTION),
+    store.db.scalar(`SELECT COUNT(*) ${where} AND ${PROMOTED_EXISTS}`, batchId),
   );
   const remaining = toCount(
     store.db.scalar(
       `SELECT COUNT(*) ${where} AND i.scan_state = 'clean' AND ${PROMOTED_NOT_EXISTS}`,
       batchId,
-      PROMOTED_CATEGORY,
-      PROMOTED_ACTION,
     ),
   );
   return { batchId, total, clean, blocked, promoted, remaining };
@@ -113,8 +125,6 @@ export function nextBatchChunk(store: CairnStore, batchId: string, limit: number
       ORDER BY i.archive_id, i.item_index
       LIMIT ?`,
     batchId,
-    PROMOTED_CATEGORY,
-    PROMOTED_ACTION,
     limit,
   );
   return rows.map((r) => ({
@@ -131,6 +141,11 @@ export function nextBatchChunk(store: CairnStore, batchId: string, limit: number
  * （category='onboarding', action='item_promoted'，detail 含 itemId+memoryId）。
  * 幂等：同一 (itemId, memoryId) 重复标记不产生第二条审计；同一 itemId 晋升到
  * 不同 memoryId 视为状态改写，抛 E_CONFLICT_STATE。
+ *
+ * 例外：原目标记忆已被遗忘（tombstone）时允许改挂到新记忆。撤销（policy revoke）
+ * 之后再整理必然会走到这里——旧记忆已经不存在，再死守旧映射只会让条目永远卡在
+ * "已晋升"。此时追加一条审计，旧的保留在历史里（审计只增不改），判定以新的一条为准。
+ *
  * 调用方契约：只允许对 scan_state='clean' 的条目调用（blocked 条目已被
  * nextBatchChunk 排除在批次之外，活动记忆侧另有 DB 触发器兜底）。
  */
@@ -148,16 +163,26 @@ export function markItemPromoted(store: CairnStore, itemId: string, memoryId: st
     );
     if (rows.length > 0) {
       const prevMemoryId = extractMemoryId(rows[0]!['detail']);
-      if (prevMemoryId !== memoryId) {
+      if (prevMemoryId === memoryId) return; // 幂等：同条目同记忆，不重复记审计
+      if (prevMemoryId == null || !isTombstoned(store, prevMemoryId)) {
         throw err('E_CONFLICT_STATE', '条目已晋升到另一条记忆，拒绝重复标记（审计即状态，不允许改写）', {
           itemId,
           promotedMemoryId: prevMemoryId,
         });
       }
-      return; // 幂等：同条目同记忆，不重复记审计
+      // 原目标已被遗忘 → 视为重新整理，落到下面的追加逻辑。
     }
     store.audit.record(PROMOTED_CATEGORY, PROMOTED_ACTION, { type: 'import_item', id: itemId }, { itemId, memoryId });
   });
+}
+
+/**
+ * 原晋升目标是否已被遗忘。只认明确的 tombstone：记忆行不存在（脏 id、被硬删的旧数据）
+ * 不算"已遗忘"，那种情况下宁可报冲突让人看一眼，也不要猜。
+ */
+function isTombstoned(store: CairnStore, memoryId: string): boolean {
+  const row = store.db.get('SELECT status FROM memory WHERE id = ?', memoryId);
+  return row != null && String(row['status']) === 'tombstoned';
 }
 
 function extractMemoryId(detail: unknown): string | undefined {

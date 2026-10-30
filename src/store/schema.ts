@@ -430,3 +430,15 @@ CREATE TRIGGER memory_fts_au AFTER UPDATE OF content ON memory BEGIN
   INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 `;
+
+/**
+ * 003：内容去重加速（design D4）。
+ *
+ * 只加非唯一索引，不加 UNIQUE 约束：`UNIQUE(scope_id, content_hash) WHERE status='active'`
+ * 会与 keep_both 直接冲突——用户显式要求两条矛盾并存时，两条都可能是 active 且同内容；
+ * 历史修订也会让同一 content_hash 在 active 与 superseded 之间交错。
+ * 判定留在 governance/dedup.ts，索引只保证这条查询不随库增长退化。
+ */
+export const MIGRATION_003_DEDUP = /* sql */ `
+CREATE INDEX IF NOT EXISTS memory_scope_content ON memory(scope_id, content_hash);
+`;

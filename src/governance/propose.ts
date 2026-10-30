@@ -1,4 +1,5 @@
 import { contentHash } from '../core/hash.js';
+import { findDuplicate } from './dedup.js';
 import { err } from '../core/errors.js';
 import { EvidenceInput, MEMORY_KINDS, MemoryKind, SecretScanResult } from '../core/types.js';
 import { CairnStore } from '../store/open.js';
@@ -86,8 +87,8 @@ export function proposePlan(store: CairnStore, input: ProposePlanInput): Propose
   const rejected: RejectedItem[] = [];
   const duplicates: DuplicateItem[] = [];
   const ops: PlanOpInput[] = [];
-  /** 批内已占用正文哈希（仅承载正文的 op），防止同一批内互相重复。 */
-  const batchHashes = new Set<string>();
+  /** 批内已占用正文哈希 → 保留它的条目 id（用于告诉调用方"重复到哪条去了"）。 */
+  const batchHashes = new Map<string, string | null>();
 
   for (const item of input.items) {
     // 1. 逐项确定性校验：逐项拒绝（不抛错），全部无 op 时才抛 E_PLAN_INVALID
@@ -138,13 +139,21 @@ export function proposePlan(store: CairnStore, input: ProposePlanInput): Propose
     //    其余条目与库中现有记忆比对，再与批内更早条目比对
     if (item.opHint !== 'skip') {
       const hash = contentHash(item.content);
-      const existing = store.memories.findByContentHash(input.scopeId, hash);
+      // 与写入路径共用同一判定（governance/dedup）：只认 active/candidate。
+      // 若用 findByContentHash，会把 archived 也算成重复，导致"归档后重新导入永远无法晋升"。
+      const existing = findDuplicate(store.db, input.scopeId, item.content);
       if (existing) {
-        duplicates.push({ itemId: item.itemId, duplicateOfMemoryId: existing.id });
+        duplicates.push({ itemId: item.itemId, duplicateOfMemoryId: existing.memoryId });
         continue;
       }
       if (batchHashes.has(hash)) {
-        rejected.push({ itemId: item.itemId, reason: '与同批更早条目内容重复', findings: [] });
+        const keep = batchHashes.get(hash) ?? null;
+        rejected.push({
+          itemId: item.itemId,
+          // 前缀机器可读（调用方据此把证据并到保留项），后缀给人看。
+          reason: `repeatOf:${keep ?? '?'} 与同批更早条目内容重复`,
+          findings: [],
+        });
         continue;
       }
     }
@@ -155,7 +164,7 @@ export function proposePlan(store: CairnStore, input: ProposePlanInput): Propose
       ops.push({ opType: 'skip', itemId: item.itemId ?? null, reason: item.reason ?? null });
       continue;
     }
-    batchHashes.add(contentHash(item.content));
+    batchHashes.set(contentHash(item.content), item.itemId ?? null);
     const common = {
       itemId: item.itemId ?? null,
       content: item.content,

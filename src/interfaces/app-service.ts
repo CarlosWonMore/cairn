@@ -26,7 +26,9 @@ import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } fr
 import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
-import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
+import { findDuplicate } from '../governance/dedup.js';
+import { decideWrite, describeJudgement, Judgement, WriteAction } from '../onboarding/judgement.js';
+import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, promotedPredicate, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
 import { proposePlan, ProposedItem } from '../governance/propose.js';
 import { applyPlan, ApplyReport } from '../governance/apply.js';
 import { discoverSources, SourceCandidate } from '../onboarding/discover.js';
@@ -58,6 +60,19 @@ export interface AddMemoryInput {
   sourceSessionId?: string | null;
   evidence?: EvidenceInput[];
   scope?: ScopeSelection;
+}
+
+/**
+ * 写入结果。`action` 说明实际发生了什么——调用方不该靠"有没有拿到 id"来猜
+ * 自己是新建了一条、并入了旧的一条、还是被判断拦下了。
+ */
+export interface AddMemoryOutcome {
+  action: WriteAction;
+  basis: string;
+  /** `skip` 为 null；其余为实际落库或被并入/晋升的记忆。 */
+  memory: MemoryRecord | null;
+  /** `merge` / `promote_candidate` 指向命中的既有记忆。 */
+  duplicateOf: string | null;
 }
 
 export interface CallerContext {
@@ -180,7 +195,13 @@ export class AppService {
   // 显式记忆生命周期
   // -------------------------------------------------------------------------
 
-  addMemory(input: AddMemoryInput): MemoryRecord {
+  /**
+   * 显式写入。判断（`judgement`）是建议不是授权：它只能影响"这条值不值得记"，
+   * 敏感度与作用域永远取自写入参数，不取自判断（design D10）。
+   *
+   * 查重在这里做，因为写入路径的重复不是判断出来的、是对比出来的。
+   */
+  addMemory(input: AddMemoryInput, opts: { judgement?: Judgement | null } = {}): AddMemoryOutcome {
     const store = this.store;
     store.assertWritable();
     const authority = input.authority ?? 'user_explicit';
@@ -195,22 +216,80 @@ export class AppService {
       throw scanError(scan);
     }
     const scope = this.resolveScope(input.scope);
-    if (input.sensitivity === 'sensitive' && scope.syncPolicy !== 'local_only') {
+    // 敏感度只由写入参数决定：判断里没有这个字段，也无权改它。
+    const sensitivity = input.sensitivity ?? 'normal';
+    if (sensitivity === 'sensitive' && scope.syncPolicy !== 'local_only') {
       throw err('E_VALIDATION', 'sensitive 记忆必须使用 local_only 作用域（device-local / project-device / 自定义 local_only）');
     }
     const ctx = this.caller;
+    const createdBy = ctx.agentId === 'cli' ? 'cli' : `mcp:${ctx.agentId}`;
+    const sourceAgent = input.sourceAgent ?? ctx.agentId;
+
+    const judgement = opts.judgement ?? null;
+    const duplicate = findDuplicate(store.db, scope.id, input.content);
+    const decision = decideWrite({ judgement, duplicate });
+    const auditDetail = {
+      basis: decision.basis,
+      judgement: judgement ? describeJudgement(judgement) : null,
+      rationale: judgement?.rationale ?? null,
+      duplicateOf: decision.targetMemoryId,
+      scopeId: scope.id,
+    };
+
+    if (decision.action === 'skip') {
+      // 高置信的"不值得记"：不写库，但必须留痕，否则这条路是黑洞。
+      store.audit.record('memory', 'write_skipped', undefined, auditDetail);
+      return { action: 'skip', basis: decision.basis, memory: null, duplicateOf: null };
+    }
+
+    if (decision.action === 'merge') {
+      const target = store.memories.require(decision.targetMemoryId!);
+      if (target.scopeId !== scope.id) {
+        throw err('E_VALIDATION', '并入目标必须与写入作用域相同');
+      }
+      // 只追加证据与来源，不新建记忆（spec memory-governance）。
+      const additions: EvidenceInput[] = input.evidence?.length
+        ? input.evidence
+        : [{ evidenceKind: 'user_statement', sourceAgent, trustLevel: 'user_supplied' }];
+      for (const ev of additions) {
+        store.memories.addEvidence(target.id, target.currentRevisionId, ev);
+      }
+      store.audit.record('memory', 'write_merged', { type: 'memory', id: target.id }, auditDetail);
+      return { action: 'merge', basis: decision.basis, memory: store.memories.require(target.id), duplicateOf: target.id };
+    }
+
+    if (decision.action === 'promote_candidate') {
+      const candidateId = decision.targetMemoryId!;
+      // 本次写入自己就不具备晋升权威时，不能把它变成 active——只把证据并回候选。
+      if (authority === 'agent_inferred' || authority === 'imported_unverified') {
+        const cand = store.memories.require(candidateId);
+        for (const ev of input.evidence ?? []) {
+          store.memories.addEvidence(cand.id, cand.currentRevisionId, ev);
+        }
+        store.audit.record('memory', 'write_merged_candidate', { type: 'memory', id: cand.id }, auditDetail);
+        return { action: 'candidate', basis: decision.basis, memory: cand, duplicateOf: cand.id };
+      }
+      const promoted = store.memories.promoteToActive(candidateId, authority, createdBy);
+      for (const ev of input.evidence ?? []) {
+        store.memories.addEvidence(promoted.id, promoted.currentRevisionId, ev);
+      }
+      store.audit.record('memory', 'write_promoted_candidate', { type: 'memory', id: promoted.id }, auditDetail);
+      return { action: 'promote_candidate', basis: decision.basis, memory: promoted, duplicateOf: promoted.id };
+    }
+
+    // insert 与 candidate 都走新建：candidate 是低置信"不值得记"的可逆降级，不是丢弃。
     const memory = store.memories.add(
       {
         kind,
         content: input.content,
         scopeId: scope.id,
-        authority,
-        createdBy: ctx.agentId === 'cli' ? 'cli' : `mcp:${ctx.agentId}`,
-        sourceAgent: input.sourceAgent ?? ctx.agentId,
+        authority: decision.action === 'candidate' ? 'agent_inferred' : authority,
+        createdBy,
+        sourceAgent,
         sourceSessionId: input.sourceSessionId ?? null,
         evidence: input.evidence,
         expiresAt: input.expiresAt ?? null,
-        sensitivity: input.sensitivity ?? 'normal',
+        sensitivity,
       },
       ctx.deviceId,
     );
@@ -224,8 +303,9 @@ export class AppService {
         idempotencyKey: `memory:${memory.id}`,
       });
     }
-    store.audit.record('memory', 'added', { type: 'memory', id: memory.id }, { kind, authority, scopeId: scope.id });
-    return memory;
+    const auditAction = decision.action === 'candidate' ? 'added_candidate' : 'added';
+    store.audit.record('memory', auditAction, { type: 'memory', id: memory.id }, { ...auditDetail, kind, authority, sensitivity });
+    return { action: decision.action, basis: decision.basis, memory, duplicateOf: null };
   }
 
   reviseMemory(id: string, newContent: string, opts: { reason?: string; expectedCurrentRevisionId?: string } = {}): { memory: MemoryRecord; revision: RevisionRecord } {
@@ -551,8 +631,7 @@ export class AppService {
     const rows = this.store.db.all(
       `SELECT i.batch_id AS bid, COUNT(*) AS n FROM import_item i
        WHERE i.scan_state = 'clean' AND i.batch_id IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM audit_event a WHERE a.category='onboarding' AND a.action='item_promoted'
-                         AND json_extract(a.detail,'$.itemId') = i.id)
+         AND ${promotedPredicate('i').notExists}
        GROUP BY i.batch_id ORDER BY i.batch_id DESC LIMIT 1`,
     );
     return rows.length > 0 ? String(rows[0]!.bid) : null;
@@ -591,17 +670,19 @@ export class AppService {
     return { ...out, plan: out.plan, planHash: out.planHash };
   }
 
-  /** 本地可信审批通道（CLI approve）：展示差异后由用户在终端执行。 */
-  approve(planId: string, opts: { ttlMs?: number } = {}): { approvalId: string; expiresAt: string; itemCount: number } {
+  /** 本地可信审批通道（CLI approve / 控制台 webui）：展示差异后由用户签发。 */
+  approve(planId: string, opts: { ttlMs?: number; channel?: string } = {}): { approvalId: string; expiresAt: string; itemCount: number } {
     const store = this.store;
     store.assertWritable();
+    const channel = opts.channel ?? 'cli';
     store.plans.expireStale();
     const plan = store.plans.requireById(planId);
     if (plan.status !== 'awaiting_approval') {
       throw err('E_APPROVAL_INVALID', `计划状态为 ${plan.status}，只有 awaiting_approval 可批准`);
     }
-    const { approval } = store.plans.issueApproval({ planId, channel: 'cli', ttlMs: opts.ttlMs });
-    store.audit.record('approval', 'issued_via_cli', { type: 'approval', id: approval.id }, { planId, planHash: plan.planHash.slice(0, 16) });
+    const { approval } = store.plans.issueApproval({ planId, channel, ttlMs: opts.ttlMs });
+    // 审计动作名携带签发通道：事后能回答"这次批准是在终端还是网页上给的"。
+    store.audit.record('approval', `issued_via_${channel}`, { type: 'approval', id: approval.id }, { planId, planHash: plan.planHash.slice(0, 16), channel });
     return { approvalId: approval.id, expiresAt: approval.expiresAt, itemCount: plan.itemCount };
   }
 

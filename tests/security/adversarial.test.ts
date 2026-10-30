@@ -249,7 +249,7 @@ test('对抗-2c 层三 更正路径：reviseMemory 秘密 → E_SECRET_DETECTED�
   const home = makeTestHome();
   const service = AppService.open(home);
   try {
-    const m = service.addMemory({ content: '部署端口是 8080', kind: 'fact' });
+    const m = service.addMemory({ content: '部署端口是 8080', kind: 'fact' }).memory!;
     const e = catchCairnError(() => service.reviseMemory(m.id, `新口令 password = "${SECRET_PASSWORD}"`));
     assert.equal(e.code, 'E_SECRET_DETECTED');
     assert.ok(!JSON.stringify(e).includes(SECRET_PASSWORD), '更正阻断错误不回显秘密原文');

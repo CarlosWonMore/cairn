@@ -1,5 +1,5 @@
 import { CairnDb } from './db.js';
-import { MIGRATION_001_CORE, MIGRATION_002_SEARCH } from './schema.js';
+import { MIGRATION_001_CORE, MIGRATION_002_SEARCH, MIGRATION_003_DEDUP } from './schema.js';
 import { err } from '../core/errors.js';
 
 export interface Migration {
@@ -12,6 +12,7 @@ export interface Migration {
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'core_v1', sql: MIGRATION_001_CORE },
   { version: 2, name: 'search_v1', sql: MIGRATION_002_SEARCH },
+  { version: 3, name: 'dedup_v1', sql: MIGRATION_003_DEDUP },
 ];
 
 export interface MigrationResult {
