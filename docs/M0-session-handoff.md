@@ -575,3 +575,34 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 2. **改动已推送。** 4 个 commit 按关注点拆分（核心库层 / 接口层 / 控制台 / 脚本与文档），已推到 `origin/main`。
 
 至此 `add-auto-onboarding` 的 43 项任务与追加的 8.1–8.5 全部落地并验证，无待确认项。
+
+## 8. 2026-10-31 归档 `add-auto-onboarding`
+
+变更目录已移到 `openspec/changes/archive/2026-10-31-add-auto-onboarding/`（用 `git mv`，历史保留；`.openspec.yaml` 随目录走）。`openspec list` 现在返回空数组——**仓库没有活动变更了**。
+
+归档前先做了主规格同步（用户选择"先同步再归档"），三个 delta 形态不同，处理方式也不同：
+
+| Delta | 主规格原状态 | 差异 | 同步结果 |
+| --- | --- | --- | --- |
+| `auto-onboarding` | 不存在 | 8 条全 ADDED | 新建主规格，Purpose 逐字复制，8 条需求 26 个场景 |
+| `local-console` | 13 条 | 1 条 MODIFIED + 4 条 ADDED | 「批次进度全局可见」整块改写（并入快照来源/字节数/脱敏状态，加"档案与批次一一对应"场景），追加 4 条 → 17 条 |
+| `memory-governance` | 6 条 | 1 条 ADDED | 追加「内容重复不产生重复记忆」→ 7 条 |
+
+两点值得记住：
+
+- **`auto-onboarding` 与既有的 `agent-onboarding` 是两个能力，不是笔误。** 后者管初始化与接管（元数据发现、三类操作独立授权、快照、分批初始化、原生记忆渐进接管、受管入口移除），前者管自动化的许可边界（策略签发、条件判定、可撤销、判断在写入时生效）。名字近，读规格前先分清。
+- **`local-console` 那条 MODIFIED 是替换而非补充。** 旧版只要求"列出全部批次"，新版要求把快照来源、字节数、脱敏状态并入同一行，并明确「MUST NOT 把快照与批次拆成两个视图」。不同步就归档的话，主规格会一直描述着一个已经被删掉的三视图界面，下一次写 delta 会以错误基线为准。
+
+验证：
+
+- `openspec validate --specs` 与 `--specs --strict`：9 passed / 0 failed
+- `openspec validate --all --strict`：9 passed / 0 failed
+- 主规格内无残留 `## ADDED/MODIFIED/REMOVED/RENAMED Requirements` 头
+- 逐条机械核对：三个 delta 的 15 条需求、45 个场景全部在主规格中存在
+
+本轮只改 Markdown（主规格 + 三处文档），未触碰 `src/`、`tests/`，因此没有重跑测试；代码基线仍是 609 项 / 608 通过 / 0 失败 / 1 skip。
+
+### 归档后仍未验证的项（不因归档消失）
+
+- 浏览器只在 Chrome 上验证过，Firefox/Safari 未覆盖（`role`/`aria` 与焦点行为是标准 API，但没实测）。
+- 没有视觉回归（像素比对），版式改动不会报警。

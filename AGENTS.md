@@ -2,10 +2,10 @@
 
 ## 当前入口
 
-- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录与 2026-10-28 追加第六、七节）。
-- 三个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）、`add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）、`add-memory-workbench`（本地控制台：预览页 + 工作台 + 双层建议 + 静态导出；28/28 tasks，2026-10-29 归档，主规格新增 `local-console` 与 `memory-review`）。
+- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录，以及此后三次追加：第 6 节自动整理的实施方案与实测、第 7 节浏览器点击级验收、第 8 节 2026-10-31 归档记录）。
+- 四个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）、`add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）、`add-memory-workbench`（本地控制台：预览页 + 工作台 + 双层建议 + 静态导出；28/28 tasks，2026-10-29 归档，主规格新增 `local-console` 与 `memory-review`）、`add-auto-onboarding`（策略预授权的自动整理 + 写入时判断与查重 + 导入工作台抽屉化；43 tasks + 追加 8.1–8.5，2026-10-31 归档，主规格新增 `auto-onboarding`，改写 `local-console` 与 `memory-governance`）。**仓库当前没有活动变更。**
 - **归档时的一条实测结论**：真实库 533 条快照里只有 329 条是实质正文（127 KB），其余 204 条是结构残片（143）、blocked 占位符（45）、碎片（3）与加粗小标题（13）。规则引擎对这 533 条已跑到天花板——判 191 条 skip、342 条判 `promote` 但**全部来自兜底规则 `S-CLEAN-DEFAULT`、置信度一律 medium**，等于没有判断。因此「再补规则就能自动处理」不成立，语义判断必须交给 AI 层。
-- **当前有一个已实现待归档的变更 `add-auto-onboarding`（策略预授权的自动整理 + 写入时判断与查重 + 导入工作台抽屉化）：43/43 tasks 完成，4/4 制品齐全。** 方案要点见 `openspec/changes/add-auto-onboarding/design.md`，使用说明见 `docs/cairn-auto-onboarding.md`。四条不许退让的边界：策略复用 `approved_by='local_cli'` + `channel='policy:<id>:<hash8>'`（不改 CHECK 枚举）；`judgement` 只能影响"值不值得记"，不能改敏感度/扩作用域/当审批；查重是 `findDuplicate` 一个函数三个调用点（写入 / 计划生成 / 计划应用）；`memory_decide` 不能签发策略。
+- **`add-auto-onboarding` 的四条不许退让的边界**（已进主规格，改实现前先读 `openspec/specs/auto-onboarding/spec.md`）：策略复用 `approved_by='local_cli'` + `channel='policy:<id>:<hash8>'`（不改 CHECK 枚举）；`judgement` 只能影响"值不值得记"，不能改敏感度/扩作用域/当审批；查重是 `findDuplicate` 一个函数三个调用点（写入 / 计划生成 / 计划应用）；`memory_decide` 不能签发策略。方案要点见 `openspec/changes/archive/2026-10-31-add-auto-onboarding/design.md`，使用说明见 `docs/cairn-auto-onboarding.md`。
 - **"已晋升"这个谓词只有一处出处：`src/onboarding/batches.ts` 的 `promotedPredicate()`。** 它曾经在 6 个文件里各写一份，撤销语义就是在其中一处漏掉的——别再手写 `EXISTS (… item_promoted …)`。
 - **撤销是粘的**：`onboarding revoke` 把记忆转墓碑，普通重跑**不会**把它们写回来；要重做必须显式 `--redo`（同时放宽选择与规则层两处）。撤销"结果"（`onboarding revoke`）与撤销"授权"（`policy revoke`）是两件不同的事。
 - 控制台（`cairn ui`）入口与边界见 `docs/cairn-console.md`；只读冒烟脚本 `node scripts/smoke-console.mjs`（对真实库前后做字节级 sha256 与表行数比对，报告落 `artifacts/console-smoke-<date>.json`，不入库；已覆盖 `/api/imports`、`/api/policies`、抽屉的 archive items 与"GET 打写端点必须 404"）。
