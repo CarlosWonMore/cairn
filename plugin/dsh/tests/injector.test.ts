@@ -96,11 +96,80 @@ describe('createCairnMemoryPlugin：降级行为', () => {
       recall: async () => [hit('a', '内容')],
     });
     plugin.apply({ on: (e: string) => events.push(e) });
-    assert.deepEqual(events, ['agent/pre-step']);
+    // 需要两个事件：session/event 攒用户消息（pre-step 拿不到原文），pre-step 执行注入。
+    assert.deepEqual(events, ['session/event', 'agent/pre-step']);
   });
 
   it('宿主 ctx 缺失时不抛错', () => {
     const plugin = createCairnMemoryPlugin({ recall: async () => [] });
     assert.doesNotThrow(() => plugin.apply(undefined));
+  });
+});
+describe('插件对象形状：Cordis 兼容性（踩过的坑）', () => {
+  it('只暴露 name / inject / apply，不泄露额外属性', () => {
+    const plugin = createCairnMemoryPlugin({ recall: async () => [] });
+    const keys = Object.keys(plugin).sort();
+    assert.deepEqual(keys, ['apply', 'inject', 'name'],
+      'Cordis 用 Proxy 拦截 ctx 属性读取，插件对象多暴露一个属性就会被当作服务名解析并抛 cannot get property without inject');
+  });
+
+  it('inject 必须声明 tools（调 MCP 工具的前提）', () => {
+    const plugin = createCairnMemoryPlugin({});
+    assert.ok(Array.isArray(plugin.inject));
+    assert.ok(plugin.inject.includes('tools'), '不声明 tools 就拿不到 ctx.tools，插件无法召回');
+    for (const dep of plugin.inject) assert.equal(typeof dep, 'string');
+  });
+
+  it('pre-step 处理器必须调用 next()，否则会卡住整条链路', async () => {
+    let handler: ((p: unknown, n?: () => unknown) => Promise<unknown>) | null = null;
+    const plugin = createCairnMemoryPlugin({ recall: async () => [] });
+    plugin.apply({ on: (_e: string, fn: unknown) => { handler = fn as typeof handler; } });
+    assert.ok(handler, '必须注册 pre-step');
+    let called = false;
+    await handler!({ message: '足够长的查询' }, () => { called = true; return 'next-result'; });
+    assert.equal(called, true, 'next() 必须被调用');
+  });
+
+  it('apply 在 ctx.on 抛错时不向外冒泡', () => {
+    const plugin = createCairnMemoryPlugin({ recall: async () => [] });
+    assert.doesNotThrow(() =>
+      plugin.apply({ on: () => { throw new Error('宿主事件注册失败'); } }),
+    );
+  });
+});
+describe('注入走 agent.inject（真实 API）', () => {
+  it('命中时调用 agent.inject，且消息形状可辨识', async () => {
+    let handler: ((p: unknown, n?: () => unknown) => Promise<unknown>) | null = null;
+    const plugin = createCairnMemoryPlugin({
+      recall: async () => [{ id: 'a', kind: 'fact', content: '投影预算是 2KB' }],
+      config: { budgetBytes: 2048 },
+    });
+    plugin.apply({ on: (_e: string, fn: unknown) => { handler = fn as typeof handler; } });
+
+    const injected: unknown[] = [];
+    const payload = {
+      message: '投影预算是多少',
+      agent: { inject: (m: unknown) => injected.push(m) },
+    };
+    await handler!(payload, () => undefined);
+    assert.equal(injected.length, 1, '命中时必须调用 agent.inject');
+    const msg = injected[0] as { source?: { kind?: string } };
+    assert.equal(msg.source?.kind, 'cairn-memory-injection', '注入来源必须可辨识，便于会话记录区分');
+  });
+
+  it('未命中时不调用 agent.inject', async () => {
+    let handler: ((p: unknown, n?: () => unknown) => Promise<unknown>) | null = null;
+    const plugin = createCairnMemoryPlugin({ recall: async () => [] });
+    plugin.apply({ on: (_e: string, fn: unknown) => { handler = fn as typeof handler; } });
+    const injected: unknown[] = [];
+    await handler!({ message: '足够长的查询文本', agent: { inject: (m: unknown) => injected.push(m) } }, () => undefined);
+    assert.equal(injected.length, 0);
+  });
+
+  it('agent 缺失或 inject 非函数时不抛错（降级）', async () => {
+    let handler: ((p: unknown, n?: () => unknown) => Promise<unknown>) | null = null;
+    const plugin = createCairnMemoryPlugin({ recall: async () => [{ id: 'a', kind: 'fact', content: '内容' }] });
+    plugin.apply({ on: (_e: string, fn: unknown) => { handler = fn as typeof handler; } });
+    await assert.doesNotReject(() => handler!({ message: '足够长的查询文本' }, () => undefined) as Promise<unknown>);
   });
 });
