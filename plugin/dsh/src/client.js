@@ -22,25 +22,47 @@ window.__ModuleLoader__.load({
 
     function useUsage() {
       const [usage, setUsage] = React.useState(null);
+      const [failed, setFailed] = React.useState(false);
       React.useEffect(function () {
         let alive = true;
         function pull() {
           fetch(USAGE_URL, { headers: { accept: 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { if (alive) setUsage(d); })
-            .catch(function () { /* 拿不到就保持上一次，不打断界面 */ });
+            .then(function (r) {
+              if (!r.ok) throw new Error('http ' + r.status);
+              return r.ok ? r.json() : null;
+            })
+            .then(function (d) {
+              if (!alive) return;
+              setFailed(false);
+              setUsage(d);
+            })
+            .catch(function () {
+              if (alive) { setFailed(true); setUsage(null); }
+            });
         }
         pull();
         const t = setInterval(pull, 3000);
         return function () { alive = false; clearInterval(t); };
       }, []);
-      return usage;
+      return { usage: usage, failed: failed };
     }
 
     function MemoryUsagePanel() {
-      const usage = useUsage();
+      const state = useUsage();
+      const usage = state.usage;
       const [open, setOpen] = React.useState(false);
-      if (!usage) return null;
+      // usage 尚未到达：渲染等待态 chip（面板必须可见，否则用户无法区分
+      // 「插件没装上」和「数据还没到」——第三轮面板排查的核心症状）。
+      if (!usage) {
+        return h('span', {
+          'data-cairn-usage': 'waiting',
+          style: {
+            display: 'inline-flex', alignItems: 'center', gap: '6px',
+            color: '#9e9e9e', border: '1px dashed #bdbdbd',
+            borderRadius: '999px', padding: '2px 10px', font: 'inherit',
+          },
+        }, h('span', { 'aria-hidden': true }, '◌'), h('span', null, state.failed ? '端点不可用' : 'Cairn 记忆面板…'));
+      }
 
       const color = COLOR[usage.status] || COLOR.miss;
       const head = h('button', {
@@ -94,12 +116,22 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        ctx.slots.inject('conversation.session.header.actions', function () {
-          return ctx.slots.register(
-            { name: 'conversation.session.header.actions', id: 'cairn-memory-usage', order: 20 },
-            MemoryUsagePanel,
-          );
-        });
+        try {
+          ctx.slots.inject('conversation.session.header.actions', function () {
+            return ctx.slots.register(
+              {
+                name: 'conversation.session.header.actions',
+                key: 'cairn-memory-usage',
+                priority: 20,
+                inject: function () { return {}; },
+              },
+              MemoryUsagePanel,
+            );
+          });
+        } catch (error) {
+          // slot 未声明或已注册：不影响宿主其他功能，但要让排查者能在控制台看到
+          console.error('[cairn-dsh-memory] panel slot registration failed:', error);
+        }
       },
     };
   },

@@ -145,39 +145,58 @@ export const inject = ['tools'] as string[];
  */
 export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   const config = runtimeConfig ?? {};
-  const recall = makeToolRecall(ctx);
-  if (!recall) return; // 没有 tools 服务 → 静默降级，不注册钩子。
+  // 第四轮面板排查：tools 服务（MCP stdio）是异步就绪的——apply 时可能尚未可用。
+  // 绝不能在这里提前 return，否则 usage 路由与 pre-step 钩子全部丢失
+  //（面板不可见 + 召回失效的直接根因）。recall 缺失时降级为空召回。
+  const nullRecall: RecallFn = async () => [];
+  const recall = makeToolRecall(ctx) ?? nullRecall;
 
   const injector = createInjector({ recall, config });
 
   // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
-  // 用 ctx.inject(['webServer']) 惰性获取——worksbuddy 也这么做，webServer 不进模块级 inject。
   // 只返回摘要级信息，正文永不外传（design D3）。
   const usagePath = '/plugins/cairn-dsh-memory/usage';
+  let usageRegistered = false;
+  const serveUsage = (req: { method?: string }, res: { writeHead?: Function; end?: Function }): void => {
+    if (req.method !== 'GET') {
+      res.writeHead?.(405, { 'content-type': 'application/json' });
+      res.end?.(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+    const usage = injector.lastUsage();
+    res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end?.(JSON.stringify(usage ?? { status: 'miss', label: '未命中' }));
+  };
+  const registerUsageOn = (webServer: { register: (o: unknown) => unknown }): void => {
+    webServer.register({
+      kind: 'exact',
+      path: usagePath,
+      handler: serveUsage,
+    });
+    usageRegistered = true;
+  };
+  // 第三轮面板排查（toZcode-panel.md）：include-fiber 的 ctx 形态不确定——
+  // 路径 1 走 runtime ctx.inject（与 dsh-client-modules 同款），路径 2 走直接属性访问；
+  // 都失败只影响面板（诚实降级），不影响召回。诊断走 console.warn → host.stderr → DSH 日志。
   try {
-    const lazy = ctx as { inject?: (deps: string[], cb: (c: unknown) => void) => unknown } | undefined;
-    if (typeof lazy?.inject === 'function') {
-      lazy.inject(['webServer'], (webCtx) => {
-        const web = webCtx as { webServer?: { register?: (o: unknown) => unknown } };
-        if (typeof web.webServer?.register !== 'function') return;
-        web.webServer.register({
-          kind: 'exact',
-          path: usagePath,
-          handler: (req: { method?: string }, res: { writeHead?: Function; end?: Function }) => {
-            if (req.method !== 'GET') {
-              res.writeHead?.(405, { 'content-type': 'application/json' });
-              res.end?.(JSON.stringify({ error: 'method not allowed' }));
-              return;
-            }
-            const usage = injector.lastUsage();
-            res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-            res.end?.(JSON.stringify(usage ?? { status: 'miss', label: '未命中' }));
-          },
-        });
+    const c = ctx as { inject?: (deps: string[], cb: (c: unknown) => void) => unknown; webServer?: { register: (o: unknown) => unknown } };
+    if (typeof c.inject === 'function') {
+      c.inject(['webServer'], (webCtx: unknown) => {
+        const web = webCtx as { webServer?: { register: (o: unknown) => unknown } };
+        if (web && typeof web.webServer?.register === 'function') registerUsageOn(web.webServer);
       });
     }
-  } catch {
-    // 端点注册失败只影响面板，不影响召回。
+  } catch (e) {
+    console.warn('[cairn-dsh-memory] usage route path-1 failed:', (e as Error).message);
+  }
+  if (!usageRegistered) {
+    try {
+      const web = (ctx as { webServer?: { register: (o: unknown) => unknown } }).webServer;
+      if (web && typeof web.register === 'function') registerUsageOn(web);
+      else console.warn('[cairn-dsh-memory] webServer service unavailable; usage panel endpoint not registered');
+    } catch (e) {
+      console.warn('[cairn-dsh-memory] usage route path-2 failed:', (e as Error).message);
+    }
   }
 
   // pre-step 的 payload 不含用户原文（只有 { agent, signal }），

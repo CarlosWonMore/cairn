@@ -36,10 +36,20 @@ describe('插件形状（踩过三次的坑）', () => {
     assert.deepEqual(events, ['session/event', 'agent/pre-step']);
   });
 
-  it('拿不到 tools 服务时不注册任何钩子（降级）', () => {
+  it('拿不到 tools 服务时钩子照常注册、召回降级为空（2026-11-02 契约变更）', async () => {
+    // 第四轮面板排查：无 tools 时提前 return 会导致 usage 路由与 pre-step
+    // 钩子全部丢失（面板不可见的直接根因）——现在钩子必须注册，召回降级。
     const events: string[] = [];
-    apply({ on: (e: string) => events.push(e) }, {});
-    assert.deepEqual(events, [], '没有 ctx.tools 就不该注册钩子');
+    let preStep: ((p: unknown, n?: () => unknown) => Promise<unknown>) | null = null;
+    apply({
+      on: (e: string, fn: unknown) => { events.push(e); if (e === 'agent/pre-step') preStep = fn as typeof preStep; },
+    }, {});
+    assert.deepEqual(events, ['session/event', 'agent/pre-step'], '钩子必须注册');
+    if (preStep) {
+      const injected: unknown[] = [];
+      await preStep({ agent: { inject: (m: unknown) => injected.push(m) } }, () => {});
+      assert.equal(injected.length, 0, '无 tools 时召回降级为空，不注入');
+    }
   });
 
   it('ctx.on 抛错时不向外冒泡', () => {

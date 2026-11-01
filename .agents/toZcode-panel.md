@@ -1,0 +1,216 @@
+# 给 ZCode：DSH 记忆面板（client 插件）为什么渲染不出来
+
+> 交接方：DSH 会话（2026-11-02 02:00，Asia/Shanghai）
+> 仓库：`D:\Project\AI MemoryGLM` ｜ 分支 `main` ｜ HEAD `446a40a`
+> **核心问题：Host 侧插件已 `active`，但浏览器里看不到面板。**
+
+---
+
+## 一、先看结果，别先看我怎么说
+
+| 事实 | 证据 |
+|---|---|
+| Host 插件**加载成功** | 日志 `plugin.snapshot {\"pluginId\":\"include:cairn-dsh-memory\",\"fiberPhase\":\"active\"}` |
+| MCP 连接**正常** | `[cairn-mcp] stdio server ready (pid 41848)`，进程存在 |
+| **client 产物疑似未被接管** | 见下方「我的探测方法本身有问题」 |
+| 面板**从未在界面上出现过** | 用户连续 5 次重启后确认看不到 |
+
+---
+
+## 二、我走过的弯路（请勿重走）
+
+这是本次交接**最重要的一节**。我连续 5 次修错，每次都只追着报错里出现的那个属性名改：
+
+| 次 | 我改的 | 结果 | 真因 |
+|---|---|---|---|
+| 1 | 插件对象不再暴露 `recall` 属性 | 失败 | 症状 |
+| 2 | `inject` 加 `tools` | 失败 | 症状 |
+| 3 | config 改从 apply 第二参数取 | 失败 | 症状 |
+| 4 | **导出改成插件对象 `{name,inject,apply}`** | ✅ `active` | **真因** |
+| 5 | slot 换位置 + 加 HTTP 数据通路 | **仍看不到** | 未知 |
+
+第 4 次为什么是真因——asar 里加载器的代码：
+
+```js
+if (typeof plugin === 'function') return {
+  apply: (ctx) => plugin(guarded(ctx))   // 函数导出被当 apply，ctx 成了第一个参数
+};
+```
+
+我的默认导出曾是工厂函数 `createCairnMemoryPlugin(options)`，于是被代理的 ctx 落进了 `options`，读 `options.recall` / `options.config` 立刻抛 `cannot get property ... without inject`。**三次报错是同一个错误的不同面具。**
+
+---
+
+## 三、当前代码与配置的确定事实
+
+### Host 侧（已工作）
+
+`plugin/dsh/src/index.ts`：
+
+```ts
+export const name = 'cairn-dsh-memory';
+export const inject = ['tools'];
+export function apply(ctx, config) { ... }
+export default { name, inject, apply };
+```
+
+行为：监听 `session/event` 攒用户消息 → `agent/pre-step` 时调 `ctx.tools.call('mcp__cairn__memory_search', ...)` → `agent.inject(...)` 注入 → 写 `lastUsage`。
+
+单测 26/26 通过（`plugin/dsh/tests/`）。
+
+### Client 侧（疑似有问题）
+
+`plugin/dsh/src/client.js` 当前是**裸 ESM 风格**：
+
+```js
+window.__ModuleLoader__.load({
+  id: 'cairn-dsh-memory',
+  factory(require) {
+    const React = require('react');
+    ...
+    return { inject: ['slots'], apply(ctx) { ... } };   // ← 直接返回对象
+  },
+});
+```
+
+而**能工作的** `dsh-connect-workbuddy/lib/client.js` 是 **CJS 包装**：
+
+```js
+window.__ModuleLoader__.load({
+  id: 'dsh-connect-workbuddy',
+  factory: (require) => {
+    var module = { exports: {} };
+    var exports = module.exports;
+    ...
+    exports.apply = apply;
+    exports.inject = inject;
+    exports.name = name;
+    return module.exports;      // ← 返回 module.exports
+  }
+});
+```
+
+**我怀疑这是主因之一，但没有验证。** 请重点核对。
+
+### package.json 的 `dsh.client`
+
+可工作的 workbuddy：
+
+```json
+"client": {
+  "inject": ["@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-slots", ...],
+  "platform": "web"
+}
+```
+
+我的（参考 decoration 模板补的）：
+
+```json
+"client": {
+  "platform": "web",
+  "immediately": true,
+  "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+}
+```
+
+注意：workbuddy 的 `inject` 里有 `@deepseek-ai/dsh-client-ui-slots`，我的没有。**这可能是差异。**
+---
+
+## 四、我的探测方法本身有问题（别重犯）
+
+我用 `curl` 探测 `/plugins/cairn-dsh-memory/client.js` 得到 404，一度以为是证据。**这个探测方法无效**：
+
+```bash
+# 我测的（无效）：连已装且正常工作的插件也是 404
+curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:12281/plugins/dsh-connect-workbuddy/client.js"
+# → 404
+```
+
+从 asar 里 `@deepseek-ai/dsh-client-modules` 的说明看，真实形态是**按 combo 合并**的：
+
+> `.../plugins/??...&rev=...`，with one bootstrap combo for the modules row and one or more application combos for the other rows; each phase is partitioned before a URL exceeds 3 KiB.
+
+即：多个 bundle 被合并进一条 `??` 请求，不是一对一路径。所以「访问单个 client.js 得 404」**不构成证据**。
+
+---
+
+## 五、请 ZCode 做的事（按顺序）
+
+### 1. 确认 client 产物到底有没有被宿主接管
+
+推导方式建议：
+
+- 打开 `http://127.0.0.1:12281`，在浏览器 Network 里筛 `plugins`，看 boot combo 请求里是否出现 `cairn-dsh-memory`
+- 或在页面控制台查 `window.__ModuleLoader__` 已注册的 id 列表（若有 API）
+- 对照 `dsh-connect-workbuddy` 的同名请求，看两者的差异
+
+**先确认它有没有进入 boot graph，再谈渲染。** 如果连 graph 都没进，问题在 manifest 或加载阶段，不在 slot。
+
+### 2. 核对三处我怀疑但不确认的地方
+
+| # | 怀疑点 | 怎么验 |
+|---|---|---|
+| a | `factory` 必须返回 `module.exports`（CJS 包装），直接返回对象不行 | 按 workbuddy 的形状改写后重试 |
+| b | `dsh.client.inject` 缺 `@deepseek-ai/dsh-client-ui-slots` | 补上后重试 |
+| c | `exports["./client"]` 指向 `./src/client.js` 而 `files` 只含 `dist` | 确认宿主是从 package 目录读还是按 files 打包 |
+
+### 3. 确认 slot 名
+
+我用的是 `conversation.session.header.actions`。依据是 asar 里 ConversationRoot 的渲染：
+
+```js
+children: renderSlot("conversation.session.header.actions", {})
+```
+
+**已排除**：`conversation.session.header.views.actions`——它的注释写着内容是进 View tab 的 **More 下拉菜单**（`The View tab row's More launcher`），不是直接可见，所以我不再用它。
+
+请确认 `conversation.session.header.actions` 在当前版本真的被 render（我只有静态代码依据，没有运行时证据）。
+
+---
+
+## 六、验收标准（看得见才算过）
+
+1. 会话顶部出现一个记忆状态指示（文字标明状态，不只靠颜色）
+2. 三种状态能区分：`已注入` / `已过滤` / `未命中`
+3. 点开能看到：召回条数、命中通道、预算占用、被过滤条数、注入条目摘要
+4. 库里已有一条可命中的记忆用于验证：
+
+```bash
+cd "D:/Project/AI MemoryGLM"
+npx tsx src/interfaces/cli/main.ts search "投影"   # 应能命中（2026-11-02 已写入）
+```
+
+5. **回归**：`npm test` 668/667/0/1；`npx tsx --test plugin/dsh/tests/*.test.ts` 26/26
+
+---
+
+## 七、边界与纪律
+
+- **只改 `plugin/dsh/`**，不要动 `src/`。Host 侧已工作，别推倒重来。
+- 改完必须**重启 DSH** 才生效（client 产物在启动时装配）。
+- 不采信我的自述：我这次给的全是「怀疑」而非「确认」，请自行验证。
+- 未验证就写「未验证」，不要因为看着合理就说通过。
+
+---
+
+## 八、如何反馈
+
+在本文件末尾追加；重点写「与我怀疑点的出入」：
+
+```markdown
+## ZCode 排查结果（YYYY-MM-DD HH:mm）
+
+### 根因
+（一句话说清到底是什么导致面板不显示）
+
+### 与 DSH 怀疑点的对照
+| 怀疑点 | 是否成立 | 证据 |
+|---|---|---|
+| a. factory 需返回 module.exports | | |
+| b. inject 缺 ui-slots | | |
+| c. exports 路径与 files 不一致 | | |
+| d. slot 名不对 | | |
+
+### 修改与验证
+（改了哪些文件 + 重启后是否真看到面板 + 贴证据）
+```
