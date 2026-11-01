@@ -7,16 +7,20 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 
-import defaultExport, { apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
 
 /** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中；
- *  同时捕获 webServer 注册（同一 apply 实例内读活动记录，避免跨实例假通过）。 */
+ *  同时捕获 webServer 全部路由注册（同一 apply 实例内读活动记录，避免跨实例假通过）。 */
 function makeSpyCtx() {
   const queries: string[] = [];
   const injected: unknown[] = [];
-  let captured: { handler?: (req: unknown, res: unknown) => void } | null = null;
+  const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
   const ctx = {
     tools: {
       call: async (_name: string, args: { query: string }) => {
@@ -28,15 +32,20 @@ function makeSpyCtx() {
         };
       },
     },
-    webServer: { register: (o: unknown) => { captured = o as typeof captured; } },
+    webServer: { register: (o: unknown) => routes.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
     on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
   };
+  function handlerFor(path: string): (req: unknown, res: unknown) => void {
+    const h = routes.find((r) => r.path === path)?.handler;
+    assert.ok(h, `路由 ${path} 必须已注册`);
+    return h!;
+  }
   function readUsage(url = '/plugins/cairn-dsh-memory/usage?history=1'): Record<string, unknown> {
     let body = '';
-    captured!.handler!({ method: 'GET', url }, { writeHead: () => {}, end: (b: string) => { body = b; } });
+    handlerFor('/plugins/cairn-dsh-memory/usage')({ method: 'GET', url }, { writeHead: () => {}, end: (b: string) => { body = b; } });
     return JSON.parse(body) as Record<string, unknown>;
   }
-  return { ctx, queries, injected, readUsage };
+  return { ctx, queries, injected, readUsage, handlerFor };
 }
 
 describe('插件形状（踩过三次的坑）', () => {
@@ -102,16 +111,17 @@ describe('插件形状（踩过三次的坑）', () => {
   });
 
   it('usage 端点兜底形状字段完备（2026-11-02：退化形状害 client 详情段崩溃）', () => {
-    let captured: { handler?: (req: unknown, res: unknown) => void } | null = null;
+    const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
     const ctx = {
       // 不给 tools（降级路径也要注册路由），用 path-2（直接 webServer 属性）捕获 handler
-      webServer: { register: (o: unknown) => { captured = o as typeof captured; } },
+      webServer: { register: (o: unknown) => routes.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
       on: () => {},
     };
     apply(ctx, {});
-    assert.ok(captured!.handler, 'usage 路由必须注册成功');
+    const usageHandler = routes.find((r) => r.path === '/plugins/cairn-dsh-memory/usage')?.handler;
+    assert.ok(usageHandler, 'usage 路由必须注册成功');
     let body = '';
-    captured!.handler!({ method: 'GET' }, { writeHead: () => {}, end: (b: string) => { body = b; } });
+    usageHandler!({ method: 'GET' }, { writeHead: () => {}, end: (b: string) => { body = b; } });
     const parsed = JSON.parse(body) as Record<string, unknown>;
     // client 详情段读这些字段，缺一个就崩（宿主 crash boundary 会卸载整个面板）
     for (const k of ['status', 'label', 'candidates', 'injected', 'matchedBy', 'bytesUsed', 'bytesBudget', 'filteredCount']) {
@@ -122,19 +132,20 @@ describe('插件形状（踩过三次的坑）', () => {
   });
 
   it('usage?debug=1 附带摘要级诊断（不含正文）', () => {
-    let captured: { handler?: (req: unknown, res: unknown) => void } | null = null;
+    const routes2: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
     apply({
-      webServer: { register: (o: unknown) => { captured = o as typeof captured; } },
+      webServer: { register: (o: unknown) => routes2.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
       on: () => {},
     }, {});
+    const usageHandler2 = routes2.find((r) => r.path === '/plugins/cairn-dsh-memory/usage')!.handler!;
     let body = '';
-    captured!.handler!({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage?debug=1' },
+    usageHandler2({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage?debug=1' },
       { writeHead: () => {}, end: (b: string) => { body = b; } });
     const parsed = JSON.parse(body) as { debug?: { lastPreStep?: { fired?: boolean } } };
     assert.ok(parsed.debug, 'debug=1 必须返回诊断');
     assert.equal(typeof parsed.debug!.lastPreStep!.fired, 'boolean');
     let plain = '';
-    captured!.handler!({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage' },
+    usageHandler2({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage' },
       { writeHead: () => {}, end: (b: string) => { plain = b; } });
     assert.ok(!('debug' in JSON.parse(plain)), '不带 debug=1 不返回诊断');
   });
@@ -267,5 +278,131 @@ describe('插件形状（踩过三次的坑）', () => {
       assert.ok(seen.includes('记忆'));
       assert.equal(injected.length, 1, '2-gram 路命中后必须注入');
     });
+  });
+});
+
+describe('活动持久化开关（默认内存，用户 2026-11-02 决策）', () => {
+  const PREV_HOME = process.env.CAIRN_HOME;
+  const PREV_MAX = process.env.CAIRN_ACTIVITY_MAX_BYTES;
+  let home = '';
+
+  function useTempHome(): string {
+    home = mkdtempSync(join(tmpdir(), 'cairn-dsh-persist-'));
+    process.env.CAIRN_HOME = home;
+    return home;
+  }
+  function postPersist(handler: (req: unknown, res: unknown) => void, enabled: unknown): { status?: number; body: string } {
+    const out: { status?: number; body: string } = { body: '' };
+    handler(
+      {
+        method: 'POST',
+        on: (ev: string, cb: (c?: unknown) => void) => {
+          if (ev === 'data') cb(typeof enabled === 'string' ? enabled : JSON.stringify({ enabled }));
+          if (ev === 'end') cb();
+        },
+      },
+      { writeHead: (s: number) => { out.status = s; }, end: (b: string) => { out.body = b; } },
+    );
+    return out;
+  }
+
+  afterEach(() => {
+    if (PREV_HOME === undefined) delete process.env.CAIRN_HOME; else process.env.CAIRN_HOME = PREV_HOME;
+    if (PREV_MAX === undefined) delete process.env.CAIRN_ACTIVITY_MAX_BYTES; else process.env.CAIRN_ACTIVITY_MAX_BYTES = PREV_MAX;
+    if (home) { try { rmSync(home, { recursive: true, force: true }); } catch { /* 临时目录删不掉就算了 */ } home = ''; }
+  });
+
+  it('默认内存：不落盘，payload.persist=false', async () => {
+    useTempHome();
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }] }, () => {});
+    assert.equal(existsSync(join(home, ACTIVITY_FILE)), false, '默认不创建日志文件');
+    assert.equal(readUsage().persist, false);
+  });
+
+  it('切换落盘：marker 写入、条目追加、查询原文与正文零出现', async () => {
+    useTempHome();
+    const { ctx, readUsage, handlerFor } = makeSpyCtx();
+    apply(ctx, {});
+    const resp = postPersist(handlerFor('/plugins/cairn-dsh-memory/persist'), true);
+    assert.equal(resp.status, 200);
+    assert.equal((JSON.parse(resp.body) as { enabled: boolean }).enabled, true);
+    assert.ok(existsSync(join(home, 'activity-dsh.enabled')), 'marker 必须写入');
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }] }, () => {});
+    const file = join(home, ACTIVITY_FILE);
+    assert.ok(existsSync(file), '落盘后必须有日志文件');
+    const content = readFileSync(file, 'utf8');
+    assert.match(content, /自动召回/, '条目是摘要');
+    assert.ok(!content.includes('投影预算是多少'), '查询原文绝不入文件');
+    assert.ok(!content.includes('投影预算是 2KB'), '记忆正文绝不入文件');
+    assert.equal(readUsage().persist, true);
+  });
+
+  it('重启回放：新实例从文件恢复尾部且不重复', async () => {
+    useTempHome();
+    const a = makeSpyCtx();
+    apply(a.ctx, {});
+    postPersist(a.handlerFor('/plugins/cairn-dsh-memory/persist'), true);
+    const preStepA = (a.ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStepA({ agent: { inject: () => {} }, messages: [{ role: 'user', content: [{ type: 'text', text: '第一次' }] }] }, () => {});
+    const onPostA = (a.ctx as Record<string, unknown>)['tools/post-execute'] as (e: unknown, r: unknown, n?: () => unknown) => Promise<unknown>;
+    await onPostA({ name: 'mcp__cairn__memory_search' }, {}, () => {});
+    const file = join(home, ACTIVITY_FILE);
+    const before = readFileSync(file, 'utf8').trim().split('\n').length;
+
+    // 模拟重启：全新 apply 实例，同一 CAIRN_HOME
+    const b = makeSpyCtx();
+    apply(b.ctx, {});
+    const recent = (b.readUsage().recent as { t: string; summary: string }[]) ?? [];
+    assert.equal(recent.length, before, '重启后恢复相同条数');
+    const unique = new Set(recent.map((e) => e.t + '|' + e.summary));
+    assert.equal(unique.size, recent.length, '回放不得产生重复条目');
+  });
+
+  it('切回内存：marker 删除、停止追加', async () => {
+    useTempHome();
+    const { ctx, readUsage, handlerFor } = makeSpyCtx();
+    apply(ctx, {});
+    const persistHandler = handlerFor('/plugins/cairn-dsh-memory/persist');
+    postPersist(persistHandler, true);
+    const file = join(home, ACTIVITY_FILE);
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: '第一条' }] }, () => {});
+    const sizeOn = statSync(file).size;
+    const resp = postPersist(persistHandler, false);
+    assert.equal((JSON.parse(resp.body) as { enabled: boolean }).enabled, false);
+    assert.equal(existsSync(join(home, 'activity-dsh.enabled')), false, 'marker 必须删除');
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: '第二条' }] }, () => {});
+    assert.equal(statSync(file).size, sizeOn, '关闭后不再追加');
+    assert.equal(readUsage().persist, false);
+  });
+
+  it('轮转：超过阈值滚动 .old，日志文件重新从零开始', async () => {
+    useTempHome();
+    process.env.CAIRN_ACTIVITY_MAX_BYTES = '200';
+    const { ctx, handlerFor } = makeSpyCtx();
+    apply(ctx, {});
+    postPersist(handlerFor('/plugins/cairn-dsh-memory/persist'), true);
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    for (let i = 0; i < 12; i++) {
+      await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: `第${i}轮轮转测试消息` }] }, () => {});
+    }
+    assert.ok(existsSync(join(home, ACTIVITY_FILE + '.old')), '必须滚动出 .old');
+    assert.ok(statSync(join(home, ACTIVITY_FILE)).size < 400, '当前文件回到小体量');
+  });
+
+  it('非法 body 返回 400，不翻转状态', () => {
+    useTempHome();
+    const { ctx, handlerFor } = makeSpyCtx();
+    apply(ctx, {});
+    const persistHandler = handlerFor('/plugins/cairn-dsh-memory/persist');
+    const bad1 = postPersist(persistHandler, '{"enabled":"yes"}');
+    assert.equal(bad1.status, 400);
+    const bad2 = postPersist(persistHandler, 'not-json');
+    assert.equal(bad2.status, 400);
+    assert.equal(existsSync(join(home, 'activity-dsh.enabled')), false, '非法请求不得开落盘');
   });
 });

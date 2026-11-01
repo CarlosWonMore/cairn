@@ -19,6 +19,7 @@ window.__ModuleLoader__.load({
 
     // Host 与 Client 分处两个进程，只能走 HTTP。history=1 取完整活动记录。
     const USAGE_URL = '/plugins/cairn-dsh-memory/usage?history=1';
+    const PERSIST_URL = '/plugins/cairn-dsh-memory/persist';
 
     // 宿主 slot 有 crash boundary：组件一抛错整个条目被卸载。响应必须归一化
     // 成字段完备的对象：对端给什么都绝不抛。
@@ -34,6 +35,7 @@ window.__ModuleLoader__.load({
         bytesBudget: Number(d.bytesBudget) || 0,
         filteredCount: Number(d.filteredCount) || 0,
         recent: Array.isArray(d.recent) ? d.recent : [],
+        persist: d.persist === true,
       };
     }
 
@@ -94,10 +96,23 @@ window.__ModuleLoader__.load({
       const state = useUsage();
       const data = state.data;
       const [filters, setFilters] = React.useState(loadFilters);
+      const [persist, setPersistState] = React.useState(null); // null=尚未从 host 取到
       function update(patch) {
         var next = Object.assign({}, filters, patch);
         setFilters(next);
         saveFilters(next);
+      }
+      // 持久化开关：host 侧 marker 文件是权威，localStorage 不存它。
+      function setPersist(on) {
+        setPersistState(on); // 乐观更新，host 应答后校准
+        fetch(PERSIST_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: !!on }),
+        })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) { if (d && typeof d.enabled === 'boolean') setPersistState(d.enabled); })
+          .catch(function () { /* 网络失败：下轮 3s 轮询的 data.persist 会校准 */ });
       }
 
       if (!data) {
@@ -114,6 +129,10 @@ window.__ModuleLoader__.load({
         })
         .slice(-filters.limit)
         .reverse();
+
+      // host 是持久化状态的权威：轮询数据到达时校准本地 optimistic 状态
+      var persistOn = data.persist;
+      React.useEffect(function () { setPersistState(data.persist); }, [data.persist]);
 
       var color = COLOR[data.status] || COLOR.miss;
       var rows = [
@@ -174,7 +193,12 @@ window.__ModuleLoader__.load({
             h('span', { style: { opacity: .4 } }, '|'),
             [15, 30, 120].map(function (n) {
               return chip(n + '条', filters.limit === n, function () { update({ limit: n }); });
-            })),
+            }),
+            h('span', { style: { opacity: .4 } }, '|'),
+            // 持久化开关：内存（默认）/ 落盘。状态权威在 host（marker 文件），重启保持。
+            h('span', { style: { fontSize: 12, opacity: .6 } }, '记录存储:'),
+            chip('内存', persist === false, function () { setPersist(false); }),
+            chip('落盘', persist === true, function () { setPersist(true); })),
           entries.length === 0
             ? h('div', { style: { fontSize: 12, opacity: .6, padding: '6px 0' } },
                 '暂无记录。自动召回随每轮对话产生；agent 显式调用 Cairn 工具（检索/保存等）会记为「工具调用」。')
@@ -186,7 +210,9 @@ window.__ModuleLoader__.load({
                     h('span', null, filters.detail === 'full' ? (e.summary || '') : ''));
                 })),
           h('div', { style: { marginTop: 10, fontSize: 12, opacity: .6, lineHeight: 1.7 } },
-            '「自动召回」是插件在每轮对话前注入的记忆；「工具调用」是 agent 显式执行的 Cairn 操作。记录只留摘要，不含正文与参数。')),
+            '「自动召回」是插件在每轮对话前注入的记忆；「工具调用」是 agent 显式执行的 Cairn 操作。记录只留摘要，不含正文与参数。',
+            h('br'),
+            '记录存储＝内存：仅本次 DSH 运行期间有效；＝落盘：写入 ~/.cairn/activity-dsh.jsonl（超 2MB 自动滚动），重启后仍可回看。')),
       );
     }
 

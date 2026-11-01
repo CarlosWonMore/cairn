@@ -12,6 +12,9 @@
  * 3. 调 MCP 工具需要 `inject: ['tools']`，工具名形如 mcp__cairn__memory_search。
  */
 
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   createDedupeState,
   filterInjectable,
@@ -237,6 +240,95 @@ export function makeInjectionMessage(text: string): { role: 'user'; content: { t
 /** 插件名（必须与 package.json name 和 patch 行一致）。 */
 export const name = 'cairn-dsh-memory';
 
+// ———— 活动持久化（用户开关，默认关＝仅内存）————
+// 开关状态落一个 marker 文件（存在即开），活动日志是 JSONL（每行一条摘要）。
+// 目录随 Cairn 主权根走（CAIRN_HOME 优先，否则 ~/.cairn），与记忆数据同域。
+export type ActivityEntry = { t: string; kind: 'recall' | 'tool'; summary: string };
+
+export const ACTIVITY_FILE = 'activity-dsh.jsonl';
+const ACTIVITY_ENABLED_MARKER = 'activity-dsh.enabled';
+const ACTIVITY_RING_LIMIT = 120;
+/** 轮转阈值：超过即滚动为 .old（默认 2MB；测试可用 CAIRN_ACTIVITY_MAX_BYTES 调小）。 */
+function activityMaxBytes(): number {
+  const v = Number(process.env.CAIRN_ACTIVITY_MAX_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : 2 * 1024 * 1024;
+}
+
+export function activityDir(): string {
+  const home = process.env.CAIRN_HOME;
+  return home && home.trim().length > 0 ? home : join(homedir(), '.cairn');
+}
+
+function activityPath(): string {
+  return join(activityDir(), ACTIVITY_FILE);
+}
+
+function activityEnabledPath(): string {
+  return join(activityDir(), ACTIVITY_ENABLED_MARKER);
+}
+
+/** 开关当前状态：marker 文件存在即开。读失败一律视为关（fail-safe 默认内存）。 */
+export function readPersistEnabled(): boolean {
+  try {
+    return existsSync(activityEnabledPath());
+  } catch {
+    return false;
+  }
+}
+
+export function setPersistEnabled(on: boolean): void {
+  try {
+    mkdirSync(activityDir(), { recursive: true });
+    if (on) writeFileSync(activityEnabledPath(), new Date().toISOString(), 'utf8');
+    else if (existsSync(activityEnabledPath())) rmSync(activityEnabledPath());
+  } catch (e) {
+    console.error('[cairn-dsh-memory] persist toggle failed:', (e as Error).message);
+  }
+}
+
+/** 从 JSONL 尾部加载持久化条目（坏行跳过，形状不符跳过）。 */
+export function loadPersistedActivity(limit = ACTIVITY_RING_LIMIT): ActivityEntry[] {
+  try {
+    const file = activityPath();
+    if (!existsSync(file)) return [];
+    const lines = readFileSync(file, 'utf8').split('\n').filter((l) => l.trim().length > 0);
+    const out: ActivityEntry[] = [];
+    for (const line of lines.slice(-limit)) {
+      try {
+        const e = JSON.parse(line) as ActivityEntry;
+        if (e && typeof e.t === 'string' && (e.kind === 'recall' || e.kind === 'tool') && typeof e.summary === 'string') {
+          out.push({ t: e.t, kind: e.kind, summary: e.summary });
+        }
+      } catch {
+        /* 坏行跳过 */
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function appendActivityFile(entry: ActivityEntry): void {
+  try {
+    mkdirSync(activityDir(), { recursive: true });
+    const file = activityPath();
+    try {
+      if (statSync(file).size > activityMaxBytes()) {
+        const old = file + '.old';
+        if (existsSync(old)) rmSync(old);
+        renameSync(file, old);
+      }
+    } catch {
+      /* 大小检查失败就继续追加 */
+    }
+    appendFileSync(file, JSON.stringify(entry) + '\n', 'utf8');
+  } catch (e) {
+    // FAIL-OPEN：持久化失败绝不影响记忆操作与留痕的内存环
+    console.error('[cairn-dsh-memory] activity append failed:', (e as Error).message);
+  }
+}
+
 /** 依赖的宿主服务：调 MCP 工具需要 tools。 */
 export const inject = ['tools'] as string[];
 
@@ -276,13 +368,21 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   };
 
   // 活动记录（用户要求：所有经 cairn 的操作留痕）。只存摘要，正文/参数永不入条目。
-  // 持久化留痕是审计层的事（audit_event 表记治理操作）；这里是会话内的操作流。
-  type ActivityEntry = { t: string; kind: 'recall' | 'tool'; summary: string };
+  // 持久化由用户开关控制（默认关＝内存；开＝JSONL 落盘，随 Cairn 主权根目录）。
   const activity: ActivityEntry[] = [];
+  let persistOn = readPersistEnabled();
+  if (persistOn) {
+    // 重启回放：把持久化尾部并入内存环（按 t+summary 去重防重复加载）
+    for (const e of loadPersistedActivity()) {
+      if (!activity.some((x) => x.t === e.t && x.summary === e.summary)) activity.push(e);
+    }
+  }
   const recordCfg = { recall: config.record?.recall !== false, tools: config.record?.tools !== false };
   const pushActivity = (kind: ActivityEntry['kind'], summary: string): void => {
-    activity.push({ t: new Date().toISOString(), kind, summary });
-    if (activity.length > 120) activity.splice(0, activity.length - 120);
+    const entry: ActivityEntry = { t: new Date().toISOString(), kind, summary };
+    activity.push(entry);
+    if (activity.length > ACTIVITY_RING_LIMIT) activity.splice(0, activity.length - ACTIVITY_RING_LIMIT);
+    if (persistOn) appendActivityFile(entry);
   };
 
   // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
@@ -296,7 +396,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       return;
     }
     const usage = injector.lastUsage();
-    const payload: Record<string, unknown> = { ...(usage ?? EMPTY_USAGE) };
+    const payload: Record<string, unknown> = { ...(usage ?? EMPTY_USAGE), persist: persistOn };
     // 活动记录随 payload 走：默认带最近 15 条，?history=1 带全部（上限 120）。
     try {
       const u = new URL(req.url ?? '/', 'http://local');
@@ -316,11 +416,64 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     // 退化形状会让面板在宿主 crash boundary 下被整个卸载。
     res.end?.(JSON.stringify(payload));
   };
+  // 持久化开关端点：GET 查状态，POST {enabled:boolean} 切换。
+  // 状态落 marker 文件（host 侧权威），面板刷新/重启后仍保持用户选择。
+  const persistPath = '/plugins/cairn-dsh-memory/persist';
+  const servePersist = (req: { method?: string; on?: (ev: string, cb: (chunk?: unknown) => void) => void }, res: { writeHead?: Function; end?: Function }): void => {
+    if (req.method === 'GET') {
+      res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end?.(JSON.stringify({ enabled: persistOn }));
+      return;
+    }
+    if (req.method !== 'POST') {
+      res.writeHead?.(405, { 'content-type': 'application/json' });
+      res.end?.(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+    let body = '';
+    try {
+      req.on?.('data', (chunk: unknown) => {
+        body += typeof chunk === 'string' ? chunk : String(chunk ?? '');
+        if (body.length > 1024) body = ''; // 上限保护：超限直接作废
+      });
+      req.on?.('end', () => {
+        try {
+          const parsed = body.length > 0 ? (JSON.parse(body) as { enabled?: unknown }) : {};
+          if (typeof parsed.enabled !== 'boolean') {
+            res.writeHead?.(400, { 'content-type': 'application/json' });
+            res.end?.(JSON.stringify({ error: 'enabled must be boolean' }));
+            return;
+          }
+          setPersistEnabled(parsed.enabled);
+          persistOn = parsed.enabled;
+          if (persistOn) {
+            // 开启时把已有持久化尾部并入环，避免面板瞬间只剩空环
+            for (const e of loadPersistedActivity()) {
+              if (!activity.some((x) => x.t === e.t && x.summary === e.summary)) activity.push(e);
+            }
+          }
+          res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          res.end?.(JSON.stringify({ enabled: persistOn }));
+        } catch {
+          res.writeHead?.(400, { 'content-type': 'application/json' });
+          res.end?.(JSON.stringify({ error: 'bad json' }));
+        }
+      });
+    } catch {
+      res.writeHead?.(400, { 'content-type': 'application/json' });
+      res.end?.(JSON.stringify({ error: 'bad request' }));
+    }
+  };
   const registerUsageOn = (webServer: { register: (o: unknown) => unknown }): void => {
     webServer.register({
       kind: 'exact',
       path: usagePath,
       handler: serveUsage,
+    });
+    webServer.register({
+      kind: 'exact',
+      path: persistPath,
+      handler: servePersist,
     });
     usageRegistered = true;
   };
