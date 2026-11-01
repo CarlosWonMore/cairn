@@ -113,11 +113,12 @@ export interface CairnPluginOptions {
  * 构造插件。只暴露 name / inject / apply —— 多一个可枚举属性就会被 Cordis 当服务名解析。
  */
 export function createCairnMemoryPlugin(options: CairnPluginOptions = {}) {
-  const config = options.config ?? {};
+  // 预置配置（单测用）。真实运行时由 Cordis 作为 apply 的第二参数传入。
+  const presetConfig = options.config ?? {};
   // 闭包持有：既不外泄成属性，也允许单测预置 recall。
   const presetRecall = options.recall ?? null;
   let injector: ReturnType<typeof createInjector> | null = presetRecall
-    ? createInjector({ recall: presetRecall, config })
+    ? createInjector({ recall: presetRecall, config: presetConfig })
     : null;
   // pre-step 的 payload 不含用户原文（只有 { agent, signal }），
   // 所以从 session/event 的 user/message 攒最近一条，供 pre-step 使用。
@@ -126,7 +127,14 @@ export function createCairnMemoryPlugin(options: CairnPluginOptions = {}) {
   return {
     name: 'cairn-dsh-memory',
     inject: ['tools'] as string[],
-    apply(ctx: unknown): void {
+    /**
+     * @param ctx Cordis 上下文
+     * @param runtimeConfig Cordis 注入的配置对象。**必须从参数取，不能读 ctx.config**——
+     *   ctx 的属性一律走 Proxy，未在 inject 声明的（包括 config）会抛
+     *   `cannot get property "config" without inject`，插件直接 failed。
+     */
+    apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
+      const config: PluginConfig = { ...presetConfig, ...(runtimeConfig ?? {}) };
       if (!injector) {
         const recall = makeToolRecall(ctx);
         if (!recall) return; // 没有 tools 服务 → 静默降级，不注册钩子。

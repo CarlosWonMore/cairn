@@ -56,7 +56,7 @@ const INJECTION_RULES: InjectionRule[] = [
   {
     kind: 'exfiltrate_memory',
     rule: 'exfiltrate_all_memories',
-    re: /(?:把|将)?(?:全部|所有|整个)(?:记忆|库|数据).{0,6}(?:导出|上传|发送|输出|泄露)|(?:导出|上传|发送|输出|泄露).{0,6}(?:全部|所有|整个)(?:记忆|库|数据)|export\s+(?:all|the\s+entire)\s+(?:memor|data|vault)|dump\s+all\s+memor/i,
+    re: /(?:把|将|请|帮我|替我).{0,10}(?:全部|所有|整个|完整)?(?:记忆|库|数据|秘密|凭据|密钥|口令|secret|secrets).{0,8}(?:导出|上传|发送|输出|泄露|外传|打印)(?!功能|入口|按钮|命令|模块|脚本|面板)|(?:导出|上传|发送|输出|泄露|打印).{0,6}(?:全部|所有|整个|完整)?(?:记忆|库|数据|秘密|凭据|密钥|口令|secret|secrets)|export\s+(?:all|the\s+entire)\s+(?:memor|data|vault)|dump\s+all\s+memor/i,
   },
   {
     kind: 'escalate_scope',
@@ -66,7 +66,7 @@ const INJECTION_RULES: InjectionRule[] = [
   {
     kind: 'role_override',
     rule: 'role_override',
-    re: /(?:从现在起|现在)你是|(?:你)是一个(?:新的)?(?:系统|管理员|root)|ignore\s+your\s+(?:role|persona)|you\s+are\s+now\s+(?:a|an|the)\s+(?:system|admin|root|developer)/i,
+    re: /(?:从现在起|现在)你是|你现在(?:是|当|做)|(?:你)是一个(?:新的)?(?:系统|管理员|root)|ignore\s+your\s+(?:role|persona)|you\s+are\s+now\s+(?:a|an|the)\s+(?:system|admin|root|developer)|扮演(?:系统|管理员|root)/i,
   },
   {
     kind: 'fake_approval',
