@@ -797,3 +797,25 @@ cairn agent apply --plan-file plan.json
 2. **不关外键时 `DROP TABLE` 会静默级联删光子表数据**，而 `foreign_key_check` 仍报干净。
 
 迁移框架因此支持 `preTransactionPragma` / `postTransactionPragma`。回滚只能从备份恢复（`cairn backup`）。
+
+## DSH 记忆插件（实时召回）
+
+投影简报（上一节）只能静态注入且受 2 KB 预算限制。要在会话中**按当前问题**召回，需要 DSH Cordis 插件。
+
+```bash
+cd plugin/dsh && npm run build
+dsh plugin --profile web add <plugin/dsh 绝对路径>   # 装到 profile
+# 重启 DSH 生效
+```
+
+**插件以 MCP 为内核**：记忆存储、作用域判定、审批仍由 Cairn MCP server 负责；插件只做召回注入与去重，不拥有数据、不产生写入。
+
+失败时只跳过本次注入，不阻塞会话——模型仍可用 `mcp__cairn__*` 工具。
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关 |
+| `budgetBytes` | `1536` | 单次注入字节预算 |
+| `topK` | `5` | 一次召回条数上限 |
+
+**证据边界**：插件纯逻辑有 21 项自动化测试；但**与真实 DSH 的集成未手工冒烟验证**（`agent/pre-step` 是否触发、注入是否进入上下文）。能力分级保持 `fixture-only`，不虚标。
