@@ -5,6 +5,7 @@ import type { CairnStore } from '../store/open.js';
 import { err } from '../core/errors.js';
 import { sha256Canonical, sha256Hex } from '../core/hash.js';
 import { AGENT_KINDS, HOST_ADAPTERS, isAgentKind } from './adapters.js';
+import { CAIRN_DSH_ENTRY_ID, hasCairnInsert, removeCairnInsert, upsertCairnInsert } from './cordisPatch.js';
 import type { AgentKind, CapabilityLevel, HostAdapter } from './adapters.js';
 import {
   BACKUP_SUFFIX,
@@ -79,6 +80,10 @@ const NATIVE_DISABLE_MANUAL: Record<AgentKind, string> = {
   workbuddy: [
     '手动步骤（mcp-primary 准备）：原生记忆为账号级服务端设置，请在 设置 → 记忆 中手动关闭。',
     '本原型不能代为更改；完成前不能宣称已接管或关闭原生记忆。',
+  ].join('\n'),
+  dsh: [
+    '手动步骤（mcp-primary 准备）：DSH 未公开原生记忆的关闭接口或配置路径，本产品不能代为关闭。',
+    '请按 DSH 官方文档在其自身设置中处理；完成前不能宣称已接管或关闭原生记忆。',
   ].join('\n'),
 };
 
@@ -286,7 +291,16 @@ export async function planAgentConfig(
     if (mcpPath !== null) {
       const current = await readFileOrNull(mcpPath);
       const existingText = current !== null ? current.toString('utf8') : null;
-      if (existingText !== null) {
+      if (existingText !== null && adapter.mcpConfigKind === 'cordis-patch') {
+        // 插件树形态：本产品条目存在但无安装记录 → 视为外来条目，拒绝覆盖。
+        const present = hasCairnInsert(existingText);
+        if (present && !cairnEntryOwnedByUs(store, agentKind, homeRoot, mcpPath)) {
+          conflicts.push({
+            path: mcpPath,
+            reason: '已存在同名外来条目 insert:' + CAIRN_DSH_ENTRY_ID + '（无本产品安装记录），拒绝覆盖',
+          });
+        }
+      } else if (existingText !== null) {
         const obj = parseJsonObject(existingText, mcpPath);
         const existingKey = findExistingCairnKey(obj);
         if (existingKey !== null && !cairnEntryOwnedByUs(store, agentKind, homeRoot, mcpPath)) {
@@ -297,19 +311,34 @@ export async function planAgentConfig(
         }
       }
       if (conflicts.length === 0) {
-        const after = mergeMcpConfig({
-          existingText,
-          mapKey: adapter.mcpServerMapKey(homeRoot, projectRoot),
-          entry: input.mcpCommand,
-          path: mcpPath,
-        });
-        actions.push({
-          type: 'write_mcp_config',
-          path: mcpPath,
-          before: existingText,
-          after,
-          beforeHash: current !== null ? sha256Hex(current) : null,
-        });
+        if (adapter.mcpConfigKind === 'cordis-patch') {
+          // DSH：Cordis 插件树形态。after 由行级块编辑器产出（见 cordisPatch.ts）。
+          const up = upsertCairnInsert(existingText ?? '', {
+            command: input.mcpCommand.command,
+            args: input.mcpCommand.args,
+          });
+          actions.push({
+            type: 'write_mcp_config',
+            path: mcpPath,
+            before: existingText,
+            after: up.output,
+            beforeHash: current !== null ? sha256Hex(current) : null,
+          });
+        } else {
+          const after = mergeMcpConfig({
+            existingText,
+            mapKey: adapter.mcpServerMapKey(homeRoot, projectRoot),
+            entry: input.mcpCommand,
+            path: mcpPath,
+          });
+          actions.push({
+            type: 'write_mcp_config',
+            path: mcpPath,
+            before: existingText,
+            after,
+            beforeHash: current !== null ? sha256Hex(current) : null,
+          });
+        }
       }
     } else {
       notes.push('已提供 mcpCommand，但该宿主没有公开的 MCP 配置路径（blocked）：跳过写入，需用户手动添加。');
@@ -486,7 +515,29 @@ export async function doctorAgentConfig(
     notes.push('MCP：无公开配置文件路径（blocked），不做检查。');
   } else {
     configExists = await pathExists(mcpPath);
-    if (configExists) {
+    if (configExists && adapter.mcpConfigKind === 'cordis-patch') {
+      const buf = (await readFileOrNull(mcpPath))!;
+      const text = buf.toString('utf8');
+      try {
+        cairnEntryPresent = hasCairnInsert(text);
+        if (cairnEntryPresent) {
+          const owned = cairnEntryOwnedByUs(store, agentKind, homeRoot, mcpPath);
+          notes.push(
+            owned
+              ? 'MCP：本产品条目已插入（insert:' + CAIRN_DSH_ENTRY_ID + '），且有本产品安装记录。'
+              : 'MCP：发现本产品形态的条目但无安装记录（视为外来条目）。',
+          );
+          const parsed = /command:\s*"([^"]+)"/.exec(text);
+          if (parsed !== null) {
+            const { existsSync } = await import('node:fs');
+            const cmdOk = existsSync(parsed[1]!);
+            notes.push('MCP：command 指向 ' + parsed[1]! + (cmdOk ? '（存在）' : '（不存在，插件可能无法启动）'));
+          }
+        }
+      } catch (e) {
+        notes.push('MCP：插件树结构不符合预期，无法确认条目（' + (e as Error).message + '）。');
+      }
+    } else if (configExists) {
       const buf = (await readFileOrNull(mcpPath))!;
       try {
         const obj = parseJsonObject(buf.toString('utf8'), mcpPath);
@@ -607,6 +658,17 @@ async function removeOnlyOurParts(
   const mcpPath = adapter.mcpConfigPath(homeRoot, projectRoot);
   const blockPath = adapter.blockTargetPath(homeRoot, projectRoot);
   const text = current.toString('utf8');
+
+  if (mcpPath !== null && configPath === mcpPath && adapter.mcpConfigKind === 'cordis-patch') {
+    const r = removeCairnInsert(text);
+    if (r.changed) {
+      await writeFileAtomic(configPath, Buffer.from(r.output, 'utf8'));
+      notes.push(configPath + ': 只移除了本产品 insert 块，其他 patch 行与注释保持不变。');
+    } else {
+      notes.push(configPath + ': 未找到本产品 insert 块，无需修改。');
+    }
+    return;
+  }
 
   if (mcpPath !== null && configPath === mcpPath) {
     const obj = parseJsonObject(text, configPath);

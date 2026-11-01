@@ -15,7 +15,19 @@ import { err } from '../core/errors.js';
  * - 'blocked'：无公开文档路径或需要用户手动 UI 步骤，原型拒绝写入推测路径。
  */
 
-export type AgentKind = 'claude-code' | 'cursor' | 'copilot' | 'openclaw' | 'workbuddy';
+export type AgentKind = 'claude-code' | 'cursor' | 'copilot' | 'openclaw' | 'workbuddy' | 'dsh';
+
+/**
+ * MCP 配置的**形态**，而不是路径。
+ *
+ * - 'json'：宿主把 MCP 服务器放在一个 JSON 文件的 named entry 里（mcpServers / servers）；
+ * - 'cordis-patch'：宿主用插件树的 YAML 补丁行登记插件，MCP 服务器是一条 insert 行；
+ * - 'none'：无公开配置路径。
+ *
+ * DSH（DeepSeek Harness）是唯一已知的 'cordis-patch' 宿主：它**不读 mcp.json**，
+ * 接入点是 <dshHome>/profiles/<profile>/cordis.patch.yml 的 `- insert:` 行。
+ */
+export type McpConfigKind = 'json' | 'cordis-patch' | 'none';
 
 export type CapabilityLevel = 'fixture-only' | 'blocked';
 
@@ -27,6 +39,8 @@ export interface HostAdapter {
   label: string;
   /** MCP 配置文件路径；null = 官方未公开路径，拒绝写入。 */
   mcpConfigPath(homeRoot: string, projectRoot: string | null): string | null;
+  /** MCP 配置形态；决定 plan/apply/doctor/uninstall 走 JSON 合并还是插件树块编辑。 */
+  mcpConfigKind: McpConfigKind;
   mcpConfigCapability: CapabilityLevel;
   /** 受管区块目标文件；null = 无公开块文件，只提供可复制文案。 */
   blockTargetPath(homeRoot: string, projectRoot: string | null): string | null;
@@ -41,7 +55,48 @@ export interface HostAdapter {
   notes: string[];
 }
 
-export const AGENT_KINDS: readonly AgentKind[] = ['claude-code', 'cursor', 'copilot', 'openclaw', 'workbuddy'];
+/**
+ * DSH profile 名（决定 patch 文件所在目录）。
+ * 默认 'desktop'：DSH 桌面端把配置树放在 <dshHome>/profiles/desktop/。
+ */
+export const DEFAULT_DSH_PROFILE = 'desktop';
+
+let dshProfileOverride: string | null = null;
+
+/** 覆盖 DSH profile 名（CLI --dsh-profile 用）；传 null 复位。 */
+export function setDshProfile(profile: string | null): void {
+  if (profile !== null && !/^[A-Za-z0-9._-]+$/.test(profile)) {
+    throw err('E_VALIDATION', `非法的 DSH profile 名: ${JSON.stringify(profile)}`);
+  }
+  dshProfileOverride = profile;
+}
+
+export function dshProfileFor(_homeRoot: string): string {
+  return dshProfileOverride ?? DEFAULT_DSH_PROFILE;
+}
+
+/** <dshHome>/profiles/<profile> */
+export function resolveDshProfileRoot(dshHome: string): string {
+  return join(dshHome, 'profiles', dshProfileFor(dshHome));
+}
+
+/**
+ * 解析 DSH 数据根。
+ *
+ * 顺序：显式传入 → DSH_HOME 环境变量 → E_VALIDATION。
+ * **不回退 ~/.dsh**：该目录在部分机器上是旧安装留下的空壳，猜它比报错更危险（design D4）。
+ */
+export function resolveDshHome(explicit: string | null | undefined): string {
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  const fromEnv = process.env['DSH_HOME'];
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv;
+  throw err(
+    'E_VALIDATION',
+    'DSH 数据根未指定：请用 --home-root <dir> 显式给出，或设置 DSH_HOME 环境变量（不猜测 ~/.dsh）',
+  );
+}
+
+export const AGENT_KINDS: readonly AgentKind[] = ['claude-code', 'cursor', 'copilot', 'openclaw', 'workbuddy', 'dsh'];
 
 export function isAgentKind(value: unknown): value is AgentKind {
   return typeof value === 'string' && (AGENT_KINDS as readonly string[]).includes(value);
@@ -58,6 +113,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return projectRoot ? join(projectRoot, '.mcp.json') : null;
     },
     mcpConfigCapability: 'fixture-only',
+    mcpConfigKind: 'json',
     blockTargetPath: (homeRoot, projectRoot) =>
       // 矩阵 rules_memory：CLAUDE.md（项目）与 .claude/CLAUDE.md（用户）均为公开文件。
       projectRoot ? join(projectRoot, 'CLAUDE.md') : join(homeRoot, '.claude', 'CLAUDE.md'),
@@ -77,6 +133,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       // 矩阵：.cursor/mcp.json（project）或 ~/.cursor/mcp.json（global），两者均为公开路径。
       projectRoot ? join(projectRoot, '.cursor', 'mcp.json') : join(homeRoot, '.cursor', 'mcp.json'),
     mcpConfigCapability: 'fixture-only',
+    mcpConfigKind: 'json',
     blockTargetPath: (homeRoot, projectRoot) => {
       // 矩阵 rules_memory：项目级 AGENTS.md 为公开规则文件；全局规则只有 User Rules (UI)，
       // 无文件路径，故 projectRoot 为 null 时不提供块目标。
@@ -99,6 +156,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       // 矩阵：VS Code 工作区 .vscode/mcp.json（project）；CLI 用户级 ~/.copilot/mcp-config.json（user）。
       projectRoot ? join(projectRoot, '.vscode', 'mcp.json') : join(homeRoot, '.copilot', 'mcp-config.json'),
     mcpConfigCapability: 'fixture-only',
+    mcpConfigKind: 'json',
     blockTargetPath: (homeRoot, projectRoot) => {
       // 矩阵 rules_memory：.github/copilot-instructions.md 为仓库级公开文件；无 home 级块文件。
       void homeRoot;
@@ -123,6 +181,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return null;
     },
     mcpConfigCapability: 'blocked',
+    mcpConfigKind: 'none',
     blockTargetPath: (homeRoot) =>
       // 矩阵：~/.openclaw/workspace/AGENTS.md 为官方默认工作区模板，公开路径；openclaw 无项目作用域。
       join(homeRoot, '.openclaw', 'workspace', 'AGENTS.md'),
@@ -144,6 +203,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return null;
     },
     mcpConfigCapability: 'blocked',
+    mcpConfigKind: 'none',
     blockTargetPath: () => {
       // 矩阵：官方记忆页只有设置界面与"复制提示词—粘贴结果"导入，未公开工作区记忆/规则文件（blocked）。
       return null;
@@ -156,6 +216,33 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       '无公开工作区规则/记忆文件：不写任何块文件，只提供可复制的路由文案，由用户手动粘贴。',
       '原生记忆为账号级服务端能力，无公开文件或写入 API：不能宣称已接管或关闭原生记忆，只能由用户在设置中手动关闭。',
       '本原型不爬取云端与缓存；记忆导入仅走官方粘贴通道。',
+    ],
+  },
+  dsh: {
+    kind: 'dsh',
+    label: 'DeepSeek Harness (DSH)',
+    mcpConfigPath: (dshHome) => {
+      // DSH 不读 mcp.json：MCP 服务器是 Cordis 插件树里的一条 `- insert:` 补丁行。
+      // 目标固定为 <dshHome>/profiles/<profile>/cordis.patch.yml（profile 见 dshProfileFor）。
+      return join(resolveDshProfileRoot(dshHome), 'cordis.patch.yml');
+    },
+    mcpConfigCapability: 'fixture-only',
+    mcpConfigKind: 'cordis-patch',
+    blockTargetPath: (dshHome) => {
+      // DSH 的 @deepseek-ai/dsh-agent-instructions 在**每个会话首个请求**加载 user-global 层：
+      // $DSH_HOME/AGENTS.md，然后才是项目级 AGENTS.md（叠加，后者更具体优先）。
+      // 要覆盖"所有工作区"，落点必须是这个用户级文件，而不是逐项目的 AGENTS.md。
+      return join(dshHome, 'AGENTS.md');
+    },
+    blockCapability: 'fixture-only',
+    nativeDisable: 'none',
+    mcpServerMapKey: () => 'mcpServers',
+    notes: [
+      'DSH 不使用 mcp.json：MCP 接入点是 Cordis 插件树的 <dshHome>/profiles/<profile>/cordis.patch.yml，条目必须写成 "insert:" 块。不带 insert 的裸 id 行是"覆盖既有条目"，找不到目标会被静默丢弃（日志只有一行 patch: entry not found）。',
+      '规则入口是用户级 <dshHome>/AGENTS.md（对所有工作区生效）；项目级 AGENTS.md 追加在其后，两者叠加而非替代。',
+      '证据边界：fixture 抄自一份真实 DSH 安装（2026-11-01，profile=desktop）的文件形态；真实加载验证仅在该单机单版本上进行，不表述为兼容所有 DSH 版本，故分级为 fixture-only。',
+      'DSH 无公开的原生记忆关闭接口：mcp-primary 只能给手动步骤，不能宣称已接管。',
+      '数据根与用户主目录是两个概念：本适配器只认显式 homeRoot 或 DSH_HOME 环境变量，不猜测 ~/.dsh。',
     ],
   },
 };

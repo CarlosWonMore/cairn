@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { AppService, ExitCode } from '../app-service.js';
 import { CairnError, isCairnError } from '../../core/errors.js';
-import { HOST_ADAPTERS, AgentKind } from '../../agents/adapters.js';
+import { HOST_ADAPTERS, AgentKind, resolveDshHome, setDshProfile } from '../../agents/adapters.js';
 import {
   planAgentConfig,
   applyAgentConfig,
@@ -33,7 +33,7 @@ interface Flags {
 /** 取值型标志；其余 --flag 一律按布尔处理，避免吞掉位置参数。 */
 const VALUE_FLAGS = new Set([
   'home', 'kind', 'scope', 'scope-id', 'project', 'project-name', 'agent', 'agent-id', 'ttl-days',
-  'expires', 'status', 'limit', 'out', 'format', 'reason', 'host', 'home-root', 'project-root',
+  'expires', 'status', 'limit', 'out', 'format', 'reason', 'host', 'home-root', 'project-root', 'dsh-profile', 'dsh-profile',
   'mode', 'plan-file', 'mcp-command', 'mcp-args', 'max', 'expected-revision', 'approval', 'ttl',
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
@@ -378,7 +378,12 @@ async function main(): Promise<void> {
         if (!agentKind || !AGENT_KINDS.includes(agentKind)) {
           throw new CairnError('E_VALIDATION', `用法: cairn agent plan|doctor|uninstall --host ${AGENT_KINDS.join('|')}，或 agent apply --plan-file <file>`);
         }
-        const homeRoot = str(flags, 'home-root') ?? home ?? service.store.paths.home;
+        // DSH 的数据根与用户主目录是两个概念：显式 --home-root → DSH_HOME → 报错（不回退 ~/.dsh）。
+        setDshProfile(str(flags, 'dsh-profile') ?? null);
+        const homeRoot =
+          agentKind === 'dsh'
+            ? resolveDshHome(str(flags, 'home-root') ?? home)
+            : (str(flags, 'home-root') ?? home ?? service.store.paths.home);
         const projectRoot = str(flags, 'project-root') ?? process.cwd();
         const mode = (str(flags, 'mode') ?? 'router') as ConfigMode;
         if (sub === 'plan') {
@@ -749,7 +754,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   status                        库状态摘要
   worker run-once               处理一轮后台任务 [--max N]（默认不安装任何 hook）
   device status|re-enroll       设备身份与克隆恢复
-  agent plan|apply|doctor|uninstall --host <agent>  宿主配置管理（plan 零写入）
+  agent plan|apply|doctor|uninstall --host <agent>  宿主配置管理（plan 零写入）；--host dsh 用于 DeepSeek Harness（Cordis 插件树，可加 --dsh-profile）
   uninstall                     移除所有本产品宿主配置（数据库保留）
 
 全局选项:
