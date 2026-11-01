@@ -214,3 +214,32 @@ npx tsx src/interfaces/cli/main.ts search "投影"   # 应能命中（2026-11-02
 ### 修改与验证
 （改了哪些文件 + 重启后是否真看到面板 + 贴证据）
 ```
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-4/5：根因实锤）
+
+### 根因（一句话）
+`conversation.session.header.actions` 是 **list slot**，注册选项必需 `id` 字段；我们写的是 keyed slot 的形状（`key` + `priority`），`slots.register` 校验直接抛 `list slot … requires options.id`，**面板从未注册成功**。此前各轮修复（路由先于 tools 注册、waiting chip、双路径 webServer）都是必要的外围，最后卡住的就是这一处。
+
+### 证据链（三层独立实锤，不靠推测）
+1. **DSH 渲染进程日志**（用户提供的 `app-1793560489940.log`）：`Uncaught Error: list slot "conversation.session.header.actions" requires options.id`，堆栈穿过 cairn combo 帧（`…cairn-dsh-memory/client.js…&rev=7ddb7b4527d7:11026:30`）——证明我们的 apply 确实执行、确实走到了 register、被校验拒绝。同一日志第 1 行证明 `cairn-dsh-memory/client.js` 已在 boot combo 里（加载阶段无问题）。
+2. **asar 校验代码**（`D:\Program Files\DSH NEXT\resources\app.asar` 反查）：`case "list": if (e.id === void 0) throw … requires options.id`；另有 `case "keyed"` 用 `key`+`priority` 查重、`case "chain"` 要求 `select`。slot 服务有三种槽型，key/priority 是 keyed 的契约，不是 list 的。list 查重按 `id`+`priority`（缺省 0）。
+3. **可工作参照** `dsh-connect-workbuddy/lib/client.js`（`profiles/desktop/node_modules/` 下，日志实证它成功注册 9 slots）：所有 list slot 注册一律 `{name, id, order, locale?, inject}` + 组件第二参，无一带 `key`。
+
+### 与 DSH 怀疑点的对照
+| 怀疑点 | 是否成立 | 证据 |
+|---|---|---|
+| a. factory 需返回 module.exports | 不成立（返回对象可用） | 日志堆栈实证 apply 已执行到 register |
+| b. `dsh.client.inject` 缺 ui-slots | 不成立 | 同上；slots 服务已拿到我们的注册并完成校验 |
+| c. exports 路径与 files 不一致 | 不成立 | client.js 已进 boot combo（日志第 1 行 rev=7ddb7b4527d7） |
+| d. slot 名不对 | 名字对，形状错 | 校验器认得该 slot 并按 list 契约校验；错在选项缺 `id` |
+
+### 次级发现：apply 外层的 try/catch 永远接不住注册抛错
+Uncaught 堆栈显示 `slots.inject` 的回调是在**后续的全局 reconcile tick** 里才被调（该次 reconcile 的入口甚至是别的插件注册触发的 `notifyDeclaration`），此时 apply 早已返回。所以 catch 必须放进回调本体——已移。这条对后续写 DSH client 插件的任何人都是坑。
+
+### 修改与验证
+- `plugin/dsh/src/client.js`：`key`→`id`、`priority:20`→`order:20`（镜像 workbuddy 形状），try/catch 移入回调本体，附 comment 说明槽型契约。
+- `node --check` 通过；插件单测 26/26 通过（`npx tsx --test plugin/dsh/tests/*.test.ts`）。
+- **usage 端点已在真实 DSH 实证可用**：`http://127.0.0.1:34420/plugins/cairn-dsh-memory/usage`（带 token）→ `200 {"status":"miss","label":"未命中"}`——正是 serveUsage 的兜底形状。Host 侧路由注册成立，数据通路只剩前端挂载这一环。
+- **待办**：重启 DSH 后目视确认面板（预期先见 waiting chip「Cairn 记忆面板…」，端点可达后转三态 chip）。ZCode 无法替用户完成这最后一步。

@@ -116,22 +116,29 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        try {
-          ctx.slots.inject('conversation.session.header.actions', function () {
+        ctx.slots.inject('conversation.session.header.actions', function () {
+          // 注意：这个回调不是在 apply 里同步执行的——slots 服务在之后的全局
+          // reconcile tick 里才调它（DSH app-*.log 的 Uncaught 堆栈证实入口是
+          // 别人触发的 notifyDeclaration）。所以 try/catch 必须放进回调本体，
+          // 放在 apply 外层永远接不住，只会变成 Uncaught Error。
+          try {
             return ctx.slots.register(
               {
                 name: 'conversation.session.header.actions',
-                key: 'cairn-memory-usage',
-                priority: 20,
+                // list slot 契约（对照 dsh-connect-workbuddy/lib/client.js 实锤）：
+                // 缺 id 直接抛 requires options.id；list slot 用 order 排序，
+                // 没有 priority 字段。2026-11-02 前写的 key/priority 都不在契约里。
+                id: 'cairn-memory-usage',
+                order: 20,
                 inject: function () { return {}; },
               },
               MemoryUsagePanel,
             );
-          });
-        } catch (error) {
-          // slot 未声明或已注册：不影响宿主其他功能，但要让排查者能在控制台看到
-          console.error('[cairn-dsh-memory] panel slot registration failed:', error);
-        }
+          } catch (error) {
+            // 形状不符、重复注册等：不影响宿主其他功能，但必须让排查者在控制台看到
+            console.error('[cairn-dsh-memory] panel slot registration failed:', error);
+          }
+        });
       },
     };
   },
