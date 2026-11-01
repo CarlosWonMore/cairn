@@ -113,6 +113,47 @@ function makeToolRecall(ctx: unknown): RecallFn | null {
 }
 
 /**
+ * 从消息 content 字段提取纯文本。
+ *
+ * 兼容三种形态：字符串、`{type:'text',text}` 数组、单个 `{text}` 对象——
+ * 宿主消息结构只从 asar 反推过，不能赌单一形状。
+ */
+export function extractText(content: unknown): string {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof (c as { text?: string })?.text === 'string' ? (c as { text: string }).text : ''))
+      .join(' ')
+      .trim();
+  }
+  if (content && typeof content === 'object' && typeof (content as { text?: string }).text === 'string') {
+    return ((content as { text: string }).text) ?? '';
+  }
+  return '';
+}
+
+/**
+ * 从 pre-step payload 提取召回用文本。
+ *
+ * 2026-11-02 asar 实锤：waterfall 载荷是 `{ messages, ...position, signal }`，
+ * messages 里就有本轮用户输入——**不依赖 session/event 攒消息**（旧做法读
+ * `evt.message`，而真实形状是 `evt.data`，导致用户消息永远抓不到、召回一次没跑过）。
+ * 从末尾向前找第一条有文本的 user（或未标 role）消息。
+ */
+export function extractStepText(payload: unknown): string {
+  const messages = (payload as { messages?: unknown } | null | undefined)?.messages;
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string; content?: unknown } | null | undefined;
+    const role = typeof m?.role === 'string' ? m.role : 'user';
+    if (role !== 'user') continue;
+    const text = extractText(m?.content);
+    if (text.length > 0) return text;
+  }
+  return '';
+}
+
+/**
  * 构造注入消息。
  *
  * 刻意不依赖宿主 createUserMessage：用最小可辨识形状（role/content/source），
@@ -153,21 +194,37 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
 
   const injector = createInjector({ recall, config });
 
+  // 摘要级诊断（不含正文），usage?debug=1 可读：用于区分「hook 没挂上 /
+  // 事件形状不符 / 召回失败」——本轮排查就是靠它才能不靠用户来回试。
+  const diag = {
+    lastEventType: '' as string,
+    lastCapture: { captured: false, textLen: 0, sourceKind: '' },
+    lastPreStep: { fired: false, messageLen: 0, reason: '', selected: 0, injected: false },
+  };
+
   // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
   // 只返回摘要级信息，正文永不外传（design D3）。
   const usagePath = '/plugins/cairn-dsh-memory/usage';
   let usageRegistered = false;
-  const serveUsage = (req: { method?: string }, res: { writeHead?: Function; end?: Function }): void => {
+  const serveUsage = (req: { method?: string; url?: string }, res: { writeHead?: Function; end?: Function }): void => {
     if (req.method !== 'GET') {
       res.writeHead?.(405, { 'content-type': 'application/json' });
       res.end?.(JSON.stringify({ error: 'method not allowed' }));
       return;
     }
     const usage = injector.lastUsage();
+    const payload: Record<string, unknown> = { ...(usage ?? EMPTY_USAGE) };
+    // ?debug=1：附加摘要级诊断（不含正文），供端到端排查 hook 链路。
+    try {
+      const u = new URL(req.url ?? '/', 'http://local');
+      if (u.searchParams.get('debug') === '1') payload.debug = diag;
+    } catch {
+      /* url 解析失败就当没有 debug 参数 */
+    }
     res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     // 兜底必须字段完备（EMPTY_USAGE）：client 详情段会读 injected 等字段，
     // 退化形状会让面板在宿主 crash boundary 下被整个卸载。
-    res.end?.(JSON.stringify(usage ?? EMPTY_USAGE));
+    res.end?.(JSON.stringify(payload));
   };
   const registerUsageOn = (webServer: { register: (o: unknown) => unknown }): void => {
     webServer.register({
@@ -201,23 +258,33 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     }
   }
 
-  // pre-step 的 payload 不含用户原文（只有 { agent, signal }），
-  // 所以从 session/event 的 user/message 攒最近一条。
+  // pre-step 的 payload 自带 messages（2026-11-02 asar 实锤：waterfall 载荷
+  // `{ messages, ...position, signal }`），直接从里面取用户原文；
+  // session/event 只作兜底（真实形状是 evt.data，不是 evt.message）。
   let lastUserMessage = '';
 
   const hooks = ctx as { on?: (event: string, fn: unknown) => void } | undefined;
   if (typeof hooks?.on !== 'function') return;
 
   try {
-    hooks.on('session/event', (evt: { type?: string; message?: { content?: { text?: string }[] } }) => {
-      try {
-        if (evt?.type !== 'user/message') return;
-        const text = (evt.message?.content ?? []).map((c) => c?.text ?? '').join(' ').trim();
-        if (text.length > 0) lastUserMessage = text;
-      } catch {
-        /* 结构不符就忽略 */
-      }
-    });
+    hooks.on(
+      'session/event',
+      (evt: { type?: string; data?: { content?: unknown; source?: { kind?: string } }; message?: { content?: { text?: string }[] } }) => {
+        try {
+          diag.lastEventType = evt?.type ?? '?';
+          if (evt?.type !== 'user/message') return;
+          // 真实宿主形状：消息体在 evt.data（含 source.kind）。只认真实用户输入，
+          // agent-instructions 之类的 user-role 注入不驱动召回。
+          const kind = evt.data?.source?.kind;
+          if (kind !== undefined && kind !== 'user') return;
+          const text = extractText(evt.data?.content ?? evt.message?.content);
+          diag.lastCapture = { captured: text.length > 0, textLen: text.length, sourceKind: kind ?? '?' };
+          if (text.length > 0) lastUserMessage = text;
+        } catch {
+          /* 结构不符就忽略 */
+        }
+      },
+    );
   } catch {
     /* 注册失败降级 */
   }
@@ -225,14 +292,28 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   try {
     hooks.on(
       'agent/pre-step',
-      async (payload: { agent?: { inject?: (m: unknown) => void } }, next?: () => unknown) => {
+      async (
+        payload: { agent?: { inject?: (m: unknown) => void }; messages?: unknown },
+        next?: () => unknown,
+      ) => {
+        diag.lastPreStep.fired = true;
         try {
-          const out = await injector.runOnce(lastUserMessage);
-          if (out.injected && typeof payload?.agent?.inject === 'function') {
-            payload.agent.inject(makeInjectionMessage(out.text));
+          const stepText = extractStepText(payload) || lastUserMessage;
+          diag.lastPreStep.messageLen = stepText.length;
+          const out = await injector.runOnce(stepText);
+          diag.lastPreStep.reason = out.reason;
+          diag.lastPreStep.selected = out.selected;
+          diag.lastPreStep.injected = out.injected;
+          if (out.injected) {
+            const agent = payload?.agent;
+            if (typeof agent?.inject === 'function') {
+              agent.inject(makeInjectionMessage(out.text));
+            } else {
+              diag.lastPreStep.reason = out.reason + ' (agent.inject 不可用，未注入)';
+            }
           }
-        } catch {
-          /* 任何异常都只跳过本次注入 */
+        } catch (e) {
+          diag.lastPreStep.reason = 'threw: ' + (e as Error).message;
         }
         // 必须调用 next()，否则整条链路卡住。
         return typeof next === 'function' ? next() : undefined;

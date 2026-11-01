@@ -265,3 +265,34 @@ Uncaught 堆栈显示 `slots.inject` 的回调是在**后续的全局 reconcile 
 ### 验证
 - 插件单测 30/30（26→30）；`tsc --noEmit` 净；`node --check` 净；dist 重建后 `import('./dist/usage-state.js').EMPTY_USAGE` 形状核对通过。
 - 待用户重启 DSH 复验。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-7：tab 化 + 召回链路真实形状）
+
+### 用户反馈的两个问题
+1. 面板出现在 header「ptc 模式」后面 → 用户期望**像「轨迹」一样是独立 tab**。
+2. 触发了记忆获取动作，面板仍显示 未命中/0/none/0 B —— 而轨迹里能看到调用记录。
+
+### 根因 A（数据）：读错事件形状，召回一次都没跑过
+- 面板显示「命中通道：none」是 `EMPTY_USAGE` 的特征值（真实跑过召回的 miss 是 `fts`）→ lastUsage 恒为 null。
+- asar 实锤：`user/message` 事件的消息体在 **`evt.data`**（`event.data.source.kind === 'user'`，Keys 断言含 `turn`/`content`），旧实现读 `evt.message` → 永远 undefined → 用户消息永远抓不到 → pre-step 里 `shouldInject(空串)` 拒绝。
+- **轨迹里的「调用记录」是 agent 显式调 MCP 工具（手动路径），与插件的自动召回（pre-step）是两条路**——面板只统计后者。这是用户困惑的直接原因，已在面板里加了说明文字。
+
+### asar 实锤的宿主契约（本轮全部反查自 `app.asar`）
+- `agent/pre-step`：`dispatch.waterfall("agent/pre-step", { messages, ...position, signal }, fallback)`；监听器签名 `(payload, next)`，可返回 `{kind:'reject'}`，fallback 返回 `{kind:'enter', messages}`。
+- **payload 自带 `messages`** —— 用户原文不必从 session/event 攒。
+- `agent.inject(message: UserMessage): void` 是真实 API（宿主文档：pre-step 监听器用它 "add durable request material"）。
+- `conversation.view` 是会话 tab 槽：轨迹插件的注册形状 `{name, id:'trajectory', order:10, locale, label:()=>t(...), children?, inject:(sessionId)=>props}` + 组件第二参。
+
+### 修改
+1. `src/index.ts`：
+   - pre-step 改为**直接读 `payload.messages`**（末尾向前找第一条有文本的 user 消息）；session/event 兜底改读 `evt.data` 且只认 `source.kind==='user'`。
+   - 新增 `extractText`/`extractStepText`（导出，含形状兼容：字符串/`{type,text}`数组/`{text}`对象）。
+   - 新增摘要级诊断 `diag`（lastEventType/lastCapture/lastPreStep，**不含正文**），`usage?debug=1` 可读——后续排查不再需要用户来回重启试错。
+2. `src/client.js`：header chip 改为 `conversation.view` 独立 tab（id `cairn-memory`，order 90，label「记忆」），整页布局：三态状态 + 明细 + 注入列表 + 说明文字。
+3. 回归测试 +5（30→35）：真实 pre-step 形状驱动召回并注入、session/event 真实形状兜底、agent-instructions 不触发、debug 参数、extractText/extractStepText 形状兼容。
+
+### 验证
+- 插件单测 35/35；`tsc` 净（dist 已重建，含新代码）；`node --check` 净。
+- 待用户重启 DSH：① 会话顶部应出现「记忆」tab（与轨迹并列）；② 发一条消息后 tab 内数据应从 0 变化（`usage?debug=1` 可由 ZCode 直接 curl 验证链路）。
