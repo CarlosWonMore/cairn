@@ -383,3 +383,22 @@ Round-10 把 `React.useEffect`（persist 校准）写在了 `if (!data) return` 
 
 ### 状态
 dist 无需重建（client.js 由宿主直接读取）；待用户再重启一次 DSH（rev 重算后生效）目视确认面板完整渲染。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-12：主题对比度自动适配 + 文字设定）
+
+### 用户确认与反馈
+重启后面板完整渲染 ✓（hooks 修复生效）。新问题：深色主题下文字近黑（黑上黑），要求背景黑→白字、背景白→黑字、可手动设定、必须清晰。
+
+### 实测（浏览器自动化，端口 3480）
+- 有效背景 `rgb(21,21,23)`；面板文字 `rgb(17,17,17)`——对比度 ≈1:1。
+- 根因：DSH 未定义 `--dsw-text` 等主题变量（getComputedStyle 实测 vars 为空），旧代码的 `var(--dsw-text, #111)` 回退色在深色主题下不可读；非激活 chip（opacity .55）文字直接消失。
+
+### 修复（client.js）
+- `bgLuminance()`：沿祖先链实测第一个不透明背景的 WCAG 相对亮度（透明则继续向上；取不到落到 `prefers-color-scheme`）。
+- `pickPalette(pref)`：深浅两套调色板（正文/状态色/激活 chip 配色，均按 ≥4.5:1 选）；`文字: 自动|白字|黑字` 三个 chip 手动覆盖，随筛选器 localStorage 持久化（key 不变，旧存档缺 text 字段自动回落 auto）。
+- 应用到 waiting 态、容器正文、状态点、chip 激活配色；非激活 chip opacity .55→.62；删除死常量 COLOR。
+
+### 状态
+48/48 插件测试绿；client.js 由宿主直接读取，待重启 DSH 生效。

@@ -11,12 +11,6 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
-    const COLOR = {
-      injected: '#2e7d32',
-      filtered: '#ef6c00',
-      miss: '#757575',
-    };
-
     // Host 与 Client 分处两个进程，只能走 HTTP。history=1 取完整活动记录。
     const USAGE_URL = '/plugins/cairn-dsh-memory/usage?history=1';
     const PERSIST_URL = '/plugins/cairn-dsh-memory/persist';
@@ -68,7 +62,7 @@ window.__ModuleLoader__.load({
 
     // 展示配置（用户要求：可筛选、设定展示内容与时长），localStorage 持久化。
     var FILTER_KEY = 'cairn-memory-tab-filters';
-    var FILTER_DEFAULT = { recall: true, tool: true, limit: 30, detail: 'full' };
+    var FILTER_DEFAULT = { recall: true, tool: true, limit: 30, detail: 'full', text: 'auto' };
     function loadFilters() {
       try {
         var raw = window.localStorage && window.localStorage.getItem(FILTER_KEY);
@@ -79,11 +73,68 @@ window.__ModuleLoader__.load({
           tool: saved.tool !== false,
           limit: [15, 30, 120].indexOf(saved.limit) >= 0 ? saved.limit : 30,
           detail: saved.detail === 'brief' ? 'brief' : 'full',
+          text: ['auto', 'white', 'black'].indexOf(saved.text) >= 0 ? saved.text : 'auto',
         };
       } catch (e) { return Object.assign({}, FILTER_DEFAULT); }
     }
     function saveFilters(f) {
       try { if (window.localStorage) window.localStorage.setItem(FILTER_KEY, JSON.stringify(f)); } catch (e) { /* 忽略 */ }
+    }
+
+    // ——— 主题对比度（用户要求：背景黑→白字、背景白→黑字，且可手动设定）———
+    // 实测 DSH 深色主题下 --dsw-text 等变量未定义（vars 为空），硬编码回退色
+    // 会黑上黑。做法：沿祖先链实测有效背景的 WCAG 相对亮度自动选字色；
+    // 「文字：自动|白字|黑字」可手动覆盖（随筛选器持久化）。
+    function channelCurve(v) { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+    function rgbLuminance(r, g, b) { return 0.2126 * channelCurve(r) + 0.7152 * channelCurve(g) + 0.0722 * channelCurve(b); }
+
+    function bgColorAt(el) {
+      // 返回该元素不透明背景的亮度；透明则返回 null 继续向上找
+      try {
+        var c = window.getComputedStyle(el).backgroundColor;
+        var m = c && c.match(/rgba?\(([^)]+)\)/);
+        if (!m) return null;
+        var p = m[1].split(',').map(function (x) { return parseFloat(x); });
+        var a = p.length > 3 ? p[3] : 1;
+        if (a < 0.85) return null;
+        return rgbLuminance(p[0], p[1], p[2]);
+      } catch (e) { return null; }
+    }
+
+    function bgLuminance() {
+      try {
+        var el = document.body;
+        while (el) {
+          var lum = bgColorAt(el);
+          if (lum !== null) return lum;
+          if (el === document.documentElement) break;
+          el = el.parentElement || document.documentElement;
+        }
+      } catch (e) { /* 落到 prefers-color-scheme */ }
+      try {
+        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 0.05 : 0.95;
+      } catch (e) { return 0.95; }
+    }
+
+    // 深浅两套调色板：正文 4.5:1 以上、状态色醒目、激活 chip 在两种主题下都可读
+    function pickPalette(pref) {
+      var dark;
+      if (pref === 'white') dark = true;
+      else if (pref === 'black') dark = false;
+      else dark = bgLuminance() < 0.45;
+      return dark ? {
+        text: '#f3f4f6',
+        status: { injected: '#7ddb8a', filtered: '#ffb26b', miss: '#c6cad1' },
+        chipActiveBg: 'rgba(96,134,224,.30)',
+        chipActiveBorder: '#7d9be8',
+        chipActiveColor: '#c3d4ff',
+      } : {
+        text: '#16181d',
+        status: { injected: '#2e7d32', filtered: '#ef6c00', miss: '#757575' },
+        chipActiveBg: 'rgba(91,123,213,.12)',
+        chipActiveBorder: '#5b7bd5',
+        chipActiveColor: '#3a5bbf',
+      };
     }
 
     function hhmmss(iso) {
@@ -105,6 +156,8 @@ window.__ModuleLoader__.load({
       React.useEffect(function () {
         if (state.data && typeof state.data.persist === 'boolean') setPersistState(state.data.persist);
       }, [state.data]);
+      // 主题对比度：自动实测背景亮度，或按用户设定（文字：自动|白字|黑字）
+      var pal = pickPalette(filters.text);
       function update(patch) {
         var next = Object.assign({}, filters, patch);
         setFilters(next);
@@ -124,7 +177,7 @@ window.__ModuleLoader__.load({
       }
 
       if (!data) {
-        return h('div', { 'data-cairn-usage': 'waiting', style: { padding: 24, color: '#9e9e9e', font: 'inherit' } },
+        return h('div', { 'data-cairn-usage': 'waiting', style: { padding: 24, color: pal.status.miss, font: 'inherit' } },
           state.failed ? 'Cairn 记忆端点不可用（host 插件未注册 usage 路由？）' : 'Cairn 记忆状态加载中…');
       }
 
@@ -141,7 +194,7 @@ window.__ModuleLoader__.load({
       // host 是持久化状态的权威（校准 effect 已前移到 early return 之前）
       var persistOn = data.persist;
 
-      var color = COLOR[data.status] || COLOR.miss;
+      var color = pal.status[data.status] || pal.status.miss;
       var rows = [
         ['召回条数', String(data.candidates)],
         ['命中通道', data.matchedBy],
@@ -156,16 +209,16 @@ window.__ModuleLoader__.load({
           onClick: onClick,
           style: {
             font: 'inherit', fontSize: 12, padding: '2px 10px', cursor: 'pointer',
-            borderRadius: 999, border: '1px solid ' + (active ? '#5b7bd5' : 'rgba(127,127,127,.4)'),
-            background: active ? 'rgba(91,123,213,.12)' : 'transparent',
-            color: active ? '#3a5bbf' : 'inherit', opacity: active ? 1 : .55,
+            borderRadius: 999, border: '1px solid ' + (active ? pal.chipActiveBorder : 'rgba(127,127,127,.4)'),
+            background: active ? pal.chipActiveBg : 'transparent',
+            color: active ? pal.chipActiveColor : 'inherit', opacity: active ? 1 : .62,
           },
         }, labelText);
       }
 
       return h('div', {
         'data-cairn-usage': data.status,
-        style: { padding: '16px 20px', font: 'inherit', color: 'var(--dsw-text, #111)', overflow: 'auto' },
+        style: { padding: '16px 20px', font: 'inherit', color: pal.text, overflow: 'auto' },
       },
         // 状态区
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
@@ -201,6 +254,12 @@ window.__ModuleLoader__.load({
             [15, 30, 120].map(function (n) {
               return chip(n + '条', filters.limit === n, function () { update({ limit: n }); });
             }),
+            h('span', { style: { opacity: .4 } }, '|'),
+            // 文字对比度设定（自动=实测背景亮度；白字/黑字=手动覆盖）
+            h('span', { style: { fontSize: 12, opacity: .6 } }, '文字:'),
+            chip('自动', filters.text === 'auto', function () { update({ text: 'auto' }); }),
+            chip('白字', filters.text === 'white', function () { update({ text: 'white' }); }),
+            chip('黑字', filters.text === 'black', function () { update({ text: 'black' }); }),
             h('span', { style: { opacity: .4 } }, '|'),
             // 持久化开关：内存（默认）/ 落盘。状态权威在 host（marker 文件），重启保持。
             h('span', { style: { fontSize: 12, opacity: .6 } }, '记录存储:'),
