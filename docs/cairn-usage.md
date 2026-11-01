@@ -497,6 +497,42 @@ Cursor（项目根 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.json`）：
 - 不要手写 `user_confirmed` 之类的字段——审批凭证只来自本地 `cairn approve`。
 - 也可以用 `cairn agent plan --host <agent> --mcp-command node --mcp-args "dist/src/interfaces/mcp/server.js"` 生成这份配置（零写入），审阅后 `agent apply` 写入。
 
+
+### 4.1b DSH：不是 JSON，是 Cordis 插件树
+
+DeepSeek Harness **不读 `mcp.json`**。上面对 Claude Code / Cursor 的写法在 DSH 上完全无效——把 `mcpServers` 写进任何文件，DSH 都不会加载。
+
+DSH 的 MCP 接入点是它的 Cordis 插件树 `<dshHome>/profiles/<profile>/cordis.patch.yml`，要写成 `- insert:` 块：
+
+```yaml
+- insert:
+    - id: mcp-cairn
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: cairn
+        transport: stdio
+        command: "D:/Program Files/nodejs/node.exe"
+        args:
+          - "D:/Project/AI MemoryGLM/dist/src/interfaces/mcp/server.js"
+        failOnStartupError: false
+```
+
+几个要点：
+
+- **`- insert:` 这一层不能省。** 顶层的裸 `- id: xxx` 行是「覆盖/禁用某个已在某 bundle 层存在的条目」，找不到目标就被**静默丢弃**，日志只留一行 `[warn] patch: entry "xxx" not found`。
+- **`command` 用绝对路径。** DSH 从 Electron 起子进程，`PATH` 不可依赖。
+- **`failOnStartupError: false`**（默认值，显式写出以表意图）：让 MCP 启动失败只表现为「少几个工具」，而不是 DSH 起不来。
+- **工具名前缀由 `serverName` 决定**：注册后是 `mcp__cairn__memory_search` 这种形状，须匹配 `[A-Za-z0-9_-]{1,32}`。
+- **修改后要重启 DSH**（或触发配置重载）才加载；编辑配置条目会就地重载连接。
+
+用 `cairn agent plan --host dsh` 生成的计划就是上面这块内容，不需要手写：
+
+```bash
+cairn agent plan --host dsh --home-root "$DSH_HOME" \
+  --mcp-command "D:/Program Files/nodejs/node.exe" \
+  --mcp-args "D:/Project/AI MemoryGLM/dist/src/interfaces/mcp/server.js"
+```
+
 ### 4.2 memory_* 工具（8 个，常驻工具面）
 
 | 工具 | 参数 | 行为 |
@@ -537,7 +573,7 @@ Cursor（项目根 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.json`）：
 
 ## 5. 宿主配置管理
 
-四个子命令（`<agent>` 取值：`claude-code | cursor | copilot | openclaw | workbuddy`）：
+四个子命令（`<agent>` 取值：`claude-code | cursor | copilot | openclaw | workbuddy | dsh`）：
 
 ```bash
 cairn agent plan      --host <agent> [--mode observe|router|mcp-primary] [--mcp-command node --mcp-args "..."] [--home-root <dir>] [--project-root <dir>]
@@ -554,6 +590,25 @@ cairn agent uninstall --host <agent> [--home-root <dir>] [--project-root <dir>]
 - **doctor 只读**：如实报告配置文件是否存在、cairn 条目是否存在、受管区块是否存在、安装记录数，以及 `fixture-only` / `blocked` 能力分级。
 - **uninstall 只移除本产品条目**：文件与上次安装后状态一致时整文件恢复备份字节；用户有后续修改时只移除 cairn 条目/受管区块，其余内容保持不变。
 
+
+### DSH（DeepSeek Harness）特别说明
+
+DSH 的接入形态与其他五个宿主**根本不同**，参数也多一个：
+
+```bash
+cairn agent plan      --host dsh --home-root <dshHome> [--dsh-profile desktop] --mcp-command <node> --mcp-args "<server.js>"
+cairn agent apply     --plan-file <plan.json>
+cairn agent doctor    --host dsh --home-root <dshHome> [--dsh-profile desktop]
+cairn agent uninstall --host dsh --home-root <dshHome> [--dsh-profile desktop]
+```
+
+- **DSH 不读 `mcp.json`。** 它的 MCP 配置是 Cordis 插件树：`<dshHome>/profiles/<profile>/cordis.patch.yml`，cairn 以 `- insert:` 块登记 `@deepseek-ai/dsh-mcp-client` 插件。按其他宿主那样去改 `mcp.json`，DSH 完全不看。
+- **`- insert:` 不能省。** 不带 `insert` 的裸 `id` 行语义是「覆盖某个已存在的条目」，找不到目标就被**静默丢弃**——日志里只会多一行 `[warn] patch: entry "mcp-cairn" not found`，看起来像「还没生效」，实则从未进过配置树。这正是 cairn 用块编辑器而不是让你手写的原因。
+- **`--home-root` 对 dsh 必须给对。** 解析顺序：显式 `--home-root` → `DSH_HOME` 环境变量 → 报错。**不会**回退 `~/.dsh`（该目录在部分机器上是旧安装留下的空壳）。
+- **`--dsh-profile`** 默认 `desktop`，仅当 DSH 用了别的 profile 名时才需要。
+- **规则入口是用户级 `<dshHome>/AGENTS.md`**，对所有工作区生效；项目级 `AGENTS.md` 追加在其后（两者叠加，后者更具体因此优先）。这是「整个会话都走 cairn」的正确落点，不必逐项目写。
+- **不是 YAML 解析器。** cairn 对该文件做行级定向编辑，只碰自己那一个 `insert` 块，不重排、不改注释。结构无法识别时一律 `E_CONFIG_CONFLICT` 硬失败并零写入，绝不猜测性重写。
+
 ### 5.1 三种模式
 
 | 模式 | 写入内容 |
@@ -562,7 +617,7 @@ cairn agent uninstall --host <agent> [--home-root <dir>] [--project-root <dir>]
 | `router`（推荐长期模式） | 受管路由区块（5 行文案）+ 可选 MCP 条目。原生记忆保持原样 |
 | `mcp-primary` | router 全部内容 + 原生记忆**手动**关闭步骤（`manual_step`，apply 时跳过，需用户自己完成）。除 cursor 外此模式能力分级为 `blocked`（原生接管需用户手动） |
 
-### 5.2 五宿主能力矩阵（`src/agents/adapters.ts` 实录）
+### 5.2 六宿主能力矩阵（`src/agents/adapters.ts` 实录）
 
 | 宿主 | MCP 配置 | 受管区块（路由入口） | mcp-primary 原生记忆关闭 | MCP 顶层键 |
 | --- | --- | --- | --- | --- |
@@ -571,6 +626,7 @@ cairn agent uninstall --host <agent> [--home-root <dir>] [--project-root <dir>]
 | GitHub Copilot | `fixture-only`：项目 `.vscode/mcp.json`（键为 `servers`）或用户 `~/.copilot/mcp-config.json`（键为 `mcpServers`） | `fixture-only`：`.github/copilot-instructions.md`（项目）；无 home 级块文件 | `documented-manual`：GitHub 设置 → Copilot 中手动关闭 Memory | `servers`（项目）/ `mcpServers`（用户） |
 | OpenClaw | `blocked`：官方未公开配置文件路径，本产品拒绝写入推测路径，MCP 条目需用户手动添加 | `fixture-only`：`~/.openclaw/workspace/AGENTS.md` | 开关存在但配置路径未公开：只能给出手动步骤，`none` | `mcpServers` |
 | WorkBuddy | `blocked`：官方仅描述"自定义连接器"UI 安装，无公开路径 | `blocked`：无公开规则/记忆文件，只提供可复制文案由用户手动粘贴 | 账号级服务端设置，用户手动关闭，`none` | `mcpServers` |
+| DeepSeek Harness (DSH) | `fixture-only`：**非 JSON**。`<dshHome>/profiles/<profile>/cordis.patch.yml` 的 `- insert:` 块（Cordis 插件树，不读 `mcp.json`） | `fixture-only`：用户级 `<dshHome>/AGENTS.md`（对所有工作区生效；项目级叠加在后） | 无公开关闭接口，只能给手动步骤，`none` | `—`（插件树，无 JSON 顶层键） |
 
 **blocked 宿主的手动指引**（来自 `agent plan` 输出的 `notes` / `manual_step` 文案）：
 

@@ -606,3 +606,125 @@ OpenSpec 变更 `add-real-cloud-sync`（capability: cloud-sync）已实现并在
 
 - 浏览器只在 Chrome 上验证过，Firefox/Safari 未覆盖（`role`/`aria` 与焦点行为是标准 API，但没实测）。
 - 没有视觉回归（像素比对），版式改动不会报警。
+
+## 9. 2026-11-01 把 cairn 接进 DSH（第三个宿主）
+
+WorkBuddy（`~/.workbuddy/mcp.json`）与 ZCode（`~/.zcode/cli/config.json`）都是 mcp.json 形态，各加一个 cairn 条目即可。**DSH 不是**——它不吃 `mcp.json`，全盘扫过 `D:\AIAgents_Data\DSH_DATA` 没有任何文件含 `mcpServers` 字样。它的配置是 Cordis 树：profile 根 `cordis.yml` 是空数组，实际条目全在 `D:\AIAgents_Data\DSH_DATA\profiles\desktop\cordis.patch.yml`（注释里明写"编辑它，别改 cordis.yml"的那一层）。
+
+接入形态是一条 insert 式条目，走 DSH 自带的 `@deepseek-ai/dsh-mcp-client`（在 app.asar 里，不是 profile 的依赖）：
+
+```yaml
+- insert:
+    - id: mcp-cairn
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: cairn
+        transport: stdio
+        command: "D:/Program Files/nodejs/node.exe"
+        args:
+          - "D:/Project/AI MemoryGLM/dist/src/interfaces/mcp/server.js"
+        failOnStartupError: false
+```
+
+**`insert:` 这层不能省。** 这是我第一次踩的坑，写在这里免得下一个人重犯：`cordis.patch.yml` 的顶层数组是**补丁行**，不是**条目行**。带 `id` 但不带 `insert` 的行，语义是"覆盖/禁用某个已在某 bundle 层里存在的条目"；找不到就丢弃。所以直接把一条新插件写成 `- id: mcp-cairn` 会被静默忽略——日志里只有一行 `[warn] patch: entry "mcp-cairn" not found`，重启一次多一行，看起来像"没生效"，实际上是从没进过配置树。源码位置：asar 内的 patch 应用循环，`if (insert) { data.push(...insert); buildMap(insert); continue }` 在前，`if (!target) { warn('patch: entry %C not found', id); continue }` 在后。
+
+几个决定和理由：
+
+- **command 写绝对路径而不是 `node`。** DSH 从 Electron 里起子进程，PATH 不可依赖；WorkBuddy/ZCode 用 `node` 能跑不代表这里能跑。实测用绝对路径 + 只给 `{ HOME }` 的最小 env、cwd 设为项目目录，同样握手成功。
+- **`failOnStartupError: false`。** 默认就是 false，显式写出来是为了表达意图：DSH 的 startup policy 允许可选 MCP 条目失败而不中止整个 harness。设 true 的话，哪天 dist/ 没重新构建、DSH 起不来，排查成本比"少几个工具"高得多。真出问题应该在 stderr/日志里看，不该让宿主开不了机。
+- **`serverName: cairn` 决定工具名前缀**，注册后是 `mcp__cairn__memory_search` 这种形状。它必须匹配 `[A-Za-z0-9_-]{1,32}`。
+
+验收（都是真跑，不是看文档推断）：
+
+- YAML 用 **DSH 自己那一份 yaml@2.9.0**（从 app.asar 里按正确偏移解出来的）解析：PARSE_OK，7 个条目 id 无重复，其余六个条目（computer-use-cua-driver-native / dsh-connect-workbuddy / agent-default-model / ui-settings-account / ui-chat / ui-settings）原样未动。顺带一提，asar 里的 offset 是**相对数据区**的，得加上 `8 + headerSize` 才是文件真实偏移——第一次按绝对偏移解出来是 wasm 反汇编代码，差点误判。
+- stdio 握手真跑：initialize → `{name:"cairn",version:"0.1.0"}`，tools/list → **14 个工具**（memory_context/search/get/add/propose/update/forget/status、onboarding_status/next_batch/propose/apply、memory_review/decide）。
+- 改前备份 `cordis.patch.yml.bak-pre-cairn-20261101`。
+
+### 生效条件（与另两个宿主同一条纪律）
+
+**改 src/ 之后必须 npm run build，新会话才拿得到新代码**——三个宿主都指向 `dist/src/interfaces/mcp/server.js`，配置里没有编译步骤。当前 dist 的 mtime 晚于 src，是新的。
+
+### 2026-11-01 20:35 端到端确认（推翻上一版"尚未验证"的结论）
+
+上一版写完时我说"配置合法 + 服务端握手正常已验证，但 DSH 里能不能调到尚未验证"。**用户重启后一查，发现根本没生效**——就是上面那个漏 `insert:` 的错。修正后 DSH **热加载**（不需要重启）即生效，四条独立证据：
+
+| 证据 | 内容 |
+| --- | --- |
+| 插件状态 | `plugin.state {"pluginId":"include:mcp-cairn","module":"@deepseek-ai/dsh-mcp-client","previous":0,"state":1}` → `previous:1,state:2`（加载完成） |
+| 进程归属 | 新增 `node ... server.js` 的 **ppid = DSH NEXT.exe**（另一个同类进程 ppid 是 ZCode.exe，属既有接入，别混淆） |
+| 服务自述 | 日志 `[cairn-mcp] stdio server ready (pid 36568)` |
+| 工具可调 | 会话内 14 个 `mcp__cairn__*` 已注册；实调 `memory_status` 返回库统计、`memory_context` 返回 9 条 active 记忆正文 |
+
+教训记一条：**`[warn] patch: entry "X" not found` 是"配置根本没进树"，不是"还没生效"。** 遇到它不要等重启，直接查 patch 行的形态。
+
+### 日常自检
+
+`npm run mcp:smoke`（默认只读真实库；写库须 `--write --home <临时目录>`）。
+
+
+## 10. 2026-11-01 让「整个 DSH 会话」都走 cairn
+
+§9 解决的是"DSH 能调到 cairn 工具"，这一节解决"每个会话都被要求用它"。两件事不同：前者是能力，后者是指令。
+
+### DSH 的指令是两层叠加，不是二选一
+
+`@deepseek-ai/dsh-agent-instructions`（dsh-base 默认挂载，budget 65536 B）在**每个会话的首个请求**建立一份 baseline，内容是：
+
+1. **user-global 层**：`$DSH_HOME/AGENTS.md`（即 `D:\AIAgents_Data\DSH_DATA\AGENTS.md`），然后是 `$DSH_AGENTS_HOME/AGENTS.md`（默认 `~/.agents/AGENTS.md`）
+2. **project 层**：从项目根向下到会话工作目录的每一级 `AGENTS.md` / `CLAUDE.md`，broad→specific
+
+两层是**追加**关系，不是覆盖。所以想让"所有 DSH 会话"都遵循 cairn，正确落点是 user-global 层，而不是去改每个项目。
+
+两个 user-global 位置此前**都不存在**（`~/.agents` 目录在，但只有 skills/ 和空的 mcp.json）。已创建 `$DSH_HOME/AGENTS.md`，写入与 `ROUTER_BLOCK_CONTENT`（`src/agents/config.ts:54`）逐字一致的五条路由文案，并套 cairn 受管块标记（`cairn-router` / revision 1），这样将来 cairn 的卸载逻辑仍能精确移除它。
+
+### 为什么没有用 `cairn agent` 命令
+
+`AGENT_KINDS = ['claude-code','cursor','copilot','openclaw','workbuddy']`（`src/agents/adapters.ts:44`）——**DSH 不在支持列表里**，`cairn agent plan --host dsh` 会直接 E_VALIDATION。所以这条手工复用受管块格式，而不是等产品支持。若将来要给 DSH 加正式适配器，需要：`adapters.ts` 加 kind + 能力矩阵、CLI 接受新 kind、以及 §9 那种 Cordis patch 写入能力（现有 `write_mcp_config` 只处理 `mcpServers` JSON，不处理 Cordis 树）——这是一次真实的产品变更，不是加一行枚举。
+
+### 验收
+
+- 写入后**当前会话立即**收到 `<system-reminder> Additional instructions from: $DSH_HOME/AGENTS.md`，正文与文件一致——这是运行时注入证据，不是"文件存在"的推断。
+- 源码确认两层叠加：`userGlobalRoots()` 返回 `['user-global','agents-global']` 两个根，`instructionCandidateGroup()` 把两者归一成同一候选组去重；`USER_GLOBAL_FILE = 'AGENTS.md'`。
+- 每会话都会跑：发现逻辑在 baseline 组装时执行，不是一次性热加载。
+- 项目 `AGENTS.md` 的 cairn 块仍在（两处并存，各自 revision 1）。
+
+### 一个必须知道的边界
+
+**user-global 层能约束"行为"，不能约束"能力"。** 它让每个 DSH 会话都读到"记忆走 cairn"这条指令，但 cairn 工具本身能否被调用，取决于 §9 那条 Cordis patch 是否加载成功。两者要分别验证——§9 差点被我误判成"已接入"，就是只验了配置、没验加载。
+
+## 11. 2026-11-01 `cairn agent --host dsh` 落地（add-dsh-host-adapter）
+
+§9 与 §10 都是**手工**接入 DSH，改的是用户机器上的文件；本节是把这件事变成产品能力。变更 `add-dsh-host-adapter` 按 OpenSpec 走完 proposal → specs → design → tasks → apply → verify。
+
+### 核心判断：新增一个「配置形态」维度
+
+`HostAdapter` 原来只抽象了「路径 + JSON 顶层键名」，这套抽象表达不了 DSH。于是加入 `mcpConfigKind: 'json' | 'cordis-patch' | 'none'`，在四个入口（plan/apply/doctor/uninstall）按形态分派，而不是在四处各写一个 `if (kind === 'dsh')`。
+
+### 最关键的设计取舍：不引入 YAML 依赖
+
+项目运行时依赖只有三项，而 `cordis.patch.yml` 是 43 KB / 1277 行、由 DSH 与用户**共写**的文件。任何 YAML 反序列化再序列化都会丢注释与键序——那是真实的回归风险。因此 `src/agents/cordisPatch.ts` 做**行级定向编辑**：只定位并替换/删除本产品那一个 `- insert:` 块。
+
+代价是编辑器依赖该文件的缩进与键序约定。所以**结构不符一律硬失败**（`E_CONFIG_CONFLICT` 且零写入），绝不「尽力修复」：在配置接入这件事上，「没接上」远好于「接歪了还不知道」。
+
+### 实测验收（真跑，不采信自述）
+
+| 项 | 结果 |
+| --- | --- |
+| 全量测试 | **636 项 / 635 通过 / 0 失败 / 1 skip**（基线 609 → 净增 27） |
+| 单向 typecheck | `tsc --noEmit` 零错误 |
+| 真实 DSH 只读 doctor | `configExists=true`、`cairnEntryPresent=true`、`blockPresent=true`，并**如实报告**「无安装记录（视为外来条目）」而非假装是自己装的 |
+| plan 零写入 | 对真实文件副本执行 plan，前后 sha256 完全一致 |
+| 写入闭环 | 真实形态副本上 plan→apply→doctor→uninstall，**uninstall 后 sha256 与原始逐字节一致**，`insert` 块归零 |
+| 幂等 | 连续两次 apply，第二次内容未变化并跳过写入 |
+| 负向：外来条目 | 对含手工 `mcp-cairn` 的真实副本执行 apply → 冲突检出、**退出码 4**、文件哈希未变 |
+| 真实文件未受损 | 全程只操作临时副本；真实 `cordis.patch.yml` sha256 始终为 `08654CE5…` |
+
+### 一个必须记住的操作顺序陷阱
+
+`agent plan` 的输出用 `--out` **不会**写文件——`out()` 只把 JSON 打到 stdout。要落盘必须用 shell 重定向；但 PowerShell 的 `>` 默认写 UTF-16 BOM，`agent apply --plan-file` 会以 `SyntaxError: Unexpected token` 失败。**正确做法是用 node 以 `encoding:'utf8'` 捕获再写盘**。这个坑在验收时踩过，不是实现缺陷。
+
+### 未做（不因归档消失）
+
+- 只在**单机单版本**（DSH 桌面端，profile=desktop）验证过形态与加载结果，没有跨 DSH 版本矩阵，故分级仍是 `fixture-only`，不标 `real-cli-tested`。
+- DSH 的 profile 未做自动发现，默认 `desktop`，可用 `--dsh-profile` 覆盖。
+- `workbuddy` 的 `blocked` 分级**未改动**：官方文档确实未公开该路径。用户环境里 `~/.workbuddy/mcp.json` 可用是环境事实，不构成翻案依据。
