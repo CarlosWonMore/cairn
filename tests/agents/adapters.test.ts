@@ -73,18 +73,21 @@ describe('HOST_ADAPTERS：与 M0 矩阵一致的宿主元数据', () => {
     assert.ok(a.notes.some((n) => n.includes('未公开')), 'notes 必须声明路径未公开');
   });
 
-  it('workbuddy：MCP 与块目标均未公开（双 blocked），只给手动指引', () => {
+  it('workbuddy：MCP 仍 blocked；但块目标已公开（fixture-only）+ 8KB 投影预算', () => {
     const a = HOST_ADAPTERS['workbuddy'];
-    assert.equal(a.mcpConfigPath(HOME, PROJ), null);
+    assert.equal(a.mcpConfigPath(HOME, PROJ), null, 'MCP 路径仍未公开');
     assert.equal(a.mcpConfigPath(HOME, null), null);
     assert.equal(a.mcpConfigCapability, 'blocked');
-    assert.equal(a.blockTargetPath(HOME, PROJ), null);
-    assert.equal(a.blockTargetPath(HOME, null), null);
-    assert.equal(a.blockCapability, 'blocked');
+    // 2026-11-01 核对应用代码后改动：MemoryCollector 读 <cwd>/.workbuddy/memory/MEMORY.md 并注入。
+    assert.equal(a.blockTargetPath(HOME, PROJ), path.join(PROJ, '.workbuddy', 'memory', 'MEMORY.md'));
+    assert.equal(a.blockTargetPath(HOME, null), path.join(HOME, '.workbuddy', 'memory', 'MEMORY.md'));
+    assert.equal(a.blockCapability, 'fixture-only');
+    assert.equal(a.projectionMode, 'brief');
+    assert.equal(a.projectionBudgetBytes, 8192, 'WorkBuddy 实测上限 10000 字符，取 8KB 留余量');
     assert.equal(a.nativeDisable, 'none');
-    assert.ok(a.notes.some((n) => n.includes('连接器')), 'notes 指引连接器 UI 手动安装');
+    assert.ok(a.notes.some((n) => n.includes('MemoryCollector')), 'notes 必须写明证据来源是应用代码');
+    assert.ok(a.notes.some((n) => n.includes('localMemoryEnabled')), 'notes 必须提示注入受开关控制');
   });
-
   it('六宿主种类表完整；未知宿主拒绝且不猜路径', () => {
     assert.deepEqual([...AGENT_KINDS].sort(), ['claude-code', 'copilot', 'cursor', 'dsh', 'openclaw', 'workbuddy']);
     assert.ok(isAgentKind('claude-code'));
@@ -119,6 +122,10 @@ describe('HOST_ADAPTERS：与 M0 矩阵一致的宿主元数据', () => {
     for (const kind of AGENT_KINDS) {
       const a = HOST_ADAPTERS[kind];
       assert.ok(['json', 'cordis-patch', 'none'].includes(a.mcpConfigKind), `${kind} 的形态必须已声明`);
+      assert.ok(['brief', 'index', 'none'].includes(a.projectionMode), `${kind} 的投影模式必须已声明`);
+      assert.equal(typeof a.projectionBudgetBytes, 'number', `${kind} 的投影预算必须已声明`);
+      if (a.projectionMode === 'none') assert.equal(a.projectionBudgetBytes, 0, `${kind} 不支持投影时预算应为 0`);
+      else assert.ok(a.projectionBudgetBytes > 0, `${kind} 支持投影时预算必须为正`);
       if (a.mcpConfigPath(path.resolve('/synthetic/home'), PROJ) === null) {
         assert.equal(a.mcpConfigKind, 'none', `${kind} 无路径时必须标 none`);
       } else {

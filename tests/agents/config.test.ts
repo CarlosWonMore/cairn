@@ -462,11 +462,14 @@ describe('doctorAgentConfig：只读、如实分级', () => {
     assert.equal(after.blockPath, path.join(project, 'CLAUDE.md'));
   });
 
-  it('workbuddy/openclaw：MCP blocked；doctor 如实给出 null 路径与 blocked 分级', async () => {
+  it('workbuddy/openclaw：MCP blocked；doctor 如实给出路径与分级', async () => {
     const home = path.join(root, 'd2', 'home');
     const wb = await doctorAgentConfig(store, { agentKind: 'workbuddy', homeRoot: home, projectRoot: null });
-    assert.equal(wb.configPath, null);
-    assert.equal(wb.blockPath, null);
+    assert.equal(wb.configPath, null, 'MCP 路径仍未公开');
+    // 2026-11-01 改动：WorkBuddy 记忆落点已由应用代码证实，不再是 blocked。
+    assert.equal(wb.blockPath, path.join(home, '.workbuddy', 'memory', 'MEMORY.md'));
+    // capability 是「整体最差项」：WorkBuddy 的 MCP 仍 blocked，故整体仍 blocked。
+    // 块本身可写这件事由 blockPath/watch blockPresent 表达，不由 capability 表达。
     assert.equal(wb.capability, 'blocked');
     assert.equal(wb.configExists, false);
 
@@ -591,27 +594,26 @@ describe('五宿主全循环：plan → apply → doctor → uninstall', () => {
     assert.equal(u.removed.length, 1);
   });
 
-  it('5/5 workbuddy：双 blocked → 零文件写入，只有可复制手动步骤；uninstall 无记录', async () => {
+  it('5/5 workbuddy：MCP blocked 但块可写；plan→apply→doctor→uninstall 全循环', async () => {
     const home = path.join(root, 'loop-wb', 'home');
-    const homeBefore = await snapshot(store, [path.join(home, 'x')], home);
+    const memPath = path.join(home, '.workbuddy', 'memory', 'MEMORY.md');
 
     const plan = await planAgentConfig(store, { agentKind: 'workbuddy', homeRoot: home, projectRoot: null, mode: 'router', mcpCommand: MCP_CMD });
-    assert.deepEqual(plan.actions.filter((a) => a.type !== 'manual_step'), [], 'workbuddy 不允许任何写动作');
-    assert.equal(plan.actions.length, 1, 'router 文案降级为手动步骤');
-    assert.ok(plan.actions[0]!.after!.includes(ROUTER_BLOCK_CONTENT), '手动步骤携带可复制路由文案');
-    assert.equal(plan.capability, 'blocked');
+    const writes = plan.actions.filter((a) => a.type !== 'manual_step');
+    assert.equal(writes.length, 1, '只应有块写入（MCP 仍 blocked）');
+    assert.equal(writes[0]!.path, memPath);
+    assert.equal(plan.capability, 'blocked', 'MCP 仍 blocked 时整体能力按最差项计');
 
-    const r = await applyOk(store, plan);
-    assert.equal(r.applied.length, 0, '没有任何文件被写入');
-    assert.equal(r.skipped.length, 1);
-    const homeAfter = await snapshot(store, [path.join(home, 'x')], home);
-    assertSameSnapshot(homeBefore, homeAfter, 'workbuddy 不得在宿主 home 留下任何文件');
+    await applyOk(store, plan);
+    const written = await readFile(memPath, 'utf8');
+    assert.ok(written.includes('cairn:begin block='), '必须写入受管区块');
 
-    const u = await uninstallAgentConfig(store, { agentKind: 'workbuddy', homeRoot: home, projectRoot: null });
-    assert.deepEqual(u.removed, [], '无安装记录即无卸载动作');
     const doc = await doctorAgentConfig(store, { agentKind: 'workbuddy', homeRoot: home, projectRoot: null });
     assert.equal(doc.capability, 'blocked');
-    assert.equal(doc.configExists, false);
-    assert.equal(doc.blockPresent, false);
+    assert.equal(doc.blockPresent, true, '块可写且已写入——与 MCP 的 blocked 是两个维度');
+
+    await uninstallAgentConfig(store, { agentKind: 'workbuddy', homeRoot: home, projectRoot: null });
+    const after = await readFile(memPath, 'utf8').catch(() => '');
+    assert.ok(!after.includes('cairn:begin block='), '卸载后受管区块应被移除');
   });
 });

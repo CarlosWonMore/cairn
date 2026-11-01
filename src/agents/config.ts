@@ -5,6 +5,7 @@ import type { CairnStore } from '../store/open.js';
 import { err } from '../core/errors.js';
 import { sha256Canonical, sha256Hex } from '../core/hash.js';
 import { AGENT_KINDS, HOST_ADAPTERS, isAgentKind } from './adapters.js';
+import { buildProjection } from '../projection/brief.js';
 import { CAIRN_DSH_ENTRY_ID, hasCairnInsert, removeCairnInsert, upsertCairnInsert } from './cordisPatch.js';
 import type { AgentKind, CapabilityLevel, HostAdapter } from './adapters.js';
 import {
@@ -26,6 +27,37 @@ import { generateProjection } from '../projection/markdown.js';
  * - 受管区块走 projection 模块（幂等、原子写、首次备份）。
  * - uninstall 只处理本产品安装记录覆盖的路径，能恢复原字节就恢复原字节。
  */
+
+/**
+ * 组装受管区块内容：路由文案 + （可选）记忆简报。
+ *
+ * projectionMode='none' 或 observe 模式 → 只返回路由文案。
+ * 简报的敏感排除在 buildProjection 内部（取数阶段）完成，这里不重复过滤。
+ */
+function composeProjectionContent(
+  store: CairnStore,
+  adapter: HostAdapter,
+  mode: ConfigMode,
+): string {
+  if (mode === 'observe' || adapter.projectionMode === 'none') {
+    return ROUTER_BLOCK_CONTENT;
+  }
+  const scopeId = store.scopes.resolvePreset('personal-global').id;
+  // 预算约束的是**整个受管区块**（含 begin/end 标记），不是只有简报部分。
+  // 三项开销都要先扣掉，否则总字节会超：路由文案 + 简报标题 + 受管标记。
+  // 标记约占 60 字节（两行注释 + revision），留固定余量。
+  const MARKER_RESERVE = 96;
+  const header = [ROUTER_BLOCK_CONTENT, '', '## 已记住的事实（Cairn 投影）', ''].join('\n');
+  const headerBytes = Buffer.byteLength(header, 'utf8');
+  const briefBudget = Math.max(0, adapter.projectionBudgetBytes - headerBytes - MARKER_RESERVE);
+  const brief = buildProjection(store, {
+    scopeIds: [scopeId],
+    mode: adapter.projectionMode === 'index' ? 'index' : 'brief',
+    budgetBytes: briefBudget,
+  });
+  if (brief.selected === 0) return ROUTER_BLOCK_CONTENT;
+  return header + brief.text;
+}
 
 export type ConfigMode = 'observe' | 'router' | 'mcp-primary';
 
@@ -257,7 +289,10 @@ export async function planAgentConfig(
     const seedRevision = seedRow
       ? Number.parseInt(/revision="(\d+)"/.exec(seedRow.startMarker)?.[1] ?? '0', 10)
       : 0;
-    const upserted = upsertBlockInText(before ?? '', DEFAULT_BLOCK_ID, ROUTER_BLOCK_CONTENT, {
+    // 投影内容：按宿主能力生成「路由文案 + 记忆简报」。
+    // projectionMode='none' 时退回纯路由文案（该宿主没有可用的正文落点）。
+    const blockContent = composeProjectionContent(store, adapter, mode);
+    const upserted = upsertBlockInText(before ?? '', DEFAULT_BLOCK_ID, blockContent, {
       revisionSeed: seedRevision,
     });
     actions.push({

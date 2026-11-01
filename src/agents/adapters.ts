@@ -31,6 +31,16 @@ export type McpConfigKind = 'json' | 'cordis-patch' | 'none';
 
 export type CapabilityLevel = 'fixture-only' | 'blocked';
 
+/**
+ * 宿主能吃什么样的投影内容。
+ *
+ * - 'brief'：可承载记忆摘要正文（DSH / Claude Code / Cursor / Copilot / WorkBuddy）
+ * - 'index'：约定是索引文件，只放指针，**不得放正文**（ZCode 内置文档明写
+ *   "never put memory content there"）
+ * - 'none'：无公开落点，不投影
+ */
+export type ProjectionMode = 'brief' | 'index' | 'none';
+
 /** MCP 配置里服务器映射的顶层键名（copilot 的 VS Code 路径为 "servers"，矩阵明确与 CLI 不同）。 */
 export type McpServerMapKey = 'mcpServers' | 'servers';
 
@@ -45,6 +55,10 @@ export interface HostAdapter {
   /** 受管区块目标文件；null = 无公开块文件，只提供可复制文案。 */
   blockTargetPath(homeRoot: string, projectRoot: string | null): string | null;
   blockCapability: CapabilityLevel;
+  /** 投影形态：决定写摘要正文、只写索引行，还是完全不写。 */
+  projectionMode: ProjectionMode;
+  /** 投影字节预算；'none' 时为 0。超预算按确定性规则裁剪并明示。 */
+  projectionBudgetBytes: number;
   /** mcp-primary 的原生记忆关闭方式：documented-manual = 有文档化手动步骤；none = 无公开关闭接口。 */
   nativeDisable: 'documented-manual' | 'none';
   /**
@@ -118,6 +132,8 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       // 矩阵 rules_memory：CLAUDE.md（项目）与 .claude/CLAUDE.md（用户）均为公开文件。
       projectRoot ? join(projectRoot, 'CLAUDE.md') : join(homeRoot, '.claude', 'CLAUDE.md'),
     blockCapability: 'fixture-only',
+    projectionMode: 'brief',
+    projectionBudgetBytes: 2048,
     nativeDisable: 'documented-manual',
     mcpServerMapKey: () => 'mcpServers',
     notes: [
@@ -141,6 +157,8 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return projectRoot ? join(projectRoot, 'AGENTS.md') : null;
     },
     blockCapability: 'fixture-only',
+    projectionMode: 'brief',
+    projectionBudgetBytes: 2048,
     nativeDisable: 'none',
     mcpServerMapKey: () => 'mcpServers',
     notes: [
@@ -163,6 +181,8 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return projectRoot ? join(projectRoot, '.github', 'copilot-instructions.md') : null;
     },
     blockCapability: 'fixture-only',
+    projectionMode: 'brief',
+    projectionBudgetBytes: 2048,
     nativeDisable: 'documented-manual',
     mcpServerMapKey: (_homeRoot, projectRoot) => (projectRoot ? 'servers' : 'mcpServers'),
     notes: [
@@ -170,6 +190,7 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       'M0 曾对 CLI 用户级路径做过 real-cli-tested（Copilot CLI 1.0.86、synthetic HOME）；本实现未复跑真实 CLI，能力按 fixture-only 如实标注。',
       'Copilot Memory 为服务端账号级能力（public preview），个人仅可查看/删除，无公开写入或批量导出 API，本原型不访问云端。',
       'mcp-primary 模式：原生 Memory 只能由用户在 GitHub 设置中手动关闭。',
+      '注意：GitHub Copilot 自带服务端 Copilot Memory（Repository-level facts + User-level preferences）。本产品写入 .github/copilot-instructions.md 的投影与它并存，两者可能给出不同说法，doctor 会提示这一点。',
     ],
   },
   openclaw: {
@@ -186,6 +207,8 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       // 矩阵：~/.openclaw/workspace/AGENTS.md 为官方默认工作区模板，公开路径；openclaw 无项目作用域。
       join(homeRoot, '.openclaw', 'workspace', 'AGENTS.md'),
     blockCapability: 'fixture-only',
+    projectionMode: 'none',
+    projectionBudgetBytes: 0,
     nativeDisable: 'none',
     mcpServerMapKey: () => 'mcpServers',
     notes: [
@@ -204,16 +227,22 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
     },
     mcpConfigCapability: 'blocked',
     mcpConfigKind: 'none',
-    blockTargetPath: () => {
-      // 矩阵：官方记忆页只有设置界面与"复制提示词—粘贴结果"导入，未公开工作区记忆/规则文件（blocked）。
-      return null;
+    blockTargetPath: (homeRoot, projectRoot) => {
+      // 2026-11-01 核对应用代码：MemoryCollector.getWorkingMemoryContent() 读取
+      // <cwd>/.workbuddy/memory/MEMORY.md，包成 <working_memory_content> 注入，上限 10000 字符（Hs=1e4）。
+      // 这是项目级落点；用户级 ~/.workbuddy/MEMORY.md 另有 4000 字符上限（本次不处理）。
+      const root = projectRoot ?? homeRoot;
+      return join(root, '.workbuddy', 'memory', 'MEMORY.md');
     },
-    blockCapability: 'blocked',
+    blockCapability: 'fixture-only',
+    projectionMode: 'brief',
+    projectionBudgetBytes: 8192,
     nativeDisable: 'none',
     mcpServerMapKey: () => 'mcpServers',
     notes: [
       'MCP 配置文件路径未公开：拒绝写入 ~/.workbuddy/mcp.json 等未记录路径，只能由用户在连接器 UI 中信任并启用。',
-      '无公开工作区规则/记忆文件：不写任何块文件，只提供可复制的路由文案，由用户手动粘贴。',
+      '记忆落点：<cwd>/.workbuddy/memory/MEMORY.md（项目级，注入标签 <working_memory_content>，上限 10000 字符）。证据来自应用代码 MemoryCollector，非官方文档；真实注入生效未独立验证，故为 fixture-only。',
+      '注入受 localMemoryEnabled / generateMemoryEnabled 开关控制，被用户关闭时文件写了也不会进上下文——doctor 无法代查该开关状态。',
       '原生记忆为账号级服务端能力，无公开文件或写入 API：不能宣称已接管或关闭原生记忆，只能由用户在设置中手动关闭。',
       '本原型不爬取云端与缓存；记忆导入仅走官方粘贴通道。',
     ],
@@ -235,6 +264,8 @@ export const HOST_ADAPTERS: Record<AgentKind, HostAdapter> = {
       return join(dshHome, 'AGENTS.md');
     },
     blockCapability: 'fixture-only',
+    projectionMode: 'brief',
+    projectionBudgetBytes: 2048,
     nativeDisable: 'none',
     mcpServerMapKey: () => 'mcpServers',
     notes: [
