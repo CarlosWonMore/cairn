@@ -319,3 +319,26 @@ cairn 检索分词只按标点切 CJK 段（≥3 字整段进 FTS 短语＝要�
 - 面板只统计**自动召回**（每轮对话前注入）；agent 显式调 Cairn 工具的记录在「轨迹」，不计入面板——设计如此。
 - 验证自动召回：正常聊天（如「投影预算是多少」），无需让 agent 去拉记忆；tab 应显示 召回条数>0 → 已注入/已过滤。
 - 插件单测 40/40；tsc 净；dist 已重建。待重启复验。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-9：全操作留痕 + 可配置展示）
+
+### 用户反馈
+聊天了还是没有（tab 未命中）；并提出需求：**所有经 cairn 记忆的操作都留痕，且可配置留哪些、展示到什么程度、筛选、条数/时长等（类轨迹的选项）**。
+
+### debug 端点实锤（新端口 52227）
+- `lastEventCount: 155, lastEventType: '(no type)'` → session/event **有送达**，但旧 handler 只收了一个参数——**asar 实锤真实签名是 `(session, event)` 双参数**，旧实现把 session 对象当事件用，永远抓不到 type。已修（兜底捕获恢复）。
+- pre-step 触发但 messageLen 0：最后一步是空载荷步（子代理/压缩步）；带正文步的召回跑了但 0 命中——用户聊天内容可能与库无交集，多路查询已上线，待真实对话复验。
+- 新增 diag：`lastRecall {queries, candidates, ms}`、`toolHookRegistered`、`toolEvents`。
+
+### 新功能：活动记录（本轮主体）
+- **留痕范围**：① 每轮对话的自动召回（查询路数/候选/注入，reason 非 ok 时标注）；② **所有经 `mcp__cairn__*` 的工具调用**（asar 实锤 `tools/post-execute` 签名 `(exec, result, next)`，`exec.name` 取工具名）——agent 手动拉取从此也进面板。自己的召回调用用 3s 时间窗压住防重复记。
+- **记录纪律**：只存摘要（工具名/计数/状态），参数与返回内容一律不留（秘密纪律 D3 同源）。
+- **可配置**：`PluginConfig.record.{recall,tools}`（记录层开关，默认全开）；展示层在 tab 里配——类型筛选（自动召回/工具调用）、明细程度（简要/详细）、条数（15/30/120），localStorage 持久化（key `cairn-memory-tab-filters`）。
+- **上限**：内存环 120 条，随 DSH 重启清空；跨重启的持久化留痕属审计层扩展（`audit_event` 表现只记治理操作，不含检索），列为下一变更候选。
+- serveUsage：payload 恒带 `recent`（最近 15），`?history=1` 带全部。
+
+### 测试与验证
+- 插件单测 42/42（+2：双参签名、留痕正反例）；发现并修正一处假通过（跨 apply 实例读空日志），改为同实例 spy 读 payload。
+- tsc 净；dist 已重建。待重启复验。

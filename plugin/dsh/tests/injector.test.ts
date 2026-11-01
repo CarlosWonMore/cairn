@@ -11,10 +11,12 @@ import { describe, it } from 'node:test';
 
 import defaultExport, { apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
 
-/** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中。 */
+/** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中；
+ *  同时捕获 webServer 注册（同一 apply 实例内读活动记录，避免跨实例假通过）。 */
 function makeSpyCtx() {
   const queries: string[] = [];
   const injected: unknown[] = [];
+  let captured: { handler?: (req: unknown, res: unknown) => void } | null = null;
   const ctx = {
     tools: {
       call: async (_name: string, args: { query: string }) => {
@@ -26,9 +28,15 @@ function makeSpyCtx() {
         };
       },
     },
+    webServer: { register: (o: unknown) => { captured = o as typeof captured; } },
     on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
   };
-  return { ctx, queries, injected };
+  function readUsage(url = '/plugins/cairn-dsh-memory/usage?history=1'): Record<string, unknown> {
+    let body = '';
+    captured!.handler!({ method: 'GET', url }, { writeHead: () => {}, end: (b: string) => { body = b; } });
+    return JSON.parse(body) as Record<string, unknown>;
+  }
+  return { ctx, queries, injected, readUsage };
 }
 
 describe('插件形状（踩过三次的坑）', () => {
@@ -53,7 +61,7 @@ describe('插件形状（踩过三次的坑）', () => {
       on: (e: string) => events.push(e),
     };
     assert.doesNotThrow(() => apply(ctx, { enabled: true }), 'config 从第二参数取，读 ctx.config 会抛');
-    assert.deepEqual(events, ['session/event', 'agent/pre-step']);
+    assert.deepEqual(events, ['session/event', 'tools/post-execute', 'agent/pre-step']);
   });
 
   it('拿不到 tools 服务时钩子照常注册、召回降级为空（2026-11-02 契约变更）', async () => {
@@ -64,7 +72,7 @@ describe('插件形状（踩过三次的坑）', () => {
     apply({
       on: (e: string, fn: unknown) => { events.push(e); if (e === 'agent/pre-step') preStep = fn as typeof preStep; },
     }, {});
-    assert.deepEqual(events, ['session/event', 'agent/pre-step'], '钩子必须注册');
+    assert.deepEqual(events, ['session/event', 'tools/post-execute', 'agent/pre-step'], '钩子必须注册');
     if (preStep) {
       const injected: unknown[] = [];
       await preStep({ agent: { inject: (m: unknown) => injected.push(m) } }, () => {});
@@ -148,17 +156,49 @@ describe('插件形状（踩过三次的坑）', () => {
     assert.equal(injected.length, 1, '命中后必须注入');
   });
 
-  it('session/event 真实形状（evt.data + source.kind=user）作兜底能喂召回', async () => {
+  it('session/event 真实签名 (session, event)：双参数，事件在第二参', async () => {
     const { ctx, queries, injected } = makeSpyCtx();
     apply(ctx, {});
-    const onEvent = (ctx as Record<string, unknown>)['session/event'] as (e: unknown) => void;
+    const onEvent = (ctx as Record<string, unknown>)['session/event'] as (s: unknown, e: unknown) => void;
     const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
       (p: unknown, n?: () => unknown) => Promise<unknown>;
-    // 旧实现读 evt.message——真实形状是 evt.data，这就是「面板永远未命中」的根因
-    onEvent({ type: 'user/message', data: { content: [{ type: 'text', text: '库入口在哪' }], source: { kind: 'user' } } });
+    // asar 实锤：ctx.on("session/event", (session, event) => …)——事件是第二参。
+    // Round-8 前旧实现只收一个参数，把 session 对象当事件，永远抓不到 type。
+    onEvent({ id: 'session-1' }, { type: 'user/message', data: { content: [{ type: 'text', text: '库入口在哪' }], source: { kind: 'user' } } });
     await preStep({ agent: { inject: (m: unknown) => injected.push(m) } }, () => {});
     assert.ok(queries.includes('库入口在哪'), 'session/event 兜底必须把用户原文带进召回');
     assert.equal(injected.length, 1);
+  });
+
+  it('tools/post-execute 留痕：cairn 工具记名、非 cairn 忽略、next 透传', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const onPost = (ctx as Record<string, unknown>)['tools/post-execute'] as
+      (exec: unknown, result: unknown, n?: (r?: unknown) => unknown) => Promise<unknown>;
+    assert.ok(onPost, 'tools/post-execute 钩子必须注册');
+    const result = { ok: 1 };
+    const passed = await onPost({ name: 'mcp__cairn__memory_search' }, result, (r?: unknown) => 'next-' + String(r));
+    assert.equal(passed, 'next-[object Object]', '必须调用 next 并透传 result');
+    await onPost({ name: 'other__tool__x' }, result, () => 'y');
+
+    const parsed = readUsage() as { recent?: { kind: string; summary: string }[] };
+    assert.ok(Array.isArray(parsed.recent), 'payload 必须带 recent 活动记录');
+    const toolEntries = parsed.recent!.filter((e) => e.kind === 'tool');
+    assert.equal(toolEntries.length, 1, '只留痕 cairn 工具');
+    assert.match(toolEntries[0].summary, /cairn\.memory_search/);
+  });
+
+  it('record.tools=false 时工具调用不留痕（record.recall 同理）', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, { record: { tools: false, recall: false } });
+    const onPost = (ctx as Record<string, unknown>)['tools/post-execute'] as
+      (exec: unknown, result: unknown, n?: (r?: unknown) => unknown) => Promise<unknown>;
+    await onPost({ name: 'mcp__cairn__memory_add' }, {}, () => {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+      (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: '投影预算是多少' }] }, () => {});
+    const parsed = readUsage() as { recent?: unknown[] };
+    assert.equal((parsed.recent ?? []).length, 0, 'record 关闭后不得留痕');
   });
 
   it('非用户来源（agent-instructions 等）不驱动召回', async () => {

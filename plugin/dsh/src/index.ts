@@ -25,6 +25,11 @@ export interface PluginConfig {
   enabled?: boolean;
   budgetBytes?: number;
   topK?: number;
+  /**
+   * 留痕配置（活动记录写哪些动作）。
+   * 审计完整性原则：记录默认全开；展示层的筛选/程度/时长由面板自己配。
+   */
+  record?: { /** 每轮对话前的自动召回。 */ recall?: boolean; /** 所有经 cairn MCP 工具的调用（含 agent 手动拉取）。 */ tools?: boolean };
 }
 
 export interface RecallFn {
@@ -140,13 +145,15 @@ export function deriveQueries(message: string, max = 6): string[] {
 }
 
 /** 从 ctx.tools 取 Cairn 检索能力的适配器；拿不到就返回 null（降级）。 */
-function makeToolRecall(ctx: unknown): RecallFn | null {
+function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
   const tools = (ctx as { tools?: { call?: Function } } | undefined)?.tools;
   if (!tools || typeof tools.call !== 'function') return null;
   return async (message: string, topK: number) => {
     const seen = new Set<string>();
     const merged: RecallHit[] = [];
     for (const query of deriveQueries(message)) {
+      // 自己发起的 memory_search 调用要压住工具留痕，避免每步重复记两条
+      onOwnCall?.();
       const res = await tools.call!('mcp__cairn__memory_search', { query, limit: topK });
       // MCP 返回形如 { content: [{ type, text }] }，正文是 JSON 字符串。
       const text = Array.isArray((res as { content?: unknown[] })?.content)
@@ -248,8 +255,10 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   // 第四轮面板排查：tools 服务（MCP stdio）是异步就绪的——apply 时可能尚未可用。
   // 绝不能在这里提前 return，否则 usage 路由与 pre-step 钩子全部丢失
   //（面板不可见 + 召回失效的直接根因）。recall 缺失时降级为空召回。
+  // 自己发起的 memory_search 会在 tools/post-execute 里也出现——用时间窗压住防重复留痕。
+  let suppressToolLogUntil = 0;
   const nullRecall: RecallFn = async () => [];
-  const recall = makeToolRecall(ctx) ?? nullRecall;
+  const recall = makeToolRecall(ctx, () => { suppressToolLogUntil = Date.now() + 3000; }) ?? nullRecall;
 
   const injector = createInjector({ recall, config });
 
@@ -261,6 +270,19 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     lastEventCount: 0,
     lastCapture: { captured: false, textLen: 0, sourceKind: '' },
     lastPreStep: { fired: false, messageLen: 0, reason: '', selected: 0, injected: false },
+    lastRecall: { queries: 0, candidates: 0, ms: 0 },
+    toolHookRegistered: false,
+    toolEvents: 0,
+  };
+
+  // 活动记录（用户要求：所有经 cairn 的操作留痕）。只存摘要，正文/参数永不入条目。
+  // 持久化留痕是审计层的事（audit_event 表记治理操作）；这里是会话内的操作流。
+  type ActivityEntry = { t: string; kind: 'recall' | 'tool'; summary: string };
+  const activity: ActivityEntry[] = [];
+  const recordCfg = { recall: config.record?.recall !== false, tools: config.record?.tools !== false };
+  const pushActivity = (kind: ActivityEntry['kind'], summary: string): void => {
+    activity.push({ t: new Date().toISOString(), kind, summary });
+    if (activity.length > 120) activity.splice(0, activity.length - 120);
   };
 
   // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
@@ -275,12 +297,19 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     }
     const usage = injector.lastUsage();
     const payload: Record<string, unknown> = { ...(usage ?? EMPTY_USAGE) };
-    // ?debug=1：附加摘要级诊断（不含正文），供端到端排查 hook 链路。
+    // 活动记录随 payload 走：默认带最近 15 条，?history=1 带全部（上限 120）。
     try {
       const u = new URL(req.url ?? '/', 'http://local');
-      if (u.searchParams.get('debug') === '1') payload.debug = diag;
+      if (u.searchParams.get('history') === '1') {
+        payload.recent = activity;
+        if (u.searchParams.get('debug') === '1') payload.debug = diag;
+      } else {
+        payload.recent = activity.slice(-15);
+        if (u.searchParams.get('debug') === '1') payload.debug = diag;
+      }
     } catch {
-      /* url 解析失败就当没有 debug 参数 */
+      payload.recent = activity.slice(-15);
+      /* url 解析失败就当没有参数 */
     }
     res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     // 兜底必须字段完备（EMPTY_USAGE）：client 详情段会读 injected 等字段，
@@ -321,7 +350,8 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
 
   // pre-step 的 payload 自带 messages（2026-11-02 asar 实锤：waterfall 载荷
   // `{ messages, ...position, signal }`），直接从里面取用户原文；
-  // session/event 只作兜底（真实形状是 evt.data，不是 evt.message）。
+  // session/event 只作兜底（真实监听签名是 (session, event) 两个参数——
+  // 本轮排查发现旧实现只收了一个参数，把 session 对象当事件用了）。
   let lastUserMessage = '';
 
   const hooks = ctx as { on?: (event: string, fn: unknown) => void } | undefined;
@@ -330,7 +360,10 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   try {
     hooks.on(
       'session/event',
-      (evt: { type?: string; data?: { content?: unknown; source?: { kind?: string } }; message?: { content?: { text?: string }[] } }) => {
+      (
+        _session: unknown,
+        evt: { type?: string; data?: { content?: unknown; source?: { kind?: string } }; message?: { content?: { text?: string }[] } },
+      ) => {
         try {
           diag.lastEventCount += 1;
           diag.lastEventType = evt?.type ?? '(no type)';
@@ -352,6 +385,30 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   }
 
   try {
+    // asar 实锤签名：`on("tools/post-execute", async (exec, result, next) => …)`。
+    // 只记工具名与结果状态，参数与返回内容一律不留（秘密纪律）。
+    hooks.on(
+      'tools/post-execute',
+      async (exec: { name?: string; tool?: string }, result: unknown, next?: (r?: unknown) => unknown) => {
+        try {
+          diag.toolEvents += 1;
+          const toolName = typeof exec?.name === 'string' ? exec.name : typeof exec?.tool === 'string' ? exec.tool : '';
+          if (recordCfg.tools && toolName.startsWith('mcp__cairn__') && Date.now() >= suppressToolLogUntil) {
+            const failed = result && typeof result === 'object' && 'error' in (result as Record<string, unknown>);
+            pushActivity('tool', `${toolName.replace('mcp__cairn__', 'cairn.')}${failed ? ' → 错误' : ''}`);
+          }
+        } catch {
+          /* 留痕失败不影响工具执行 */
+        }
+        return typeof next === 'function' ? next(result) : undefined;
+      },
+    );
+    diag.toolHookRegistered = true;
+  } catch {
+    /* 注册失败降级 */
+  }
+
+  try {
     hooks.on(
       'agent/pre-step',
       async (
@@ -362,10 +419,23 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
         try {
           const stepText = extractStepText(payload) || lastUserMessage;
           diag.lastPreStep.messageLen = stepText.length;
+          diag.lastRecall.queries = stepText ? deriveQueries(stepText).length : 0;
+          const startedAt = Date.now();
           const out = await injector.runOnce(stepText);
+          diag.lastRecall.ms = Date.now() - startedAt;
+          diag.lastRecall.candidates = injector.lastUsage()?.candidates ?? 0;
           diag.lastPreStep.reason = out.reason;
           diag.lastPreStep.selected = out.selected;
           diag.lastPreStep.injected = out.injected;
+          if (recordCfg.recall && stepText) {
+            const usage = injector.lastUsage();
+            pushActivity(
+              'recall',
+              usage
+                ? `自动召回 候选${usage.candidates} 注入${out.selected}${out.reason !== 'ok' ? ` (${out.reason})` : ''}`
+                : `自动召回 跳过 (${out.reason})`,
+            );
+          }
           if (out.injected) {
             const agent = payload?.agent;
             if (typeof agent?.inject === 'function') {
