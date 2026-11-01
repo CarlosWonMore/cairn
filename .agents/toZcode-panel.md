@@ -362,3 +362,24 @@ cairn 检索分词只按标点切 CJK 段（≥3 字整段进 FTS 短语＝要�
 
 ### 状态
 - dist 已重建，待用户重启 DSH 后在「记忆」tab 试切换内存/落盘。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-11：内存/落盘看不到 = Rules of Hooks 违规）
+
+### 现象（用户重启后）
+记忆 tab 存在且可选中，但内容区全空——活动记录区与「记录存储：内存|落盘」chip 都不见。
+
+### 取证路径（浏览器自动化，本次启动 rev=77fd79f2098e）
+1. usage 端点带 `persist` 字段 → host 是新代码，且活动记录有真实条目（自动召回 + cairn.memory_get 工具调用）——后端一切正常。
+2. 页面内 fetch 完整 combo（4.18MB）并 grep 标记：`记录存储`/`persist 路由`/`活动记录`/`id: 'cairn-memory'` 全部在 → **served bundle 就是最新代码**。
+3. 进会话抓 DOM：tablist 里 `tab "记忆" [active] [selected]` **注册成功**，但 `[data-cairn-usage]` 数量 0 → 组件渲染即崩，宿主 crash boundary 静默卸载。
+
+### 根因
+Round-10 把 `React.useEffect`（persist 校准）写在了 `if (!data) return` **之后**：首渲染 data=null 提前返回少执行一个 hook，3s 后数据到达重渲染时 hook 数变多，React 抛 "Rendered more hooks than during the previous render"，组件被 crash boundary 整个卸载。Round-9 无此 bug（该 effect 是 Round-10 新增的）。
+
+### 修复
+`src/client.js`：useEffect 前移到所有 early return 之前（带 null 守卫 + `state.data` 依赖），附 comment 说明 hook 顺序纪律；顺带删掉死变量 `persistOn`。
+
+### 状态
+dist 无需重建（client.js 由宿主直接读取）；待用户再重启一次 DSH（rev 重算后生效）目视确认面板完整渲染。

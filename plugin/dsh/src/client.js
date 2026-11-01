@@ -97,6 +97,14 @@ window.__ModuleLoader__.load({
       const data = state.data;
       const [filters, setFilters] = React.useState(loadFilters);
       const [persist, setPersistState] = React.useState(null); // null=尚未从 host 取到
+      // host 是持久化状态的权威：轮询数据到达时校准本地 optimistic 状态。
+      // ⚠️ 所有 hook 必须全部位于下方 `if (!data) return` 之前——Round-10 曾把
+      // 本 effect 放在 return 之后：首渲染（data=null）提前返回少执行一个 hook，
+      // 数据到达后 hook 数变多，React 抛 "Rendered more hooks"，宿主 slot
+      // crash boundary 把整个面板卸成空白（tab 在、内容全无）。
+      React.useEffect(function () {
+        if (state.data && typeof state.data.persist === 'boolean') setPersistState(state.data.persist);
+      }, [state.data]);
       function update(patch) {
         var next = Object.assign({}, filters, patch);
         setFilters(next);
@@ -130,9 +138,8 @@ window.__ModuleLoader__.load({
         .slice(-filters.limit)
         .reverse();
 
-      // host 是持久化状态的权威：轮询数据到达时校准本地 optimistic 状态
+      // host 是持久化状态的权威（校准 effect 已前移到 early return 之前）
       var persistOn = data.persist;
-      React.useEffect(function () { setPersistState(data.persist); }, [data.persist]);
 
       var color = COLOR[data.status] || COLOR.miss;
       var rows = [
