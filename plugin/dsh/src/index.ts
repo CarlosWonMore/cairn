@@ -127,84 +127,69 @@ export function makeInjectionMessage(text: string): { role: 'user'; content: { t
   };
 }
 
-export interface CairnPluginOptions {
-  recall?: RecallFn;
-  config?: PluginConfig;
-}
+/** 插件名（必须与 package.json name 和 patch 行一致）。 */
+export const name = 'cairn-dsh-memory';
+
+/** 依赖的宿主服务：调 MCP 工具需要 tools。 */
+export const inject = ['tools'] as string[];
 
 /**
- * 构造插件。只暴露 name / inject / apply —— 多一个可枚举属性就会被 Cordis 当服务名解析。
+ * 插件入口。
+ *
+ * **必须是模块级导出的普通函数，不能是工厂函数**（踩过三次的坑）——
+ * Cordis 的加载器见 `typeof plugin === 'function'` 就把它当 apply 调用：
+ *   `apply: (ctx) => plugin(guarded(ctx))`
+ * 于是传入的 ctx 变成第一个参数（若签名是 createXxx(options)，options 就是 ctx 的
+ * Proxy，读 options.config / options.recall 立刻抛 cannot get property without inject）。
+ * 正确形状是 `export default { name, inject, apply }`，apply 签名 (ctx, config)。
  */
-export function createCairnMemoryPlugin(options: CairnPluginOptions = {}) {
-  // 预置配置（单测用）。真实运行时由 Cordis 作为 apply 的第二参数传入。
-  const presetConfig = options.config ?? {};
-  // 闭包持有：既不外泄成属性，也允许单测预置 recall。
-  const presetRecall = options.recall ?? null;
-  let injector: ReturnType<typeof createInjector> | null = presetRecall
-    ? createInjector({ recall: presetRecall, config: presetConfig })
-    : null;
+export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
+  const config = runtimeConfig ?? {};
+  const recall = makeToolRecall(ctx);
+  if (!recall) return; // 没有 tools 服务 → 静默降级，不注册钩子。
+
+  const injector = createInjector({ recall, config });
   // pre-step 的 payload 不含用户原文（只有 { agent, signal }），
-  // 所以从 session/event 的 user/message 攒最近一条，供 pre-step 使用。
+  // 所以从 session/event 的 user/message 攒最近一条。
   let lastUserMessage = '';
 
-  return {
-    name: 'cairn-dsh-memory',
-    inject: ['tools'] as string[],
-    /**
-     * @param ctx Cordis 上下文
-     * @param runtimeConfig Cordis 注入的配置对象。**必须从参数取，不能读 ctx.config**——
-     *   ctx 的属性一律走 Proxy，未在 inject 声明的（包括 config）会抛
-     *   `cannot get property "config" without inject`，插件直接 failed。
-     */
-    apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
-      const config: PluginConfig = { ...presetConfig, ...(runtimeConfig ?? {}) };
-      if (!injector) {
-        const recall = makeToolRecall(ctx);
-        if (!recall) return; // 没有 tools 服务 → 静默降级，不注册钩子。
-        injector = createInjector({ recall, config });
-      }
-      const hooks = ctx as { on?: (event: string, fn: unknown) => void } | undefined;
-      if (typeof hooks?.on !== 'function') return;
+  const hooks = ctx as { on?: (event: string, fn: unknown) => void } | undefined;
+  if (typeof hooks?.on !== 'function') return;
+
+  try {
+    hooks.on('session/event', (evt: { type?: string; message?: { content?: { text?: string }[] } }) => {
       try {
-        // 记录最近一条用户消息：pre-step 拿不到原文，只能从这里攒。
-        hooks.on('session/event', (evt: { type?: string; message?: { content?: { text?: string }[] } }) => {
-          try {
-            if (evt?.type !== 'user/message') return;
-            const parts = evt.message?.content ?? [];
-            const text = parts.map((c) => c?.text ?? '').join(' ').trim();
-            if (text.length > 0) lastUserMessage = text;
-          } catch {
-            // 结构不符就忽略，不影响会话。
+        if (evt?.type !== 'user/message') return;
+        const text = (evt.message?.content ?? []).map((c) => c?.text ?? '').join(' ').trim();
+        if (text.length > 0) lastUserMessage = text;
+      } catch {
+        /* 结构不符就忽略 */
+      }
+    });
+  } catch {
+    /* 注册失败降级 */
+  }
+
+  try {
+    hooks.on(
+      'agent/pre-step',
+      async (payload: { agent?: { inject?: (m: unknown) => void } }, next?: () => unknown) => {
+        try {
+          const out = await injector.runOnce(lastUserMessage);
+          if (out.injected && typeof payload?.agent?.inject === 'function') {
+            payload.agent.inject(makeInjectionMessage(out.text));
           }
-        });
-      } catch {
-        // 注册失败同样降级。
-      }
-      try {
-        hooks.on(
-          'agent/pre-step',
-          async (payload: { agent?: { inject?: (m: unknown) => void }; message?: string }, next?: () => unknown) => {
-            try {
-              const query = payload?.message ?? lastUserMessage;
-              const out = await injector!.runOnce(query);
-              // DSH 的公开注入入口是 agent.inject(message)：把面向模型的消息排进
-              // 下一个 step 边界。payload 里的 message 不一定是用户原文，
-              // 取不到就跳过本次注入，绝不猜。
-              if (out.injected && typeof payload?.agent?.inject === 'function') {
-                payload.agent.inject(makeInjectionMessage(out.text));
-              }
-            } catch {
-              // 任何异常都只跳过本次注入。
-            }
-            // 必须调用 next()，否则整条链路卡住。
-            return typeof next === 'function' ? next() : undefined;
-          },
-        );
-      } catch {
-        // 注册失败同样降级。
-      }
-    },
-  };
+        } catch {
+          /* 任何异常都只跳过本次注入 */
+        }
+        // 必须调用 next()，否则整条链路卡住。
+        return typeof next === 'function' ? next() : undefined;
+      },
+    );
+  } catch {
+    /* 注册失败降级 */
+  }
 }
 
-export default createCairnMemoryPlugin;
+/** Cordis 约定的默认导出：插件对象。 */
+export default { name, inject, apply };
