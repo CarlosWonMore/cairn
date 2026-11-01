@@ -763,3 +763,47 @@ WorkBuddy（`~/.workbuddy/mcp.json`）与 ZCode（`~/.zcode/cli/config.json`）�
 ### 一个必须说清的边界
 
 design 写的是「历史不回填」，指的是**系统自动**不替历史条目伪造事实。本次那 470 条是**显式执行**的：走 `markItemSkipped` 正常 API 逐条写入，每条带依据码，审计里可查来源与理由。不是直接改库。
+
+## 13. 2026-11-01 演化研讨：七方案对比 + 投影简报落地
+
+用户要求对比 7 个外部记忆方案取长补短。调研中**推翻了自己上一轮的三处判断**，这些更正比结论本身更重要：
+
+| 我原先说 | 核实后 |
+| --- | --- |
+| Cairn「完全没有注入通道」 | **错**。有受管投影（`generateProjection`），只是只写固定路由文案、从不投影记忆正文 |
+| 建议照搬 prime-memory/meow 的实时注入 | **错**。两者是 Cordis 插件（`dsh.bundle.patch`）能挂 `agent/pre-step`；Cairn 是 MCP server，独立进程，订阅不到 `session/event` |
+| 排序「没有时效维度」 | **半对**。FTS 路径只按 bm25，但 `last_used_at` 字段已存在且在维护 |
+
+### 各宿主投影能力的取证
+
+| 宿主 | 结论 | 证据 |
+| --- | --- | --- |
+| WorkBuddy | **不是 blocked** | 应用代码 `MemoryCollector.getWorkingMemoryContent()` 读 `<cwd>/.workbuddy/memory/MEMORY.md`，包成 `<working_memory_content>` 注入，上限 `Hs=1e4` 字符；用户级 `~/.workbuddy/MEMORY.md` 另为 `4e3` |
+| ZCode | 有，但**只能放索引** | 内置文档明写「never put memory content there」，每行 ~200 字符 |
+| Copilot | 有，但**与 Copilot Memory 并存** | 官方文档：Copilot Memory 含 Repository-level facts + User-level preferences，服务端自动创建 |
+| Cursor | 四类 rules，**支持 AGENTS.md** | 官方文档：models 不保留记忆；嵌套 AGENTS.md 与父目录合并，更具体者优先 |
+| Claude Code | 支持 `CLAUDE.md` + `.claude/rules/` + **`AGENTS.md`** | 官方文档目录 |
+
+### 已归档：add-memory-projection-brief
+
+- 投影内容升级为「路由文案 + 记忆简报」，按宿主分级（brief/index/none）与预算（DSH/Claude/Cursor/Copilot 2KB，WorkBuddy 8KB）。
+- 三条不变量：**敏感排除在取数阶段**、**同输入同字节**、**预算含全部开销**。
+- 摘要用确定性渲染而非 LLM——引入模型会让「同输入同字节」不成立。
+
+### 实施中发现并修掉的两个真问题
+
+1. **设计文档写了不存在的字段**：排序键用了 `importance`，但 `memory` 表实际没有该列（只有 `confidence`）。核对 schema 后改 design 与 tasks，属于未核实的疏漏。
+2. **预算算错导致超限**：首版只扣了简报部分，实际输出 2063 字节 > 2048。两次修正：先扣 header（626 字节），再补受管标记余量（96 字节），最终 1850/2048。已加断言「任意预算下输出字节不得超限」锁死。
+
+### 验证
+
+- 全量测试 **660 项 / 659 通过 / 0 失败 / 1 显式 skip**（基线 649）。
+- 真实库只读核对：投影含 20 条记忆摘要、1850 字节、无敏感泄露（DB 中 sensitive/blocked 为 0 条）。
+- 归档：`agent-interfaces` +3、`agent-onboarding` 改 1；主规格 9 passed / 0 failed。
+
+### 后续两个独立变更（未启动）
+
+- `add-lesson-kind`：新增 `lesson` 记忆类型。`kind` 是硬编码 CHECK 约束，需 SQLite 表重建迁移。
+- `add-dsh-memory-plugin`：DSH Cordis 插件，以 MCP 为内核做实时召回注入。插件放 monorepo `packages/dsh-plugin`，不独立建仓。
+
+决策记录：投影 2KB / 交接块 4KB；Q1–Q8 均按推荐执行。

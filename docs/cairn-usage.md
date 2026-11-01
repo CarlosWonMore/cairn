@@ -739,3 +739,36 @@ cairn agent apply --plan-file plan.json
 全局选项：`--home <dir>`（数据目录，默认 `~/.cairn`）、`--json`（机器可读输出，stdout 仅结果）、`--agent-id <id>`（调用方 Agent 身份，默认 `cli`）、`--help`。
 
 退出码：`0` 成功；`1` 故障（内部错误、IO 失败、目标不存在）；`2` 用法/校验错误（含作用域校验失败、`E_PLAN_INVALID`）；`3` 被治理拒绝（`E_SECRET_DETECTED`、`E_INJECTION_SUSPECTED`、审批无效/过期/重放、计划篡改、越权读取）；`4` 状态冲突（`E_TARGET_CHANGED`、同名外来条目 `E_CONFIG_CONFLICT`、投影回环）；`5` 环境不可用（数据库被锁、设备克隆/暂停、迁移失败、备份损坏）。
+
+## 投影简报：让宿主会话看得见记忆
+
+`cairn agent apply` 往宿主写的受管区块，不再只有 5 句路由文案，而是**路由文案 + 记忆简报**。
+
+### 按宿主分级
+
+| 宿主 | 形态 | 预算 | 落点 |
+| --- | --- | --- | --- |
+| DSH | brief | 2 KB | `$DSH_HOME/AGENTS.md`（用户级，对所有工作区生效） |
+| Claude Code | brief | 2 KB | 项目 `CLAUDE.md` |
+| Cursor | brief | 2 KB | 项目 `AGENTS.md` |
+| Copilot | brief | 2 KB | `.github/copilot-instructions.md` |
+| WorkBuddy | brief | **8 KB** | `<cwd>/.workbuddy/memory/MEMORY.md` |
+| OpenClaw | none | — | 无公开落点，只给可复制文案 |
+
+**WorkBuddy 的 8 KB 依据**：其应用代码 `MemoryCollector.getWorkingMemoryContent()` 读取该文件并以 `<working_memory_content>` 注入，上限 10000 字符。这是**应用代码证据**而非官方文档，且注入受 `localMemoryEnabled` 开关控制——doctor 无法代查开关状态。
+
+### 三条不变量
+
+1. **敏感内容在取数阶段排除**：`local_only` 作用域、`sensitive` 敏感度、`blocked` 状态一律不进入简报。先渲染再过滤会留泄露面，所以排除发生在 `selectProjectionCandidates` 里。
+2. **同输入同字节**：排序键是 `confidence → updated_at → id`，全序且不含「当前时间」。任何把 `now()` 写进输出都会破坏缓存，也会让「内容未变则不重写」的幂等判断失效。
+3. **预算含全部开销**：区块预算扣掉路由文案、简报标题和受管标记后才给正文，超出时写明「另 N 条未显示」。
+
+### 摘要用什么生成
+
+**确定性规则渲染，不用 LLM**：每条记忆一行 `- [kind] 摘要 (id:xxxxxxxx)`。引入模型会让第 2 条不变量不成立，且多一层依赖与成本。
+
+### 已知边界
+
+- **Copilot 与本产品并存**：GitHub Copilot 自带服务端 Copilot Memory（Repository-level facts + User-level preferences）。投影写入 `.github/copilot-instructions.md` 与它并存，两者可能给出不同说法，doctor 会提示。
+- **ZCode 暂不支持投影**：它虽是已接入的 MCP 宿主，但从来不是 `AgentKind` 的受支持项。其 `MEMORY.md` 约定为**索引**（每行一条、不放正文），若将来支持需按 index 模式单独实现。
+- **WorkBuddy 用户级文件未处理**：`~/.workbuddy/MEMORY.md`（4 KB 上限）与项目级是两个文件，本次只处理项目级。
