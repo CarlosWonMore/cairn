@@ -21,6 +21,13 @@ import { err } from '../core/errors.js';
 
 const PROMOTED_CATEGORY = 'onboarding';
 const PROMOTED_ACTION = 'item_promoted';
+/**
+ * 跳过事实的动作名。
+ *
+ * 刻意与 item_promoted 分开：后者只表示「确实生成了记忆」。若让一个动作兼表两义，
+ * 「已晋升」这个唯一谓词就对所有消费方说谎，而审计只增不改、污染后不可逆。
+ */
+const SKIPPED_ACTION = 'item_skipped';
 
 /**
  * 「这条导入条目已经晋升过了吗」的唯一出处。
@@ -36,19 +43,46 @@ const PROMOTED_ACTION = 'item_promoted';
  * 调用方一律用它，不要自己手写 EXISTS 子句：这个谓词曾经在 6 个文件里各写一遍，
  * 改语义时漏掉任何一处，各处行为就会互相矛盾。
  */
-export function promotedPredicate(alias = 'i'): { exists: string; notExists: string } {
+export interface LedgerPredicate {
+  /** 已晋升（确实生成了记忆）。语义与历史保持一致，不因本次扩展而改变。 */
+  exists: string;
+  notExists: string;
+  /** 已跳过（判定为不采用）。 */
+  skippedExists: string;
+  skippedNotExists: string;
+  /** 已处理完毕 = 已晋升 OR 已跳过。用于「这条还需要处理吗」。 */
+  handledExists: string;
+  handledNotExists: string;
+}
+
+export function promotedPredicate(alias = 'i'): LedgerPredicate {
   // 允许 console/model.ts 的 %ALIAS% 占位符（它做字符串替换后再拼接）。
   if (alias !== '%ALIAS%' && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) {
     throw err('E_VALIDATION', `非法 SQL 别名: ${alias}`);
   }
-  const exists = `EXISTS (
+  const fact = (action: string): string => `EXISTS (
   SELECT 1 FROM audit_event a
-   WHERE a.category = '${PROMOTED_CATEGORY}' AND a.action = '${PROMOTED_ACTION}'
+   WHERE a.category = '${PROMOTED_CATEGORY}' AND a.action = '${action}'
      AND json_extract(a.detail, '$.itemId') = ${alias}.id)`;
-  return { exists, notExists: `NOT ${exists}` };
+  const exists = fact(PROMOTED_ACTION);
+  const skippedExists = fact(SKIPPED_ACTION);
+  const handledExists = `(${exists} OR ${skippedExists})`;
+  return {
+    exists,
+    notExists: `NOT ${exists}`,
+    skippedExists,
+    skippedNotExists: `NOT ${skippedExists}`,
+    handledExists,
+    handledNotExists: `NOT ${handledExists}`,
+  };
 }
 
-const { exists: PROMOTED_EXISTS, notExists: PROMOTED_NOT_EXISTS } = promotedPredicate('i');
+const {
+  exists: PROMOTED_EXISTS,
+  notExists: PROMOTED_NOT_EXISTS,
+  skippedExists: SKIPPED_EXISTS,
+  handledNotExists: HANDLED_NOT_EXISTS,
+} = promotedPredicate('i');
 
 export interface BatchProgress {
   batchId: string;
@@ -56,7 +90,9 @@ export interface BatchProgress {
   clean: number;
   blocked: number;
   promoted: number;
-  /** clean 且尚未晋升：当前 Agent 还要处理的剩余量（中断续跑的游标语义）。 */
+  /** 已判定不采用（item_skipped）。与 promoted 互不重叠，但仍可查询。 */
+  skipped: number;
+  /** clean 且既未晋升也未跳过：当前 Agent 还要处理的剩余量（中断续跑的游标语义）。 */
   remaining: number;
 }
 
@@ -99,13 +135,18 @@ export function batchProgress(store: CairnStore, batchId: string): BatchProgress
   const promoted = toCount(
     store.db.scalar(`SELECT COUNT(*) ${where} AND ${PROMOTED_EXISTS}`, batchId),
   );
+  const skipped = toCount(
+    store.db.scalar(`SELECT COUNT(*) ${where} AND ${SKIPPED_EXISTS}`, batchId),
+  );
+  // remaining = 既未晋升、也未跳过。用 handled 谓词而不是"未晋升"，
+  // 否则判过 skip 的条目会永远留在待处理队列里（本次变更要修的缺陷）。
   const remaining = toCount(
     store.db.scalar(
-      `SELECT COUNT(*) ${where} AND i.scan_state = 'clean' AND ${PROMOTED_NOT_EXISTS}`,
+      `SELECT COUNT(*) ${where} AND i.scan_state = 'clean' AND ${HANDLED_NOT_EXISTS}`,
       batchId,
     ),
   );
-  return { batchId, total, clean, blocked, promoted, remaining };
+  return { batchId, total, clean, blocked, promoted, skipped, remaining };
 }
 
 /**
@@ -121,7 +162,7 @@ export function nextBatchChunk(store: CairnStore, batchId: string, limit: number
     `SELECT i.id AS id, i.archive_id AS archive_id, i.content AS content,
             i.source_ref AS source_ref, i.content_hash AS content_hash
        FROM import_item i
-      WHERE i.batch_id = ? AND i.scan_state = 'clean' AND ${PROMOTED_NOT_EXISTS}
+      WHERE i.batch_id = ? AND i.scan_state = 'clean' AND ${HANDLED_NOT_EXISTS}
       ORDER BY i.archive_id, i.item_index
       LIMIT ?`,
     batchId,
@@ -194,6 +235,99 @@ function extractMemoryId(detail: unknown): string | undefined {
   }
 }
 
+/** 跳过依据的类别：规则层、AI 复核判断、或显式 decision。 */
+export type SkipBasis = 'rule' | 'judgement' | 'decision';
+
+/** 详情里允许出现的依据类别（用于校验外部传入）。 */
+const SKIP_BASIS: readonly SkipBasis[] = ['rule', 'judgement', 'decision'];
+
+/**
+ * 跳过标记：判定某条导入条目不采用时调用。
+ *
+ * 写 audit_event（category='onboarding', action='item_skipped'，
+ * detail 含 itemId/basis/reasonCode）。**detail 不含正文**——审计不是内容存储，
+ * 正文可能含敏感内容，理由原文留在复核记录里按 itemId 关联。
+ *
+ * 幂等：同一 (itemId, basis) 重复标记不产生第二条审计。
+ * blocked 条目拒绝标记（它们根本没有进入待处理队列的资格）。
+ */
+export function markItemSkipped(
+  store: CairnStore,
+  itemId: string,
+  input: { basis: SkipBasis; reasonCode?: string },
+): void {
+  const item = store.archives.requireItem(itemId); // 不存在 → E_NOT_FOUND
+  if (item.scanState === 'blocked') {
+    throw err('E_VALIDATION', 'blocked 条目不得记录跳过事实（它们本就不在待处理队列中）', { itemId });
+  }
+  if (!SKIP_BASIS.includes(input.basis)) {
+    throw err(
+      'E_VALIDATION',
+      `非法的跳过依据类别: ${JSON.stringify(input.basis)}（支持：${SKIP_BASIS.join(', ')}）`,
+    );
+  }
+  const detail: Record<string, unknown> = { itemId, basis: input.basis };
+  if (typeof input.reasonCode === 'string' && input.reasonCode.length > 0) {
+    detail['reasonCode'] = input.reasonCode.slice(0, 120);
+  }
+  store.db.transaction(() => {
+    const rows = store.db.all(
+      "SELECT detail FROM audit_event WHERE category = ? AND action = ? AND json_extract(detail, '$.itemId') = ?",
+      PROMOTED_CATEGORY,
+      SKIPPED_ACTION,
+      itemId,
+    );
+    // 幂等：同条目已用同一依据跳过过，不重复记。
+    for (const row of rows) {
+      try {
+        const prev = JSON.parse(String(row['detail'])) as { basis?: unknown };
+        if (prev.basis === input.basis) return;
+      } catch {
+        // 旧数据损坏时按「未记过」处理，继续追加，不吞掉本次判定。
+      }
+    }
+    store.audit.record(PROMOTED_CATEGORY, SKIPPED_ACTION, { type: 'import_item', id: itemId }, detail);
+  });
+}
+
+/** 已跳过条目（供「已跳过」视图查询）。 */
+export interface SkippedItem {
+  itemId: string;
+  basis: string;
+  reasonCode: string | null;
+  at: string;
+}
+
+/**
+ * 某批次的已跳过条目。
+ *
+ * 跳过的条目要从待处理队列出队，但不能从视野里消失——这正是本次变更的取舍：
+ * remaining 只数真正待处理的，已跳过的另给一个可查入口。
+ */
+export function listSkippedItems(store: CairnStore, batchId: string, limit = 200): SkippedItem[] {
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw err('E_VALIDATION', 'limit 必须是正整数');
+  }
+  const rows = store.db.all(
+    `SELECT i.id AS id, json_extract(a.detail, '$.basis') AS basis,
+            json_extract(a.detail, '$.reasonCode') AS reason_code, a.at AS at
+       FROM audit_event a
+       JOIN import_item i ON json_extract(a.detail, '$.itemId') = i.id
+      WHERE a.category = ? AND a.action = ? AND i.batch_id = ?
+      ORDER BY a.at DESC, i.item_index
+      LIMIT ?`,
+    PROMOTED_CATEGORY,
+    SKIPPED_ACTION,
+    batchId,
+    limit,
+  );
+  return rows.map((r) => ({
+    itemId: String(r['id']),
+    basis: String(r['basis'] ?? 'unknown'),
+    reasonCode: (r['reason_code'] as string | null) ?? null,
+    at: String(r['at']),
+  }));
+}
 function toCount(v: unknown): number {
   return Number(v ?? 0);
 }

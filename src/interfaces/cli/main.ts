@@ -519,6 +519,13 @@ async function main(): Promise<void> {
             const top = Object.entries(r.byCondition).sort((a, b) => b[1] - a[1]).slice(0, 3);
             diag(`转人工的首要原因：${top.map(([k, v]) => `${k} ${v} 条`).join('、') || '无'}（用 cairn ui 查看明细）`);
           }
+        } else if (sub === 'skipped') {
+          // 已跳过的条目：从待处理队列出队，但仍可查（本次变更的核心取舍）。
+          if (!batchId) throw new CairnError('E_VALIDATION', '没有批次；请用 --batch <id> 指定');
+          const limit = flags['limit'] != null ? Number(flags['limit']) : 200;
+          const items = service.batchSkipped(batchId, limit);
+          out({ batchId, count: items.length, items }, flags);
+          diag('这些条目已判为不采用，不再计入待处理；要用新结论重判，加 --redo 重新整理。');
         } else if (sub === 'revoke') {
           // 撤销"结果"与撤销"授权"是两件事：
           //   policy revoke        → 这把钥匙作废，不能再用于未来的自动整理
@@ -531,7 +538,7 @@ async function main(): Promise<void> {
           out(r, flags);
           diag(`已撤销 ${r.tombstoned} 条记忆（转墓碑，不物理删除，修订与来源仍在）。撤销是粘的：普通重跑不会把它们写回来，要重做须 --redo。`);
         } else {
-          throw new CairnError('E_VALIDATION', '用法: cairn onboarding status|next|auto|revoke [--batch <id>] [--policy <id>] [--dry-run] [--redo]');
+          throw new CairnError('E_VALIDATION', '用法: cairn onboarding status|next|auto|skipped|revoke [--batch <id>] [--policy <id>] [--dry-run] [--redo]');
         }
         break;
       }
@@ -730,6 +737,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   discover                      元数据发现（不读正文） [--home-dir] [--project-root]
   import <文件...>              不可变快照导入（imported_unverified + local_only） [--agent-kind]
   onboarding status|next|auto   分批进度与待整理条目 [--batch] [--limit]
+                    skipped: 查看已跳过条目（出队但可查）[--batch] [--limit]
                                 auto: 按已签发策略自动整理 [--policy <id>] [--dry-run] [--redo] [--items a,b]
                                 revoke: 回滚某策略写进去的记忆（转墓碑）[--policy <id>] [--batch <id>]
   add "内容"                    显式新增记忆 [--kind] [--scope] [--project] [--sensitive]

@@ -28,7 +28,8 @@ import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildR
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
 import { findDuplicate } from '../governance/dedup.js';
 import { decideWrite, describeJudgement, Judgement, WriteAction } from '../onboarding/judgement.js';
-import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, promotedPredicate, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
+import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, listSkippedItems, promotedPredicate, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
+import type { SkippedItem } from '../onboarding/batches.js';
 import { proposePlan, ProposedItem } from '../governance/propose.js';
 import { applyPlan, ApplyReport } from '../governance/apply.js';
 import { discoverSources, SourceCandidate } from '../onboarding/discover.js';
@@ -631,7 +632,7 @@ export class AppService {
     const rows = this.store.db.all(
       `SELECT i.batch_id AS bid, COUNT(*) AS n FROM import_item i
        WHERE i.scan_state = 'clean' AND i.batch_id IS NOT NULL
-         AND ${promotedPredicate('i').notExists}
+         AND ${promotedPredicate('i').handledNotExists}
        GROUP BY i.batch_id ORDER BY i.batch_id DESC LIMIT 1`,
     );
     return rows.length > 0 ? String(rows[0]!.bid) : null;
@@ -643,6 +644,11 @@ export class AppService {
 
   batchChunk(batchId: string, limit: number): BatchChunkItem[] {
     return nextBatchChunk(this.store, batchId, limit);
+  }
+
+  /** 某批次的已跳过条目：出队但可查（本次变更的核心取舍）。 */
+  batchSkipped(batchId: string, limit?: number): SkippedItem[] {
+    return listSkippedItems(this.store, batchId, limit);
   }
 
   /** 由批次生成治理计划（Agent 建议 → 确定性管线），并标记对应条目来源。 */

@@ -95,7 +95,7 @@ export interface ArchiveView {
   redactionState: string;
   discoveredAt: string;
   importedAt: string | null;
-  items: { total: number; clean: number; blocked: number; promoted: number; remaining: number };
+  items: { total: number; clean: number; blocked: number; promoted: number; skipped: number; remaining: number };
 }
 
 export interface BatchView {
@@ -122,6 +122,8 @@ export interface ItemView {
   /** false 表示原文在导入阶段已被物理丢弃（blocked 条目），库里只有占位符。 */
   contentAvailable: boolean;
   contentHash: string;
+  /** 已处理状态：已晋升 / 已跳过 / 仍待处理。跳过的条目可查但不计 remaining。 */
+  handled: 'promoted' | 'skipped' | 'pending';
 }
 
 /** 一次自动整理的摘要（来自 `policy/auto_applied` 审计，任务 4.6）。 */
@@ -166,7 +168,7 @@ export interface ImportRowView {
   lastImportedAt: string | null;
   /** 本行是不是该来源最近一次导入——UI 默认只展开它，其余收进 details。 */
   isLatestOfSource: boolean;
-  items: { total: number; clean: number; blocked: number; promoted: number; remaining: number };
+  items: { total: number; clean: number; blocked: number; promoted: number; skipped: number; remaining: number };
   /** 该 archive 所属批次的最近一次自动整理摘要；没跑过为 null。 */
   autoRun: AutoRunView | null;
 }
@@ -179,7 +181,7 @@ export interface ImportGroupView {
   lastImportedAt: string | null;
   /** 行 id，按导入时间倒序，[0] 是最新一次。 */
   rowIds: string[];
-  items: { total: number; clean: number; blocked: number; promoted: number; remaining: number };
+  items: { total: number; clean: number; blocked: number; promoted: number; skipped: number; remaining: number };
 }
 
 export interface ImportRowsView {
@@ -235,7 +237,7 @@ export interface ConsoleCounts {
   memoriesByStatus: Record<string, number>;
   memoriesTotal: number;
   archives: number;
-  items: { total: number; clean: number; blocked: number; promoted: number; remaining: number };
+  items: { total: number; clean: number; blocked: number; promoted: number; skipped: number; remaining: number };
   batches: number;
   plansByStatus: Record<string, number>;
   approvalsLive: number;
@@ -270,6 +272,11 @@ export interface ConsoleModel {
 
 const PROMOTED_SQL = promotedPredicate('%ALIAS%').exists;
 const NOT_PROMOTED_SQL = promotedPredicate('%ALIAS%').notExists;
+/** 已跳过（判定不采用）。与 promoted 分开统计，但同样退出待处理。 */
+const SKIPPED_SQL = promotedPredicate('%ALIAS%').skippedExists;
+/** 已处理完毕 = 已晋升 OR 已跳过。「还要不要处理」用它，不用 NOT_PROMOTED。 */
+const HANDLED_SQL = promotedPredicate('%ALIAS%').handledExists;
+const NOT_HANDLED_SQL = promotedPredicate('%ALIAS%').handledNotExists;
 
 export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleModel {
   const mode: ViewMode = opts.mode ?? 'brief';
@@ -321,6 +328,7 @@ export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleM
         clean: itemAgg.clean,
         blocked: itemAgg.blocked,
         promoted: itemAgg.promoted,
+        skipped: itemAgg.skipped,
         remaining: itemAgg.remaining,
       },
       batches: batches.length,
@@ -460,8 +468,9 @@ function loadArchives(store: CairnStore): ArchiveView[] {
        (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id) AS n_total,
        (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean') AS n_clean,
        (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'blocked') AS n_blocked,
-       (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${PROMOTED_SQL.replace('%ALIAS%', 'i')}) AS n_promoted,
-       (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean' AND ${NOT_PROMOTED_SQL.replace('%ALIAS%', 'i')}) AS n_remaining
+       (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_promoted,
+       (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_skipped,
+       (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean' AND ${NOT_HANDLED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_remaining
      FROM import_archive a
      ORDER BY a.imported_at DESC, a.id`,
   );
@@ -481,6 +490,7 @@ function loadArchives(store: CairnStore): ArchiveView[] {
       clean: Number(r['n_clean']),
       blocked: Number(r['n_blocked']),
       promoted: Number(r['n_promoted']),
+      skipped: Number(r['n_skipped']),
       remaining: Number(r['n_remaining']),
     },
   }));
@@ -492,8 +502,9 @@ function loadBatches(store: CairnStore): BatchView[] {
        COUNT(*) AS total,
        SUM(CASE WHEN i.scan_state = 'clean' THEN 1 ELSE 0 END) AS clean,
        SUM(CASE WHEN i.scan_state = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-       SUM(CASE WHEN ${PROMOTED_SQL.replace('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS promoted,
-       SUM(CASE WHEN i.scan_state = 'clean' AND ${NOT_PROMOTED_SQL.replace('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS remaining,
+       SUM(CASE WHEN ${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS promoted,
+       SUM(CASE WHEN ${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS skipped,
+       SUM(CASE WHEN i.scan_state = 'clean' AND ${NOT_HANDLED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS remaining,
        MIN(i.created_at) AS first_at,
        MAX(i.created_at) AS last_at
      FROM import_item i
@@ -517,6 +528,7 @@ function loadBatches(store: CairnStore): BatchView[] {
       clean: Number(r['clean'] ?? 0),
       blocked: Number(r['blocked'] ?? 0),
       promoted: Number(r['promoted'] ?? 0),
+      skipped: Number(r['skipped'] ?? 0),
       remaining: Number(r['remaining'] ?? 0),
       lastImportedAt: (r['last_at'] as string | null) ?? null,
     };
@@ -543,8 +555,9 @@ export function buildImportRows(store: CairnStore): ImportRowsView {
             (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id) AS n_total,
             (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean') AS n_clean,
             (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'blocked') AS n_blocked,
-            (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${PROMOTED_SQL.replace('%ALIAS%', 'i')}) AS n_promoted,
-            (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean' AND ${NOT_PROMOTED_SQL.replace('%ALIAS%', 'i')}) AS n_remaining
+            (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_promoted,
+            (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND ${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_skipped,
+            (SELECT COUNT(*) FROM import_item i WHERE i.archive_id = a.id AND i.scan_state = 'clean' AND ${NOT_HANDLED_SQL.replaceAll('%ALIAS%', 'i')}) AS n_remaining
        FROM import_archive a
       ORDER BY a.imported_at DESC, a.id DESC`,
   );
@@ -573,7 +586,8 @@ export function buildImportRows(store: CairnStore): ImportRowsView {
         clean: Number(r['n_clean']),
         blocked: Number(r['n_blocked']),
         promoted: Number(r['n_promoted']),
-        remaining: Number(r['n_remaining']),
+        skipped: Number(r['n_skipped']),
+      remaining: Number(r['n_remaining']),
       },
       autoRun: batchId != null ? (autoRuns.get(batchId) ?? null) : null,
     };
@@ -593,7 +607,7 @@ export function buildImportRows(store: CairnStore): ImportRowsView {
         importCount: 0,
         lastImportedAt: row.importedAt,
         rowIds: [],
-        items: { total: 0, clean: 0, blocked: 0, promoted: 0, remaining: 0 },
+        items: { total: 0, clean: 0, blocked: 0, promoted: 0, skipped: 0, remaining: 0 },
       };
       byKey.set(key, g);
       groups.push(g);
@@ -700,7 +714,10 @@ function loadItems(
   }
   const limitSql = o.limit != null && o.limit > 0 ? 'LIMIT ?' : '';
   if (limitSql) params.push(o.limit);
-  const sql = `SELECT i.* FROM import_item i
+  const sql = `SELECT i.*,
+      (${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')}) AS is_promoted,
+      (${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')}) AS is_skipped
+    FROM import_item i
     ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY i.archive_id, i.item_index ${limitSql}`;
   return store.db.all(sql, ...params).map((r) => {
@@ -722,6 +739,7 @@ function loadItems(
       // 原文从未入库。所以这里不是"要不要给"的问题，而是"库里没有"。
       contentAvailable: scanState !== 'blocked',
       contentHash: String(r['content_hash']),
+      handled: Number(r['is_promoted']) === 1 ? 'promoted' : Number(r['is_skipped']) === 1 ? 'skipped' : 'pending',
     };
   });
 }
@@ -745,7 +763,10 @@ export function listArchiveItems(
   }
   const total = Number(store.db.scalar(`SELECT COUNT(*) AS n FROM import_item i WHERE ${where.join(' AND ')}`, ...params) ?? 0);
   const rows = store.db.all(
-    `SELECT i.* FROM import_item i WHERE ${where.join(' AND ')} ORDER BY i.item_index LIMIT ? OFFSET ?`,
+    `SELECT i.*,
+            (${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')}) AS is_promoted,
+            (${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')}) AS is_skipped
+       FROM import_item i WHERE ${where.join(' AND ')} ORDER BY i.item_index LIMIT ? OFFSET ?`,
     ...params,
     limit,
     offset,
@@ -771,6 +792,8 @@ export function listArchiveItems(
         }),
         contentAvailable: scanState !== 'blocked',
         contentHash: String(r['content_hash']),
+        // 已处理状态：抽屉里要能看出这条是被晋升了还是被判跳过了。
+        handled: Number(r['is_promoted']) === 1 ? 'promoted' : Number(r['is_skipped']) === 1 ? 'skipped' : 'pending',
       };
     }),
   };
@@ -997,13 +1020,21 @@ export function memoryDetail(
   };
 }
 
-function aggregateItems(store: CairnStore): { total: number; clean: number; blocked: number; promoted: number; remaining: number } {
+function aggregateItems(store: CairnStore): {
+  total: number;
+  clean: number;
+  blocked: number;
+  promoted: number;
+  skipped: number;
+  remaining: number;
+} {
   const row = store.db.get(
     `SELECT COUNT(*) AS total,
        SUM(CASE WHEN i.scan_state = 'clean' THEN 1 ELSE 0 END) AS clean,
        SUM(CASE WHEN i.scan_state = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-       SUM(CASE WHEN ${PROMOTED_SQL.replace('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS promoted,
-       SUM(CASE WHEN i.scan_state = 'clean' AND ${NOT_PROMOTED_SQL.replace('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS remaining
+       SUM(CASE WHEN ${PROMOTED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS promoted,
+       SUM(CASE WHEN ${SKIPPED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS skipped,
+       SUM(CASE WHEN i.scan_state = 'clean' AND ${NOT_HANDLED_SQL.replaceAll('%ALIAS%', 'i')} THEN 1 ELSE 0 END) AS remaining
      FROM import_item i`,
   );
   return {
@@ -1011,6 +1042,7 @@ function aggregateItems(store: CairnStore): { total: number; clean: number; bloc
     clean: Number(row?.['clean'] ?? 0),
     blocked: Number(row?.['blocked'] ?? 0),
     promoted: Number(row?.['promoted'] ?? 0),
+    skipped: Number(row?.['skipped'] ?? 0),
     remaining: Number(row?.['remaining'] ?? 0),
   };
 }

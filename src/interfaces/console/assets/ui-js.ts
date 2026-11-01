@@ -546,12 +546,13 @@ export const UI_JS = String.raw`
       clear(host);
       var rows = data.rows || [];
       var groups = data.groups || [];
-      var agg = { total: 0, clean: 0, blocked: 0, promoted: 0, remaining: 0 };
+      var agg = { total: 0, clean: 0, blocked: 0, promoted: 0, skipped: 0, remaining: 0 };
       rows.forEach(function (r) {
         agg.total += r.items.total;
         agg.clean += r.items.clean;
         agg.blocked += r.items.blocked;
         agg.promoted += r.items.promoted;
+        agg.skipped += r.items.skipped;
         agg.remaining += r.items.remaining;
       });
 
@@ -560,6 +561,7 @@ export const UI_JS = String.raw`
       cards.appendChild(card('导入次数', rows.length));
       cards.appendChild(card('待处理条目', agg.remaining, agg.remaining > 0 ? 'warn' : 'ok'));
       cards.appendChild(card('已晋升', agg.promoted));
+      cards.appendChild(card('已跳过', agg.skipped));
       cards.appendChild(card('blocked', agg.blocked, agg.blocked > 0 ? 'pending' : 'ok'));
       host.appendChild(cards);
 
@@ -573,7 +575,7 @@ export const UI_JS = String.raw`
 
       var table = el('table');
       var head = el('tr');
-      ['来源', '最近导入', '条目', 'clean', 'blocked', '已晋升', '剩余', '自动整理', ''].forEach(function (h) {
+      ['来源', '最近导入', '条目', 'clean', 'blocked', '已晋升', '已跳过', '剩余', '自动整理', ''].forEach(function (h) {
         head.appendChild(el('th', null, h));
       });
       table.appendChild(head);
@@ -586,7 +588,7 @@ export const UI_JS = String.raw`
         table.appendChild(rowTr(latest, g));
         if (g.rowIds.length > 1) {
           var histTr = el('tr');
-          var td = el('td', { colspan: '9', style: 'padding:0 10px 8px' });
+          var td = el('td', { colspan: '10', style: 'padding:0 10px 8px' });
           var det = el('details');
           det.appendChild(el('summary', { style: 'cursor:pointer;font-size:12px;color:var(--text-dim)' },
             '历史导入 ' + (g.rowIds.length - 1) + ' 次（同源，默认折叠）'));
@@ -601,8 +603,9 @@ export const UI_JS = String.raw`
             tr.appendChild(el('td', null, r.items.clean));
             var tb = el('td'); tb.appendChild(chip(r.items.blocked, r.items.blocked > 0 ? 'warn' : 'muted')); tr.appendChild(tb);
             tr.appendChild(el('td', null, r.items.promoted));
+            tr.appendChild(el('td', null, r.items.skipped));
             var trem = el('td'); trem.appendChild(chip(r.items.remaining, r.items.remaining > 0 ? 'warn' : 'ok')); tr.appendChild(trem);
-            tr.appendChild(el('td', { colspan: '2' }, ''));
+            tr.appendChild(el('td', { colspan: '3' }, ''));
             tr.addEventListener('click', function () { openRow(r); });
             ht.appendChild(tr);
           });
@@ -636,6 +639,7 @@ export const UI_JS = String.raw`
       tr.appendChild(el('td', null, r.items.clean));
       var tb = el('td'); tb.appendChild(chip(r.items.blocked, r.items.blocked > 0 ? 'warn' : 'muted')); tr.appendChild(tb);
       tr.appendChild(el('td', null, r.items.promoted));
+      tr.appendChild(el('td', null, r.items.skipped));
       var trem = el('td'); trem.appendChild(chip(r.items.remaining, r.items.remaining > 0 ? 'warn' : 'ok')); tr.appendChild(trem);
 
       var ta = el('td');
@@ -754,6 +758,7 @@ export const UI_JS = String.raw`
       counts.appendChild(card('clean', r.items.clean));
       counts.appendChild(card('blocked', r.items.blocked, r.items.blocked > 0 ? 'warn' : 'ok'));
       counts.appendChild(card('已晋升', r.items.promoted));
+      counts.appendChild(card('已跳过', r.items.skipped));
       counts.appendChild(card('剩余', r.items.remaining, r.items.remaining > 0 ? 'warn' : 'ok'));
       body.appendChild(counts);
 

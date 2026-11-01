@@ -114,6 +114,7 @@ test('batchProgress：total/clean/blocked 按扫描状态统计正确', async ()
       clean: 3,
       blocked: 1,
       promoted: 0,
+        skipped: 0,
       remaining: 3,
     });
   } finally {
@@ -333,6 +334,7 @@ test('未知 batchId：进度全零、chunk 为空，不抛错', async () => {
       clean: 0,
       blocked: 0,
       promoted: 0,
+        skipped: 0,
       remaining: 0,
     });
     assert.deepEqual(nextBatchChunk(s.store, 'batch-nonexistent', 5), []);

@@ -20,5 +20,13 @@
 
 export { importSnapshot, parseMarkdownItems, DEFAULT_MAX_ITEM_BYTES } from './import.js';
 export type { ImportSourceInput, ImportOutcome } from './import.js';
-export { assignBatch, batchProgress, nextBatchChunk, markItemPromoted } from './batches.js';
+export {
+  assignBatch,
+  batchProgress,
+  nextBatchChunk,
+  markItemPromoted,
+  markItemSkipped,
+  listSkippedItems,
+} from './batches.js';
+export type { SkipBasis, SkippedItem } from './batches.js';
 export type { BatchProgress, BatchChunkItem } from './batches.js';

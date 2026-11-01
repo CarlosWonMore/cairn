@@ -6,7 +6,7 @@ import type { CairnStore } from '../store/index.js';
 import { proposePlan, ProposedItem } from '../governance/propose.js';
 import { applyPlan } from '../governance/apply.js';
 import { findDuplicate } from '../governance/dedup.js';
-import { markItemPromoted, promotedPredicate } from './batches.js';
+import { markItemPromoted, markItemSkipped, promotedPredicate } from './batches.js';
 import { readReviewsIndex } from '../interfaces/console/review-store.js';
 import { computeSuggestions, type SuggestedAction, type Suggestion } from '../interfaces/console/suggestions.js';
 import {
@@ -249,6 +249,8 @@ export function runAutoOnboarding(store: CairnStore, input: AutoRunInput): AutoR
   // 分组结构与"不同 scope 不混进同一计划"的约束都在这里，将来多目标时直接生效。
   const groups = new Map<string, { scopeId: string; items: ProposedItem[]; skipped: number }>();
   const rowById = new Map(selected.map((r) => [String(r.id), r]));
+  /** 判为跳过、需要在真实运行时落事实的条目。 */
+  const skippedToMark: { itemId: string; reasonCode?: string }[] = [];
 
   for (const entry of autoEntries) {
     const row = rowById.get(entry.itemId)!;
@@ -259,6 +261,9 @@ export function runAutoOnboarding(store: CairnStore, input: AutoRunInput): AutoR
       const g = groups.get(target.id) ?? { scopeId: target.id, items: [], skipped: 0 };
       g.skipped += 1;
       groups.set(target.id, g);
+      // 真实运行才落跳过事实（dry-run 零写入）。needs_human 不算跳过：
+      // 它表示"还没判完"，把待人决定的条目当已处理会让队列静默漏项。
+      if (entry.action === 'skip') skippedToMark.push({ itemId: entry.itemId, reasonCode: entry.reason });
       continue;
     }
 
@@ -449,6 +454,16 @@ export function runAutoOnboarding(store: CairnStore, input: AutoRunInput): AutoR
       memoryIds,
       note: policy.spec.note,
       at: nowIso(),
+    });
+  }
+
+  // 判为跳过的条目落"跳过"事实：它们因此退出待处理队列，但仍可查询
+  // （listSkippedItems）。放在这里而不是 skip 分支，是因为只有走到这一步才是
+  // 真实运行——dry-run 在上面已经 return，零写入。
+  for (const s2 of skippedToMark) {
+    markItemSkipped(store, s2.itemId, {
+      basis: 'rule',
+      ...(s2.reasonCode ? { reasonCode: s2.reasonCode } : {}),
     });
   }
 
