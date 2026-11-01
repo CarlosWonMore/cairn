@@ -19,6 +19,7 @@ import {
   shouldInject,
   type RecallHit,
 } from './recall.js';
+import { buildUsage, type RecallUsage } from './usage-state.js';
 
 export interface PluginConfig {
   enabled?: boolean;
@@ -43,6 +44,8 @@ const DEFAULTS = { enabled: true, budgetBytes: 1536, topK: 5 } as const;
 export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }) {
   const cfg = { ...DEFAULTS, ...(deps.config ?? {}) };
   const dedupe = createDedupeState();
+  /** 最近一次召回的使用情况，供 UI 面板读取。 */
+  let lastUsage: RecallUsage | null = null;
 
   async function runOnce(message: string): Promise<InjectionOutcome> {
     const decision = shouldInject({ enabled: cfg.enabled, alreadyInjected: new Set(), message });
@@ -56,10 +59,25 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
       return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0 };
     }
     const safe = filterInjectable(hits);
+    const filteredCount = hits.length - safe.length;
     const rendered = renderInjection(safe, {
       budgetBytes: cfg.budgetBytes,
       alreadyInjected: { has: (id: string) => dedupe.has(id) } as unknown as ReadonlySet<string>,
     });
+
+    // 记录本轮使用情况：三态由 buildUsage 判定，正文不进状态（只放摘要）。
+    lastUsage = buildUsage({
+      candidates: hits.length,
+      injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content })),
+      injectedIds: safe
+        .filter((h) => h.content && rendered.text.includes(h.content.split(/\r?\n/)[0]!.trim().slice(0, 20)))
+        .map((h) => h.id),
+      matchedBy: 'fts',
+      bytesUsed: rendered.bytes,
+      bytesBudget: cfg.budgetBytes,
+      filteredCount,
+    });
+
     if (rendered.text.length === 0) {
       return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0 };
     }
@@ -71,7 +89,12 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     return { injected: true, reason: 'ok', text: rendered.text, selected: rendered.selected, truncated: rendered.truncated };
   }
 
-  return { runOnce, resetSession: () => dedupe.reset(), seenCount: () => dedupe.size() };
+  return {
+    runOnce,
+    lastUsage: () => lastUsage,
+    resetSession: () => dedupe.reset(),
+    seenCount: () => dedupe.size(),
+  };
 }
 
 /** 从 ctx.tools 取 Cairn 检索能力的适配器；拿不到就返回 null（降级）。 */
