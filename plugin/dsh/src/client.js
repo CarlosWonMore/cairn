@@ -1,6 +1,7 @@
 // Cairn 记忆调用面板（DSH Client 插件）。
 //
-// 注册到 conversation.session.header.views.actions —— 「对话 / 轨迹」这组视图旁的操作区。
+// 注册到 conversation.session.header.actions —— header 里直接渲染的区域（与 agent-preset 同处）。
+// 注意：views.actions 那个 slot 的内容会进「More」下拉菜单，不是直接可见，所以不用它。
 // 三态用**文字**标明，不只靠颜色：『已过滤』与『未命中』在用户眼里都是「什么都没发生」，
 // 但前者说明安全规则在工作，必须读得出来。
 window.__ModuleLoader__.load({
@@ -15,8 +16,29 @@ window.__ModuleLoader__.load({
       miss: '#757575',
     };
 
-    function MemoryUsagePanel(props) {
-      const usage = props && props.usage;
+    // 数据来自 Host 注册的 /plugins/cairn-dsh-memory/usage。
+    // Host 与 Client 分处两个进程，内存状态无法直接共享，只能走 HTTP。
+    const USAGE_URL = '/plugins/cairn-dsh-memory/usage';
+
+    function useUsage() {
+      const [usage, setUsage] = React.useState(null);
+      React.useEffect(function () {
+        let alive = true;
+        function pull() {
+          fetch(USAGE_URL, { headers: { accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { if (alive) setUsage(d); })
+            .catch(function () { /* 拿不到就保持上一次，不打断界面 */ });
+        }
+        pull();
+        const t = setInterval(pull, 3000);
+        return function () { alive = false; clearInterval(t); };
+      }, []);
+      return usage;
+    }
+
+    function MemoryUsagePanel() {
+      const usage = useUsage();
       const [open, setOpen] = React.useState(false);
       if (!usage) return null;
 
@@ -72,9 +94,9 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        ctx.slots.inject('conversation.session.header.views.actions', function () {
+        ctx.slots.inject('conversation.session.header.actions', function () {
           return ctx.slots.register(
-            { name: 'conversation.session.header.views.actions', id: 'cairn-memory-usage', order: 20 },
+            { name: 'conversation.session.header.actions', id: 'cairn-memory-usage', order: 20 },
             MemoryUsagePanel,
           );
         });

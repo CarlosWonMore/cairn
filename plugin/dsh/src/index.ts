@@ -149,6 +149,37 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   if (!recall) return; // 没有 tools 服务 → 静默降级，不注册钩子。
 
   const injector = createInjector({ recall, config });
+
+  // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
+  // 用 ctx.inject(['webServer']) 惰性获取——worksbuddy 也这么做，webServer 不进模块级 inject。
+  // 只返回摘要级信息，正文永不外传（design D3）。
+  const usagePath = '/plugins/cairn-dsh-memory/usage';
+  try {
+    const lazy = ctx as { inject?: (deps: string[], cb: (c: unknown) => void) => unknown } | undefined;
+    if (typeof lazy?.inject === 'function') {
+      lazy.inject(['webServer'], (webCtx) => {
+        const web = webCtx as { webServer?: { register?: (o: unknown) => unknown } };
+        if (typeof web.webServer?.register !== 'function') return;
+        web.webServer.register({
+          kind: 'exact',
+          path: usagePath,
+          handler: (req: { method?: string }, res: { writeHead?: Function; end?: Function }) => {
+            if (req.method !== 'GET') {
+              res.writeHead?.(405, { 'content-type': 'application/json' });
+              res.end?.(JSON.stringify({ error: 'method not allowed' }));
+              return;
+            }
+            const usage = injector.lastUsage();
+            res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+            res.end?.(JSON.stringify(usage ?? { status: 'miss', label: '未命中' }));
+          },
+        });
+      });
+    }
+  } catch {
+    // 端点注册失败只影响面板，不影响召回。
+  }
+
   // pre-step 的 payload 不含用户原文（只有 { agent, signal }），
   // 所以从 session/event 的 user/message 攒最近一条。
   let lastUserMessage = '';
