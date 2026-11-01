@@ -72,4 +72,24 @@ describe('插件形状（踩过三次的坑）', () => {
     await handler!({ agent: { inject: () => {} } }, () => { called = true; });
     assert.equal(called, true, 'next() 必须被调用');
   });
+
+  it('usage 端点兜底形状字段完备（2026-11-02：退化形状害 client 详情段崩溃）', () => {
+    let captured: { handler?: (req: unknown, res: unknown) => void } | null = null;
+    const ctx = {
+      // 不给 tools（降级路径也要注册路由），用 path-2（直接 webServer 属性）捕获 handler
+      webServer: { register: (o: unknown) => { captured = o as typeof captured; } },
+      on: () => {},
+    };
+    apply(ctx, {});
+    assert.ok(captured!.handler, 'usage 路由必须注册成功');
+    let body = '';
+    captured!.handler!({ method: 'GET' }, { writeHead: () => {}, end: (b: string) => { body = b; } });
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    // client 详情段读这些字段，缺一个就崩（宿主 crash boundary 会卸载整个面板）
+    for (const k of ['status', 'label', 'candidates', 'injected', 'matchedBy', 'bytesUsed', 'bytesBudget', 'filteredCount']) {
+      assert.ok(k in parsed, `缺少字段 ${k}`);
+    }
+    assert.ok(Array.isArray(parsed.injected), 'injected 必须是数组');
+    assert.equal(parsed.status, 'miss');
+  });
 });

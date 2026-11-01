@@ -243,3 +243,25 @@ Uncaught 堆栈显示 `slots.inject` 的回调是在**后续的全局 reconcile 
 - `node --check` 通过；插件单测 26/26 通过（`npx tsx --test plugin/dsh/tests/*.test.ts`）。
 - **usage 端点已在真实 DSH 实证可用**：`http://127.0.0.1:34420/plugins/cairn-dsh-memory/usage`（带 token）→ `200 {"status":"miss","label":"未命中"}`——正是 serveUsage 的兜底形状。Host 侧路由注册成立，数据通路只剩前端挂载这一环。
 - **待办**：重启 DSH 后目视确认面板（预期先见 waiting chip「Cairn 记忆面板…」，端点可达后转三态 chip）。ZCode 无法替用户完成这最后一步。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-6：面板已挂载，崩在详情段）
+
+### 进展确认（app-1793561469588.log）
+- `requires options.id` **消失**，combo rev 变为 `7dfaf02b8b8d`——Round-4/5 的 id 修复已生效。
+- **面板组件已成功挂载**：`MemoryUsagePanel` 出现在渲染堆栈，且被宿主 slot crash boundary 接住（`slot entry crashed in 'conversation.session.header.actions'`）。
+- 新症状：`TypeError: Cannot read properties of undefined (reading 'length')` at `MemoryUsagePanel`。
+
+### 根因（一句话）
+端点在「还没有任何召回」时返回退化兜底形状 `{status:'miss',label:'未命中'}`（serveUsage 原来的 `?? {…}`），缺 `injected` 等字段；面板一进详情段读 `usage.injected.length` 抛 TypeError，宿主 crash boundary 把整个条目卸载——面板「一闪即逝/一点就没了」。
+
+### 修复（两侧都修，防御性原则：client 对任意响应形状都不得抛）
+1. `src/usage-state.ts`：新增导出 `EMPTY_USAGE`（RecallUsage 全字段完备的兜底常量，附教训 comment）。
+2. `src/index.ts`：serveUsage 兜底改用 `EMPTY_USAGE`。
+3. `src/client.js`：新增 `normalize()`——fetch 响应一律归一化成字段完备对象再进 state；详情段条目再垫一层对象兜底。
+4. 回归测试 +4：`usage-state.test.ts` 锁死 EMPTY_USAGE 字段完备；`injector.test.ts` 用假 webServer 捕获 handler，锁死端点兜底 JSON 含全部 8 字段且 `injected` 是数组。
+
+### 验证
+- 插件单测 30/30（26→30）；`tsc --noEmit` 净；`node --check` 净；dist 重建后 `import('./dist/usage-state.js').EMPTY_USAGE` 形状核对通过。
+- 待用户重启 DSH 复验。

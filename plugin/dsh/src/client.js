@@ -20,6 +20,24 @@ window.__ModuleLoader__.load({
     // Host 与 Client 分处两个进程，内存状态无法直接共享，只能走 HTTP。
     const USAGE_URL = '/plugins/cairn-dsh-memory/usage';
 
+    // 宿主 slot 有 crash boundary：组件一抛错，整个条目被卸载（2026-11-02 的
+    // 「面板一闪即逝」就是这么来的——端点早期返回过缺字段的退化形状，详情段
+    // 读 usage.injected.length 抛 TypeError）。所以响应必须归一化成字段完备
+    // 的对象：对端给什么都绝不抛。
+    function normalize(d) {
+      if (!d || typeof d !== 'object') return null;
+      return {
+        status: typeof d.status === 'string' ? d.status : 'miss',
+        label: typeof d.label === 'string' ? d.label : '',
+        candidates: Number(d.candidates) || 0,
+        injected: Array.isArray(d.injected) ? d.injected : [],
+        matchedBy: typeof d.matchedBy === 'string' ? d.matchedBy : '—',
+        bytesUsed: Number(d.bytesUsed) || 0,
+        bytesBudget: Number(d.bytesBudget) || 0,
+        filteredCount: Number(d.filteredCount) || 0,
+      };
+    }
+
     function useUsage() {
       const [usage, setUsage] = React.useState(null);
       const [failed, setFailed] = React.useState(false);
@@ -34,7 +52,7 @@ window.__ModuleLoader__.load({
             .then(function (d) {
               if (!alive) return;
               setFailed(false);
-              setUsage(d);
+              setUsage(normalize(d));
             })
             .catch(function () {
               if (alive) { setFailed(true); setUsage(null); }
@@ -104,9 +122,10 @@ window.__ModuleLoader__.load({
           }),
           usage.injected.length
             ? h('div', { style: { marginTop: '6px', borderTop: '1px solid rgba(127,127,127,.25)', paddingTop: '6px' } },
-                usage.injected.map(function (m) {
-                  return h('div', { key: m.id }, h('code', { style: { opacity: .65 } }, m.kind), ' ',
-                    h('span', { title: m.id }, m.summary));
+                usage.injected.map(function (m, i) {
+                  m = (m && typeof m === 'object') ? m : {};
+                  return h('div', { key: m.id || i }, h('code', { style: { opacity: .65 } }, m.kind || '?'), ' ',
+                    h('span', { title: m.id }, m.summary || ''));
                 }))
             : null,
         ),

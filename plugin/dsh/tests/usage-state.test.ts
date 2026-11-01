@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { buildUsage, toSummary } from '../src/usage-state.js';
+import { buildUsage, EMPTY_USAGE, toSummary } from '../src/usage-state.js';
 
 describe('三态判定', () => {
   it('有注入时是 injected', () => {
@@ -104,5 +104,28 @@ describe('injected 只含真正注入的条目', () => {
       filteredCount: 0,
     });
     assert.deepEqual(u.injected.map((i) => i.id), ['a']);
+  });
+});
+
+describe('EMPTY_USAGE：对外兜底形状必须字段完备', () => {
+  // 2026-11-02 教训：曾用 {status,label} 两字段的退化形状当兜底，client 详情段
+  // 读 usage.injected.length 抛 TypeError，被宿主 slot crash boundary 整个卸载。
+  it('所有 RecallUsage 字段都在，client 无需判空', () => {
+    const keys = Object.keys(EMPTY_USAGE).sort();
+    assert.deepEqual(keys, [
+      'bytesBudget', 'bytesUsed', 'candidates', 'filteredCount',
+      'injected', 'label', 'matchedBy', 'status',
+    ]);
+  });
+  it('injected 是数组、数值字段是数值', () => {
+    assert.ok(Array.isArray(EMPTY_USAGE.injected));
+    assert.equal(EMPTY_USAGE.injected.length, 0);
+    for (const k of ['candidates', 'bytesUsed', 'bytesBudget', 'filteredCount'] as const) {
+      assert.equal(typeof EMPTY_USAGE[k], 'number', k);
+    }
+  });
+  it('状态是 miss 且文案齐备', () => {
+    assert.equal(EMPTY_USAGE.status, 'miss');
+    assert.ok(EMPTY_USAGE.label.length > 0);
   });
 });

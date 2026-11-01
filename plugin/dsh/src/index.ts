@@ -19,7 +19,7 @@ import {
   shouldInject,
   type RecallHit,
 } from './recall.js';
-import { buildUsage, type RecallUsage } from './usage-state.js';
+import { buildUsage, EMPTY_USAGE, type RecallUsage } from './usage-state.js';
 
 export interface PluginConfig {
   enabled?: boolean;
@@ -165,7 +165,9 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     }
     const usage = injector.lastUsage();
     res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end?.(JSON.stringify(usage ?? { status: 'miss', label: '未命中' }));
+    // 兜底必须字段完备（EMPTY_USAGE）：client 详情段会读 injected 等字段，
+    // 退化形状会让面板在宿主 crash boundary 下被整个卸载。
+    res.end?.(JSON.stringify(usage ?? EMPTY_USAGE));
   };
   const registerUsageOn = (webServer: { register: (o: unknown) => unknown }): void => {
     webServer.register({

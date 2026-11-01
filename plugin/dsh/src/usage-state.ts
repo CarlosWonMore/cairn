@@ -64,6 +64,25 @@ const LABELS: Record<UsageStatus, string> = {
 };
 
 /**
+ * 「还没有任何召回」时对外给出的完整形状。
+ *
+ * 2026-11-02 的教训：曾经用 `{status:'miss',label:'未命中'}` 当兜底，
+ * client 详情段读 `usage.injected.length` 直接抛 TypeError，被宿主 slot
+ * crash boundary 整个卸载——面板「一闪即逝」。对外形状必须字段完备，
+ * 消费端（浏览器）没有崩溃的权利。
+ */
+export const EMPTY_USAGE: RecallUsage = {
+  status: 'miss',
+  candidates: 0,
+  injected: [],
+  matchedBy: 'none',
+  bytesUsed: 0,
+  bytesBudget: 0,
+  filteredCount: 0,
+  label: LABELS.miss,
+};
+
+/**
  * 三态判定：
  * - 有实际注入 → injected
  * - 没注入但候选里有被过滤的 → filtered（**不是 miss**，这是本设计的核心）
