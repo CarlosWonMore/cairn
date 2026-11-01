@@ -1,0 +1,27 @@
+{
+  "name": "cairn-dsh-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cairn memory for DeepSeek Harness: real-time recall, backed by the Cairn MCP server as its core",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "license": "MIT"
+}
