@@ -205,3 +205,45 @@ SELECT at, json_extract(detail,'$.policyId'), json_extract(detail,'$.batchId'),
  WHERE category = 'policy' AND action = 'auto_applied'
  ORDER BY at DESC;
 ```
+
+## 跳过是粘性的、可查的、需 redo 才重来
+
+判定某条导入条目「不采用」时，系统写一条 `item_skipped` 审计事实，而不是只在当次运行的汇总里体现。这解决了首次全量整理后的一个真实残留：533 条导入条目里 18 条晋升、其余判跳过，但控制台的「待晋升」计数降不下来——因为 `remaining` 当时只认 `item_promoted`。
+
+现在的判定口径：
+
+| 谓词 | 含义 | 用途 |
+| --- | --- | --- |
+| `item_promoted` | 确实生成了记忆 | 「已晋升」计数 |
+| `item_skipped` | 判定不采用 | 「已跳过」计数 |
+| 二者任一 | 已处理完毕 | `remaining`（待处理） |
+
+**为什么跳过不复用晋升事实**：审计只增不改，让「已晋升」同时表示「跳过」会让这个唯一谓词对所有消费方说谎，日后无法分辨哪些条目真的变成了记忆。
+
+### 查看已跳过的条目
+
+跳过的条目会退出待处理队列，但**不会从视野里消失**：
+
+```bash
+# 看某批次的进度（remaining 已不含跳过）
+cairn onboarding status --batch <batchId>
+
+# 看该批次被判跳过的条目及其依据
+cairn onboarding skipped --batch <batchId> [--limit 200]
+```
+
+控制台的导入视图同样把「已跳过」单独成列，抽屉内保留每条的状态（已晋升 / 已跳过 / 仍待处理）。
+
+### 想推翻跳过结论
+
+跳过是**粘性的**：普通重跑不会把跳过的条目重新拉回队列。要重新处理必须显式重做：
+
+```bash
+cairn onboarding auto --policy <id> --batch <batchId> --redo
+```
+
+重做只放宽选择层，**不删除**既有的跳过审计——审计只增不改，这一点与「撤销是粘的」保持一致。
+
+### 历史数据不会自动出队
+
+本机制上线后，历史上被判过 skip 但没有留下事实的条目**不会自动消失**。它们需要通过一次显式重跑产生真实判定；系统不会替它们伪造历史。

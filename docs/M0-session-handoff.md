@@ -728,3 +728,38 @@ WorkBuddy（`~/.workbuddy/mcp.json`）与 ZCode（`~/.zcode/cli/config.json`）�
 - 只在**单机单版本**（DSH 桌面端，profile=desktop）验证过形态与加载结果，没有跨 DSH 版本矩阵，故分级仍是 `fixture-only`，不标 `real-cli-tested`。
 - DSH 的 profile 未做自动发现，默认 `desktop`，可用 `--dsh-profile` 覆盖。
 - `workbuddy` 的 `blocked` 分级**未改动**：官方文档确实未公开该路径。用户环境里 `~/.workbuddy/mcp.json` 可用是环境事实，不构成翻案依据。
+
+## 12. 2026-11-01 跳过事实（add-onboarding-skip-ledger）
+
+首次全量整理收尾时暴露了一个语义缺口：533 条导入条目里 18 条晋升、其余判跳过，但控制台的「待晋升」计数**降不下来**。
+
+根因不是渲染：`remaining` 只认 `item_promoted` 一种审计事实，而系统**没有「跳过」这个事实**。判 skip 只记在当次运行的 summary 里，不落库。于是「判过跳过」= 「没判过」，条目永远留在队列里。这条路径历史上从没被真实走过，缺陷一直潜伏。
+
+### 设计取舍
+
+- **不复用 `item_promoted`**：审计只增不改，让一个动作兼表两义会让「已晋升」这个唯一谓词对消费方说谎，且污染不可逆。新增 `item_skipped`。
+- **谓词仍只有一处出处**：`promotedPredicate()` 扩展为三组——`exists`（晋升，语义不变）、`skippedExists`、`handledExists`（任一，用于「还要不要处理」）。这是项目踩过的坑：该谓词曾在 6 个文件各写一份，撤销语义就是在其中一处漏掉的。
+- **跳过是粘性的**：普通重跑不复活跳过的条目；`--redo` 才重判，且不删既有审计。
+- **出队但可查**：`remaining` 不含跳过，「已跳过」单独成列，抽屉里每条有 `handled` 状态，CLI 有 `onboarding skipped --batch`。这是用户明确要求的取舍。
+
+### 途中抓到一个潜伏 bug
+
+`handledExists` 内含**两处** `%ALIAS%` 占位符，而 `console/model.ts` 用的是 `String.replace()`——只替换第一处，残留 `%` 导致 `near "%": syntax error`，一次性打挂 11 个控制台测试。
+
+这个陷阱以前不会触发：所有谓词都只有一处占位符。改 `replaceAll` 修复，并加断言锁定「必须含两处」，防止将来有人把谓词再拼一层时重蹈。
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| 全量测试 | **649 项 / 648 通过 / 0 失败 / 1 skip**（基线 636，净增 13） |
+| 控制台测试 | 129/129 |
+| 归档 | auto-onboarding +2、local-console 改 1；主规格 9 passed / 0 failed |
+| 真实库处理 | 已晋升 18（未动）、已跳过 **470**、remaining **0**、blocked 45（未动） |
+| `activeBatchId` | `null`（「没有待整理批次」） |
+
+跳过依据分布：`project_work_context` 310 / `tool_doc_not_memory` 90 / `local_context_not_reusable` 63 / `too_short_fragment` 7。
+
+### 一个必须说清的边界
+
+design 写的是「历史不回填」，指的是**系统自动**不替历史条目伪造事实。本次那 470 条是**显式执行**的：走 `markItemSkipped` 正常 API 逐条写入，每条带依据码，审计里可查来源与理由。不是直接改库。
