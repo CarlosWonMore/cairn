@@ -139,6 +139,24 @@ describe('预算与截断', () => {
   });
 });
 
+describe('lesson 优先', () => {
+  it('预算紧张时优先保留 lesson 类型', () => {
+    const personal = store.scopes.resolvePreset('personal-global').id;
+    // 低 confidence 的 lesson vs 高 confidence 的 fact：预算只够一条时保留 lesson
+    const lesson = store.memories.add(
+      { kind: 'lesson', content: '曾经这样做错了：不该用 RmRebuild', authority: 'user_explicit', scopeId: personal, createdBy: 'test', confidence: 0.1 } as never,
+      store.identity.deviceId,
+    );
+    store.memories.add(
+      { kind: 'fact', content: '一条普通的置信度很高的事实内容', authority: 'user_explicit', scopeId: personal, createdBy: 'test', confidence: 1 } as never,
+      store.identity.deviceId,
+    );
+    const r = buildProjection(store, { scopeIds: [personal], mode: 'brief', budgetBytes: 240 });
+    assert.ok(r.text.includes('不该用 RmRebuild'), 'lesson 必须优先于高置信度 fact 保留');
+    void lesson;
+  });
+});
+
 describe('两种渲染模式', () => {
   it('brief 模式含 kind 与 id 前缀', () => {
     const r = renderProjection(

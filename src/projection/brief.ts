@@ -74,7 +74,8 @@ export function selectProjectionCandidates(
        FROM memory m
        JOIN scope s ON s.id = m.scope_id
       WHERE ${where.join(' AND ')}
-      ORDER BY m.confidence DESC, m.updated_at DESC, m.id ASC`,
+      ORDER BY CASE WHEN m.kind = 'lesson' THEN 0 ELSE 1 END ASC,
+               m.confidence DESC, m.updated_at DESC, m.id ASC`,
     ...params,
   );
 

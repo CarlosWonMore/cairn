@@ -442,3 +442,89 @@ END;
 export const MIGRATION_003_DEDUP = /* sql */ `
 CREATE INDEX IF NOT EXISTS memory_scope_content ON memory(scope_id, content_hash);
 `;
+
+/**
+ * 004：新增 lesson 记忆类型。
+ *
+ * `memory.kind` 是硬编码 CHECK，加值只能重建表。这张表被 8 个表通过外键引用、
+ * 有 FTS 触发器与 6 个索引，重建必须逐字保留全部结构。
+ *
+ * 两个已实测的坑（改这条迁移前必读）：
+ * 1. `PRAGMA foreign_keys` 在**事务内是 no-op** —— 必须在 BEGIN 之前关，故走
+ *    Migration 的 preTransactionPragma。
+ * 2. 不关外键时 `DROP TABLE memory_old` 会**级联删光子表数据**，而
+ *    `PRAGMA foreign_key_check` 仍报干净：静默丢数据，最难排查的一类失败。
+ *
+ * `legacy_alter_table=ON` 同样是必须的：默认模式下 RENAME 会把子表的外键定义
+ * 改写成 `memory_old`，重建后子表就指向了一张不存在的表。
+ */
+export const MIGRATION_004_KIND_LESSON = /* sql */ `
+PRAGMA legacy_alter_table = ON;
+
+ALTER TABLE memory RENAME TO memory_old;
+
+CREATE TABLE memory (
+  id                     TEXT PRIMARY KEY,
+  owner_id               TEXT NOT NULL,
+  kind                   TEXT NOT NULL CHECK (kind IN
+                           ('instruction','preference','fact','decision','episode','procedure','environment','lesson')),
+  content                TEXT NOT NULL,
+  normalized_content     TEXT NOT NULL,
+  scope_id               TEXT NOT NULL REFERENCES scope(id) ON DELETE RESTRICT,
+  status                 TEXT NOT NULL CHECK (status IN
+                           ('candidate','active','conflicted','superseded','archived','tombstoned')),
+  authority              TEXT NOT NULL CHECK (authority IN
+                           ('user_explicit','user_confirmed','agent_inferred','imported_unverified')),
+  confidence             REAL NOT NULL DEFAULT 0 CHECK (confidence >= 0 AND confidence <= 1),
+  source_agent           TEXT,
+  source_session_id      TEXT,
+  source_import_batch_id TEXT,
+  source_message_range   TEXT,
+  observed_at            TEXT NOT NULL,
+  valid_from             TEXT,
+  valid_to               TEXT,
+  last_verified_at       TEXT,
+  last_used_at           TEXT,
+  expires_at             TEXT,
+  sensitivity            TEXT NOT NULL DEFAULT 'normal' CHECK (sensitivity IN ('normal','sensitive','blocked')),
+  current_revision_id    TEXT REFERENCES memory_revision(id) DEFERRABLE INITIALLY DEFERRED,
+  content_hash           TEXT NOT NULL,
+  created_by             TEXT NOT NULL,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  CHECK (valid_to IS NULL OR valid_from IS NULL OR valid_to >= valid_from),
+  CHECK (kind <> 'instruction' OR authority IN ('user_explicit','user_confirmed'))
+);
+
+INSERT INTO memory SELECT * FROM memory_old;
+
+DROP TABLE memory_old;
+
+PRAGMA legacy_alter_table = OFF;
+
+-- 索引与触发器随旧表一起被 DROP，必须原样重建。
+CREATE INDEX IF NOT EXISTS memory_scope_status ON memory(scope_id, status);
+CREATE INDEX IF NOT EXISTS memory_kind_status  ON memory(kind, status);
+CREATE INDEX IF NOT EXISTS memory_expiry       ON memory(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memory_updated      ON memory(updated_at);
+CREATE INDEX IF NOT EXISTS memory_hash         ON memory(content_hash);
+CREATE INDEX IF NOT EXISTS memory_source_batch ON memory(source_import_batch_id);
+-- 003_dedup_v1 建的索引：重建表会一并丢掉，必须补回，否则去重查询退化为全表扫。
+CREATE INDEX IF NOT EXISTS memory_scope_content ON memory(scope_id, content_hash);
+
+CREATE TRIGGER memory_fts_ai AFTER INSERT ON memory BEGIN
+  INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER memory_fts_ad AFTER DELETE ON memory BEGIN
+  INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER memory_fts_au AFTER UPDATE OF content ON memory BEGIN
+  INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+-- 重建后旧表的 FTS 内容已随 DROP 清空，必须从新表重建索引。
+INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
+`;

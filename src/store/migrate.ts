@@ -1,11 +1,21 @@
 import { CairnDb } from './db.js';
-import { MIGRATION_001_CORE, MIGRATION_002_SEARCH, MIGRATION_003_DEDUP } from './schema.js';
+import { MIGRATION_001_CORE, MIGRATION_002_SEARCH, MIGRATION_003_DEDUP, MIGRATION_004_KIND_LESSON } from './schema.js';
 import { err } from '../core/errors.js';
 
 export interface Migration {
   version: number;
   name: string;
   sql: string;
+  /**
+   * 在 `BEGIN` **之前**执行的 pragma 语句。
+   *
+   * 存在的唯一原因：SQLite 的 `PRAGMA foreign_keys` 在事务内是 **no-op**。
+   * 重建被外键引用的表时必须先关掉外键，否则 `DROP TABLE` 会级联删光子表数据
+   * （实测：子表 1 行变 0 行，而 `PRAGMA foreign_key_check` 仍报干净——静默丢数据）。
+   */
+  preTransactionPragma?: string[];
+  /** 在 `COMMIT` **之后**执行的 pragma 语句（用于把 pre 的改动恢复回去）。 */
+  postTransactionPragma?: string[];
 }
 
 /** 按版本排列；version 写入 PRAGMA user_version。 */
@@ -13,6 +23,15 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: 'core_v1', sql: MIGRATION_001_CORE },
   { version: 2, name: 'search_v1', sql: MIGRATION_002_SEARCH },
   { version: 3, name: 'dedup_v1', sql: MIGRATION_003_DEDUP },
+  {
+    version: 4,
+    name: 'kind_lesson',
+    sql: MIGRATION_004_KIND_LESSON,
+    // 重建被 8 个表外键引用的 memory 表：外键必须在 BEGIN 之前关掉
+    // （事务内设置 foreign_keys 是 no-op），否则 DROP 会级联删光子表数据。
+    preTransactionPragma: ['PRAGMA foreign_keys = OFF'],
+    postTransactionPragma: ['PRAGMA foreign_keys = ON'],
+  },
 ];
 
 export interface MigrationResult {
@@ -51,6 +70,8 @@ export function runMigrations(db: CairnDb, migrations: readonly Migration[] = MI
     if (m.version <= v) continue;
     try {
       let appliedThis = false;
+      // 事务外的前置 pragma：foreign_keys 必须在 BEGIN 之前设置才生效。
+      for (const pragma of m.preTransactionPragma ?? []) db.exec(pragma);
       db.transaction(() => {
         // 持写锁后重读：并发进程可能已在本事务排队期间完成该迁移
         const current = currentVersion(db);
@@ -59,6 +80,9 @@ export function runMigrations(db: CairnDb, migrations: readonly Migration[] = MI
         setVersion(db, m.version);
         appliedThis = true;
       });
+      // 事务外的后置 pragma：把 pre 阶段改掉的设置恢复。**成功失败都要跑**，
+      // 否则一次迁移失败会让连接停在外键关闭状态，后续写入失去约束。
+      for (const pragma of m.postTransactionPragma ?? []) db.exec(pragma);
       if (appliedThis) {
         applied.push(m.version);
         v = m.version;
@@ -66,6 +90,12 @@ export function runMigrations(db: CairnDb, migrations: readonly Migration[] = MI
         v = Math.max(v, m.version);
       }
     } catch (e) {
+      // 失败路径同样恢复 pragma，再做错误包装。
+      try {
+        for (const pragma of m.postTransactionPragma ?? []) db.exec(pragma);
+      } catch {
+        // 恢复失败不掩盖原始错误：原始错误更能说明问题。
+      }
       throw err('E_MIGRATION_FAILED', `迁移 ${m.version} (${m.name}) 失败: ${(e as Error).message}`, {
         version: m.version,
         name: m.name,

@@ -12,6 +12,7 @@ export const MEMORY_KINDS = [
   'episode',
   'procedure',
   'environment',
+  'lesson',
 ] as const;
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 
