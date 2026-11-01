@@ -772,3 +772,28 @@ cairn agent apply --plan-file plan.json
 - **Copilot 与本产品并存**：GitHub Copilot 自带服务端 Copilot Memory（Repository-level facts + User-level preferences）。投影写入 `.github/copilot-instructions.md` 与它并存，两者可能给出不同说法，doctor 会提示。
 - **ZCode 暂不支持投影**：它虽是已接入的 MCP 宿主，但从来不是 `AgentKind` 的受支持项。其 `MEMORY.md` 约定为**索引**（每行一条、不放正文），若将来支持需按 index 模式单独实现。
 - **WorkBuddy 用户级文件未处理**：`~/.workbuddy/MEMORY.md`（4 KB 上限）与项目级是两个文件，本次只处理项目级。
+
+## lesson：记录「曾经错了、别再犯」
+
+记忆类型新增 `lesson`，用于记录**被纠正过的认知**。与相邻类型的判据：
+
+| 类型 | 回答什么 | 例子 |
+| --- | --- | --- |
+| `procedure` | 该怎么做 | 「交付物用 os.makedirs + shutil.copy2 复刻层级」 |
+| `fact` | 是什么 | 「本机 `~/.local/bin/env` 不是 env(1)」 |
+| **`lesson`** | **曾经这样做是错的，为什么错** | 「曾用 zip 打包交付物，现场打不开——中文名 + 超长 JIRA 概要会被工具处理坏，改用文件夹」 |
+
+判据不清楚时会退化：把一般做法标成 lesson，或把真实教训塞进 procedure，都会让检索和投影失去区分度。
+
+### 投影优先级
+
+`lesson` 在投影简报中**优先占用预算**——它承载「别再犯」，最需要在会话开场被看到。排序为 `lesson → confidence → updated_at → id`。
+
+### 迁移说明
+
+`kind` 是硬编码 CHECK 约束，加值需重建 `memory` 表（迁移 004）。该表被 8 个表外键引用、有 FTS 触发器与 7 个索引，重建有两个坑：
+
+1. **事务内 `PRAGMA foreign_keys=OFF` 无效**（SQLite 明确是 no-op），必须在 `BEGIN` 之前关；
+2. **不关外键时 `DROP TABLE` 会静默级联删光子表数据**，而 `foreign_key_check` 仍报干净。
+
+迁移框架因此支持 `preTransactionPragma` / `postTransactionPragma`。回滚只能从备份恢复（`cairn backup`）。
