@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import defaultExport, { apply, extractStepText, extractText, inject, name } from '../src/index.js';
+import defaultExport, { apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
 
 /** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中。 */
 function makeSpyCtx() {
@@ -143,7 +143,8 @@ describe('插件形状（踩过三次的坑）', () => {
       agent: { inject: (m: unknown) => injected.push(m) },
       messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
     }, () => {});
-    assert.deepEqual(queries, ['投影预算是多少'], '召回必须拿到用户原文');
+    assert.ok(queries.includes('投影预算是多少'), '召回必须拿到用户原文（整句路）');
+    assert.ok(queries.length > 1, '长句会派生多路短查询（2-gram 等）');
     assert.equal(injected.length, 1, '命中后必须注入');
   });
 
@@ -156,7 +157,7 @@ describe('插件形状（踩过三次的坑）', () => {
     // 旧实现读 evt.message——真实形状是 evt.data，这就是「面板永远未命中」的根因
     onEvent({ type: 'user/message', data: { content: [{ type: 'text', text: '库入口在哪' }], source: { kind: 'user' } } });
     await preStep({ agent: { inject: (m: unknown) => injected.push(m) } }, () => {});
-    assert.deepEqual(queries, ['库入口在哪'], 'session/event 兜底必须把用户原文带进召回');
+    assert.ok(queries.includes('库入口在哪'), 'session/event 兜底必须把用户原文带进召回');
     assert.equal(injected.length, 1);
   });
 
@@ -179,5 +180,52 @@ describe('插件形状（踩过三次的坑）', () => {
     assert.equal(extractStepText({ messages: [{ role: 'assistant', content: '不该取' }, { role: 'user', content: [{ type: 'text', text: '取这条' }] }] }), '取这条');
     assert.equal(extractStepText(null), '');
     assert.equal(extractStepText({ messages: '不是数组' }), '');
+  });
+
+  describe('deriveQueries：整句查询在 FTS trigram 下恒 0 的补救（2026-11-02）', () => {
+    it('高频 CJK 2-gram 优先入选（LIKE 通道，整句无标点时最可靠）', () => {
+      const qs = deriveQueries('帮我从记忆库里拉取一下记忆');
+      assert.equal(qs[0], '记忆', `实际 ${JSON.stringify(qs)}`);
+      assert.ok(qs.every((q) => q.length <= 24), '所有查询都应是短词');
+    });
+    it('标点短句入选且各取前 8 字', () => {
+      const qs = deriveQueries('投影预算是多少？另外，库入口在哪。');
+      assert.ok(qs.includes('投影预算是多少'), JSON.stringify(qs));
+      assert.ok(qs.includes('库入口在哪'), JSON.stringify(qs));
+    });
+    it('去重、上限 6、空串不入选', () => {
+      const qs = deriveQueries('记忆。记忆！记忆？');
+      assert.equal(new Set(qs).size, qs.length, '必须去重');
+      assert.ok(qs.length <= 6);
+      assert.ok(qs.includes('记忆'), JSON.stringify(qs));
+    });
+    it('ASCII 词入选', () => {
+      const qs = deriveQueries('检查exfiltrate正则');
+      assert.ok(qs.includes('exfiltrate'), JSON.stringify(qs));
+    });
+    it('多路查询去重合并命中（2-gram 路命中即注入）', async () => {
+      const seen: string[] = [];
+      const ctx = {
+        tools: {
+          call: async (_n: string, args: { query: string }) => {
+            seen.push(args.query);
+            if (args.query !== '记忆') return { content: [{ text: '{"items":[]}' }] };
+            return { content: [{ text: JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] }) }] };
+          },
+        },
+        on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
+      };
+      apply(ctx, {});
+      const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+        (p: unknown, n?: () => unknown) => Promise<unknown>;
+      const injected: unknown[] = [];
+      await preStep({
+        agent: { inject: (m: unknown) => injected.push(m) },
+        messages: [{ role: 'user', content: [{ type: 'text', text: '帮我从记忆库里拉取一下记忆' }] }],
+      }, () => {});
+      assert.ok(seen.length > 1, '应有多个查询路');
+      assert.ok(seen.includes('记忆'));
+      assert.equal(injected.length, 1, '2-gram 路命中后必须注入');
+    });
   });
 });

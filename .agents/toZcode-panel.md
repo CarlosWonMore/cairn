@@ -296,3 +296,26 @@ Uncaught 堆栈显示 `slots.inject` 的回调是在**后续的全局 reconcile 
 ### 验证
 - 插件单测 35/35；`tsc` 净（dist 已重建，含新代码）；`node --check` 净。
 - 待用户重启 DSH：① 会话顶部应出现「记忆」tab（与轨迹并列）；② 发一条消息后 tab 内数据应从 0 变化（`usage?debug=1` 可由 ZCode 直接 curl 验证链路）。
+
+---
+
+## ZCode 排查结果（2026-11-02，Round-8：tab 已确认，修召回查询构造）
+
+### 用户反馈
+「记忆」tab 出现了 ✓；但从记忆库拉取记忆时 tab 无内容，问是否验证方式不对。
+
+### debug 端点实锤（ZCode 直接 curl，端口 2829）
+`matchedBy: fts`（非兜底 none）→ **召回链路已通**：hook 挂上、MCP memory_search 调用成功、lastUsage 已写入；但 `lastPreStep.messageLen:0/reason:empty_message`（最后一步是空载荷步，如子代理步）且唯一的带正文步查询返回 0 条。另：`lastEventType:'?'` → session/event 对 include-fiber **从未送达**（fallback 死路，主来源 payload.messages 不受影响；已加 `lastEventCount` 便于后续确认）。
+
+### 根因 B（有效性）：整句查询在 FTS5 trigram 下恒 0
+cairn 检索分词只按标点切 CJK 段（≥3 字整段进 FTS 短语＝要求整段子串命中；2 字走有界 LIKE）。无标点自然语言长句＝一个长段 → 必然 0 条。用户手动拉取（agent 显式调工具）用了关键词所以能命中——**两条路的差异是设计如此，但自动路的查询构造确实要修**。
+
+### 修改
+- `src/index.ts` 新增导出 `deriveQueries(message)`：消息 → 短查询组，按命中可靠性排序——CJK 高频 2-gram（top2，LIKE 通道）→ ASCII 词（top2）→ 标点短句（前 8 字）→ 整句前 24 字；去重、上限 6。`makeToolRecall` 多路查询按 id 去重合并、够 topK 提前停。
+- diag 加 `lastEventCount`（区分「事件从未送达」vs「送达但无 type」）。
+- 回归 +5（35→40）：2-gram 优先、标点短句、去重上限、ASCII 词、多路合并注入。
+
+### 正确的验证方式（给用户）
+- 面板只统计**自动召回**（每轮对话前注入）；agent 显式调 Cairn 工具的记录在「轨迹」，不计入面板——设计如此。
+- 验证自动召回：正常聊天（如「投影预算是多少」），无需让 agent 去拉记忆；tab 应显示 召回条数>0 → 已注入/已过滤。
+- 插件单测 40/40；tsc 净；dist 已重建。待重启复验。

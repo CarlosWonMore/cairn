@@ -97,18 +97,77 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
   };
 }
 
+/**
+ * 把一句自然语言消息拆成一组**短查询**。
+ *
+ * 2026-11-02 实测教训：整句直接当查询词，FTS5 trigram 要求整段子串命中，
+ * 候选恒 0。cairn 检索的分词只按标点切连续 CJK 段（≥3 字整段进 FTS 短语、
+ * 2 字走有界 LIKE），所以这里在插件侧补上「消息 → 查询组」的构造，按命中
+ * 可靠性排序：CJK 2-gram（top2，走 LIKE 通道，最可靠）→ ASCII 词（top2）→
+ * 标点短句（各取前 8 字，FTS 短语）→ 整句前 24 字（用户引用原文时兜底）。
+ * 去重、上限 max（默认 6）条——多几路查询对本地 SQLite 是微秒级开销。
+ */
+export function deriveQueries(message: string, max = 6): string[] {
+  const out: string[] = [];
+  const push = (q: string | undefined): void => {
+    const t = (q ?? '').trim();
+    if (t.length >= 2 && out.length < max && !out.includes(t)) out.push(t);
+  };
+
+  const clean = message.replace(/[^\u4e00-\u9fffA-Za-z0-9]+/g, '');
+  const cjkGrams = new Map<string, number>();
+  for (let i = 0; i + 2 <= clean.length; i++) {
+    const g = clean.slice(i, i + 2);
+    if (/^[\u4e00-\u9fff]{2}$/.test(g)) cjkGrams.set(g, (cjkGrams.get(g) ?? 0) + 1);
+  }
+  [...cjkGrams.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .forEach(([g]) => push(g));
+
+  const asciiWords = new Map<string, number>();
+  for (const w of message.match(/[A-Za-z0-9]{3,}/g) ?? []) asciiWords.set(w, (asciiWords.get(w) ?? 0) + 1);
+  [...asciiWords.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .forEach(([w]) => push(w));
+
+  for (const clause of message.split(/[，。！？!?；;、,.\n\r\t\s]+/)) {
+    push(clause.slice(0, 8));
+  }
+  push(message.slice(0, 24));
+  return out;
+}
+
 /** 从 ctx.tools 取 Cairn 检索能力的适配器；拿不到就返回 null（降级）。 */
 function makeToolRecall(ctx: unknown): RecallFn | null {
   const tools = (ctx as { tools?: { call?: Function } } | undefined)?.tools;
   if (!tools || typeof tools.call !== 'function') return null;
-  return async (query: string, topK: number) => {
-    const res = await tools.call!('mcp__cairn__memory_search', { query, limit: topK });
-    // MCP 返回形如 { content: [{ type, text }] }，正文是 JSON 字符串。
-    const text = Array.isArray((res as { content?: unknown[] })?.content)
-      ? ((res as { content: { text?: string }[] }).content[0] ?? {}).text ?? ''
-      : '';
-    const parsed = text ? (JSON.parse(text) as { items?: RecallHit[] }) : {};
-    return Array.isArray(parsed.items) ? parsed.items : [];
+  return async (message: string, topK: number) => {
+    const seen = new Set<string>();
+    const merged: RecallHit[] = [];
+    for (const query of deriveQueries(message)) {
+      const res = await tools.call!('mcp__cairn__memory_search', { query, limit: topK });
+      // MCP 返回形如 { content: [{ type, text }] }，正文是 JSON 字符串。
+      const text = Array.isArray((res as { content?: unknown[] })?.content)
+        ? ((res as { content: { text?: string }[] }).content[0] ?? {}).text ?? ''
+        : '';
+      let items: RecallHit[] = [];
+      try {
+        const parsed = text ? (JSON.parse(text) as { items?: RecallHit[] }) : {};
+        items = Array.isArray(parsed.items) ? parsed.items : [];
+      } catch {
+        /* 正文不是 JSON（异常响应）：本路 0 条 */
+      }
+      for (const hit of items) {
+        if (hit?.id && !seen.has(hit.id)) {
+          seen.add(hit.id);
+          merged.push(hit);
+        }
+      }
+      if (merged.length >= topK) break;
+    }
+    return merged.slice(0, topK);
   };
 }
 
@@ -198,6 +257,8 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   // 事件形状不符 / 召回失败」——本轮排查就是靠它才能不靠用户来回试。
   const diag = {
     lastEventType: '' as string,
+    /** session/event 到达总数：0 = 事件根本没送达（fallback 失效的判据）。 */
+    lastEventCount: 0,
     lastCapture: { captured: false, textLen: 0, sourceKind: '' },
     lastPreStep: { fired: false, messageLen: 0, reason: '', selected: 0, injected: false },
   };
@@ -271,7 +332,8 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       'session/event',
       (evt: { type?: string; data?: { content?: unknown; source?: { kind?: string } }; message?: { content?: { text?: string }[] } }) => {
         try {
-          diag.lastEventType = evt?.type ?? '?';
+          diag.lastEventCount += 1;
+          diag.lastEventType = evt?.type ?? '(no type)';
           if (evt?.type !== 'user/message') return;
           // 真实宿主形状：消息体在 evt.data（含 source.kind）。只认真实用户输入，
           // agent-instructions 之类的 user-role 注入不驱动召回。
