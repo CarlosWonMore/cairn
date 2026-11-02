@@ -147,18 +147,40 @@ export function deriveQueries(message: string, max = 6): string[] {
   return out;
 }
 
-/** 从 ctx.tools 取 Cairn 检索能力的适配器；拿不到就返回 null（降级）。 */
+/**
+ * 从 ctx.tools 取 Cairn 检索能力。
+ *
+ * **2026-11-02 实测纠正**：`ctx.tools.call(name, args)` 不存在（宿主里 `tools.call(` 零出现，
+ * 运行时内省 `callType: "undefined"`）。tools 服务的原型方法只有 register/restrict/guard/
+ * view/get/resolveExecution 等「注册与管控」接口。
+ *
+ * 真正的执行入口在**工具定义**上：`tools.get(name, scope)` → `definition.call(args, execution)`。
+ * dsh-ops 也这么用（`tools.get(OFFICIAL_REPLACEMENTS[tool], agent)`）。
+ */
 function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
-  const tools = (ctx as { tools?: { call?: Function } } | undefined)?.tools;
-  if (!tools || typeof tools.call !== 'function') return null;
+  const tools = (ctx as {
+    tools?: {
+      get?: (name: string, scope?: unknown) => { call?: (args: unknown, exec: unknown) => Promise<unknown> } | undefined;
+    };
+  } | undefined)?.tools;
+  if (!tools || typeof tools.get !== 'function') return null;
+
   return async (message: string, topK: number) => {
     const seen = new Set<string>();
     const merged: RecallHit[] = [];
     for (const query of deriveQueries(message)) {
-      // 自己发起的 memory_search 调用要压住工具留痕，避免每步重复记两条
       onOwnCall?.();
-      const res = await tools.call!('mcp__cairn__memory_search', { query, limit: topK });
-      // MCP 返回形如 { content: [{ type, text }] }，正文是 JSON 字符串。
+      const def = tools.get!('mcp__cairn__memory_search');
+      if (typeof def?.call !== 'function') return [];
+      // execution 参数：宿主 executor 传的是执行上下文（含 signal）。
+      // 这里只需最小可辨识形状；缺 signal 时工具多半不读它，实测为准。
+      const exec = { signal: new AbortController().signal };
+      let res: unknown;
+      try {
+        res = await def.call({ query, limit: topK }, exec);
+      } catch {
+        continue; // 单路查询失败不影响其它路
+      }
       const text = Array.isArray((res as { content?: unknown[] })?.content)
         ? ((res as { content: { text?: string }[] }).content[0] ?? {}).text ?? ''
         : '';
@@ -167,7 +189,7 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
         const parsed = text ? (JSON.parse(text) as { items?: RecallHit[] }) : {};
         items = Array.isArray(parsed.items) ? parsed.items : [];
       } catch {
-        /* 正文不是 JSON（异常响应）：本路 0 条 */
+        /* 非 JSON 响应：本路 0 条 */
       }
       for (const hit of items) {
         if (hit?.id && !seen.has(hit.id)) {
@@ -180,7 +202,6 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
     return merged.slice(0, topK);
   };
 }
-
 /**
  * 从消息 content 字段提取纯文本。
  *

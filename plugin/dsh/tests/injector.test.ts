@@ -22,15 +22,18 @@ function makeSpyCtx() {
   const injected: unknown[] = [];
   const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
   const ctx = {
+    // 真实形状：tools.get(name) → definition.call(args, exec)。
     tools: {
-      call: async (_name: string, args: { query: string }) => {
-        queries.push(args.query);
-        return {
-          content: [{
-            text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
-          }],
-        };
-      },
+      get: () => ({
+        call: async (args: { query: string }) => {
+          queries.push(args.query);
+          return {
+            content: [{
+              text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
+            }],
+          };
+        },
+      }),
     },
     webServer: { register: (o: unknown) => routes.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
     on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
@@ -256,13 +259,17 @@ describe('插件形状（踩过三次的坑）', () => {
     });
     it('多路查询去重合并命中（2-gram 路命中即注入）', async () => {
       const seen: string[] = [];
+      // 真实形状：tools.get(name) → definition.call(args, exec)。
+      // `tools.call` 不存在（2026-11-02 运行时内省 callType=undefined）。
       const ctx = {
         tools: {
-          call: async (_n: string, args: { query: string }) => {
-            seen.push(args.query);
-            if (args.query !== '记忆') return { content: [{ text: '{"items":[]}' }] };
-            return { content: [{ text: JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] }) }] };
-          },
+          get: () => ({
+            call: async (args: { query: string }) => {
+              seen.push(args.query);
+              if (args.query !== '记忆') return { content: [{ text: '{"items":[]}' }] };
+              return { content: [{ text: JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] }) }] };
+            },
+          }),
         },
         on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
       };
