@@ -10,6 +10,8 @@
  * 2. `agent/pre-step` 的真实签名是 `(payload, next)`，payload 含 { agent, signal }，
  *    且**必须 return next()** —— 不调用 next 会卡住整条链路。
  * 3. 调 MCP 工具需要 `inject: ['tools']`，工具名形如 mcp__cairn__memory_search。
+ *    调用入口是 `ctx.tools.execute({ callId, name, arguments, signal, agent })`；
+ *    工具定义上的方法是 `execute(args, exec)`。**没有 `tools.call`，也没有 `definition.call`**。
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -148,65 +150,149 @@ export function deriveQueries(message: string, max = 6): string[] {
   return out;
 }
 
-/** 召回链路诊断：记录 tools.get / definition.call 每一步的失败原因。 */
+/** 召回链路诊断：记录 tools.get / tools.execute / definition.execute 每一步的失败原因。 */
 export const recallDiag: {
   hasTools: boolean;
   hasGet: boolean;
+  hasExecute: boolean;
   defFound: boolean;
-  callType: string;
+  /** 定义上真实可用的执行方法类型；dsh 的 ToolDefinition 用 `execute`，没有 `call`。 */
+  executeType: string;
+  /** 最近一次成功走通的路径：`tools.execute` 或 `definition.execute`。 */
+  execPath: string;
   lastError?: string;
-  lastRawType?: string;
+  lastTextLen: number;
   attempts: number;
-} = { hasTools: false, hasGet: false, defFound: false, callType: 'unknown', attempts: 0 };
+} = {
+  hasTools: false,
+  hasGet: false,
+  hasExecute: false,
+  defFound: false,
+  executeType: 'unknown',
+  execPath: '',
+  lastTextLen: 0,
+  attempts: 0,
+};
+
+/** Cairn 检索工具的公开名（dsh-mcp-client 命名契约：mcp__<server>__<raw>）。 */
+const RECALL_TOOL = 'mcp__cairn__memory_search';
+/** 召回卡在 pre-step 里，必须有上限：一次挂起的 MCP 调用不能拖死整轮。 */
+const RECALL_TIMEOUT_MS = 3000;
+
+/** dsh-tools 的 ToolDefinition：执行方法是 execute(args, exec)，**没有 call**。 */
+type ToolDefinitionLike = { execute?: (args: unknown, exec: unknown) => Promise<unknown> };
+
+/** ContentBlock[] → 纯文本（非 text 块忽略）。 */
+function blocksText(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return '';
+  return blocks
+    .map((b) => (typeof (b as { text?: unknown })?.text === 'string' ? (b as { text: string }).text : ''))
+    .join('');
+}
+
+/**
+ * 归一两条调用路径的返回值。
+ *
+ * - tools.execute → ToolExecutionResult：`{ content, value, isError }`（content 是渲染块）
+ * - definition.execute → 工具自报的原始值：MCP 桥是 `{ content, structuredContent }`
+ *
+ * 两者都能从 content 取到文本；value.content 只是 MCP 桥的另一种摆法。
+ */
+function resultText(res: unknown): string {
+  if (!res || typeof res !== 'object') return '';
+  const r = res as { content?: unknown; value?: unknown };
+  return blocksText(r.content) || blocksText((r.value as { content?: unknown } | undefined)?.content);
+}
+
+function isErrorResult(res: unknown): boolean {
+  return !!res && typeof res === 'object' && (res as { isError?: unknown }).isError === true;
+}
+
+function errorText(res: unknown): string {
+  const err = (res as { error?: { message?: unknown } } | undefined)?.error?.message;
+  return typeof err === 'string' ? err : resultText(res) || 'unknown error';
+}
 
 /**
  * 从 ctx.tools 取 Cairn 检索能力。
  *
- * **2026-11-02 实测纠正**：`ctx.tools.call(name, args)` 不存在（宿主里 `tools.call(` 零出现，
- * 运行时内省 `callType: "undefined"`）。tools 服务的原型方法只有 register/restrict/guard/
- * view/get/resolveExecution 等「注册与管控」接口。
+ * **权威契约（2026-11-02，取自 app.asar 内 @deepseek-ai/dsh-tools 的 api-catalog 与源码）**：
  *
- * 真正的执行入口在**工具定义**上：`tools.get(name, scope)` → `definition.call(args, execution)`。
- * dsh-ops 也这么用（`tools.get(OFFICIAL_REPLACEMENTS[tool], agent)`）。
+ * - `ToolRuntime`（= `ctx.tools`）公开方法含 `get(name, scope)` 与
+ *   `execute(exec: ToolExecutionInput): Promise<ToolExecutionResult>`；
+ *   `ToolExecutionInput = { callId, name, arguments, signal, agent?, rootCallId?, parent?, schema? }`。
+ * - 工具定义上的执行方法是 `execute(args, exec)`，**不是 `call`**——前八轮全卡在找 `call`。
+ * - `tools.call(name, args)` 从不存在；`resolveExecution` 是 executor 内部用的可见性判定，不是调用入口。
+ *
+ * 优先走 `tools.execute`（过 pre-execute 策略/守卫/超时包装，返回已物化结果）；
+ * 它在 ptc 呈现模式下会把「非 run_code 的直呼」折叠成 UNKNOWN_TOOL，那时退回
+ * 直调定义体——插件是宿主侧调用方，不是模型发起的直呼。
  */
 function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
   const tools = (ctx as {
     tools?: {
-      get?: (name: string, scope?: unknown) => { call?: (args: unknown, exec: unknown) => Promise<unknown> } | undefined;
+      get?: (name: string, scope?: unknown) => ToolDefinitionLike | undefined;
+      execute?: (input: {
+        callId: string;
+        name: string;
+        arguments: unknown;
+        agent?: unknown;
+        signal: AbortSignal;
+      }) => Promise<unknown>;
     };
   } | undefined)?.tools;
   recallDiag.hasTools = !!tools;
   recallDiag.hasGet = typeof tools?.get === 'function';
+  recallDiag.hasExecute = typeof tools?.execute === 'function';
   if (!tools || typeof tools.get !== 'function') return null;
+
+  let seq = 0;
+
+  /** 一次检索调用 → 文本；两条路径都失败时返回空串并把原因留在诊断里。 */
+  const searchOnce = async (def: ToolDefinitionLike, args: { query: string; limit: number }, scope: unknown): Promise<string> => {
+    if (typeof tools.execute === 'function') {
+      try {
+        const res = await tools.execute({
+          callId: `cairn-recall-${++seq}`,
+          name: RECALL_TOOL,
+          arguments: args,
+          ...(scope === undefined ? {} : { agent: scope }),
+          signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
+        });
+        if (!isErrorResult(res)) {
+          recallDiag.execPath = 'tools.execute';
+          return resultText(res);
+        }
+        recallDiag.lastError = errorText(res);
+      } catch (e) {
+        recallDiag.lastError = (e as Error).message;
+      }
+    }
+    if (typeof def.execute !== 'function') return '';
+    try {
+      const res = await def.execute(args, { signal: AbortSignal.timeout(RECALL_TIMEOUT_MS) });
+      recallDiag.execPath = 'definition.execute';
+      return resultText(res);
+    } catch (e) {
+      recallDiag.lastError = (e as Error).message;
+      return '';
+    }
+  };
 
   return async (message: string, topK: number, scope?: unknown) => {
     const seen = new Set<string>();
     const merged: RecallHit[] = [];
     for (const query of deriveQueries(message)) {
       onOwnCall?.();
-      // 必须带 scope：dsh-ops 一律 tools.get(name, agent)，不带会取不到可见层里的定义。
-      const def = tools.get!('mcp__cairn__memory_search', scope);
+      // 必须带 scope：可见层按 agent 解析，不带只会看全局层。
+      const def = tools.get!(RECALL_TOOL, scope);
       recallDiag.defFound = !!def;
-      recallDiag.callType = typeof def?.call;
+      recallDiag.executeType = typeof def?.execute;
       recallDiag.attempts += 1;
-      if (typeof def?.call !== 'function') return [];
-      // execution 参数：宿主 executor 传的是执行上下文（含 signal）。
-      // 这里只需最小可辨识形状；缺 signal 时工具多半不读它，实测为准。
-      const exec = { signal: new AbortController().signal };
-      let res: unknown;
-      try {
-        res = await def.call({ query, limit: topK }, exec);
-      } catch (e) {
-        // 不再静默：把首个异常记进诊断，否则"召回恒 0"无法区分是查询没命中还是调用直接失败。
-        if (!recallDiag.lastError) recallDiag.lastError = (e as Error).message;
-        continue;
-      }
-      if (!recallDiag.lastRawType && res !== undefined) {
-        recallDiag.lastRawType = res === null ? 'null' : typeof res;
-      }
-      const text = Array.isArray((res as { content?: unknown[] })?.content)
-        ? ((res as { content: { text?: string }[] }).content[0] ?? {}).text ?? ''
-        : '';
+      // 单路取不到定义不终止整轮：其余查询路仍可能命中。
+      if (!def) continue;
+      const text = await searchOnce(def, { query, limit: topK }, scope);
+      if (text.length > 0) recallDiag.lastTextLen = text.length;
       let items: RecallHit[] = [];
       try {
         const parsed = text ? (JSON.parse(text) as { items?: RecallHit[] }) : {};

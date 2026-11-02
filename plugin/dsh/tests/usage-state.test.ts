@@ -129,3 +129,22 @@ describe('EMPTY_USAGE：对外兜底形状必须字段完备', () => {
     assert.ok(EMPTY_USAGE.label.length > 0);
   });
 });
+describe('frontmatter 摘要（2026-11-02 实测缺陷）', () => {
+  it('以 --- 开头的记忆取 name 作摘要，不显示横线', () => {
+    const s2 = toSummary('---\nname: 投影预算分级\ndescription: 说明\ntype: reference\n---\n正文');
+    assert.equal(s2, '投影预算分级');
+    assert.notEqual(s2, '---', 'frontmatter 分隔符不能当成摘要');
+  });
+
+  it('无 name 时退回 description', () => {
+    assert.equal(toSummary('---\ndescription: 只有描述\ntype: fact\n---\n正文'), '只有描述');
+  });
+
+  it('无 frontmatter 时取首个正文行', () => {
+    assert.equal(toSummary('正常第一行\n第二行'), '正常第一行');
+  });
+
+  it('空 frontmatter 跳过横线继续找正文', () => {
+    assert.equal(toSummary('---\n---\n真正的正文'), '真正的正文');
+  });
+});

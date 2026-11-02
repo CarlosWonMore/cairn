@@ -22,18 +22,21 @@ function makeSpyCtx() {
   const injected: unknown[] = [];
   const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
   const ctx = {
-    // 真实形状：tools.get(name) → definition.call(args, exec)。
+    // 真实形状：ctx.tools.execute({ callId, name, arguments, signal, agent }) → ToolExecutionResult；
+    // 工具定义上的方法是 execute(args, exec)，没有 call。
     tools: {
-      get: () => ({
-        call: async (args: { query: string }) => {
-          queries.push(args.query);
-          return {
-            content: [{
-              text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
-            }],
-          };
-        },
-      }),
+      get: () => ({ execute: async () => ({ content: [] }) }),
+      execute: async (input: { arguments: { query: string } }) => {
+        queries.push(input.arguments.query);
+        return {
+          isError: false,
+          value: {},
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
+          }],
+        };
+      },
     },
     webServer: { register: (o: unknown) => routes.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
     on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
@@ -257,19 +260,30 @@ describe('插件形状（踩过三次的坑）', () => {
       const qs = deriveQueries('检查exfiltrate正则');
       assert.ok(qs.includes('exfiltrate'), JSON.stringify(qs));
     });
-    it('多路查询去重合并命中（2-gram 路命中即注入）', async () => {
+    it('多路查询去重合并命中（走 tools.execute，2-gram 路命中即注入）', async () => {
       const seen: string[] = [];
-      // 真实形状：tools.get(name) → definition.call(args, exec)。
-      // `tools.call` 不存在（2026-11-02 运行时内省 callType=undefined）。
+      // 权威契约（app.asar 内 @deepseek-ai/dsh-tools 的 api-catalog / 源码）：
+      //   ctx.tools.execute({ callId, name, arguments, signal, agent }) → ToolExecutionResult
+      //   ToolDefinition 的执行方法是 execute(args, exec)；没有 tools.call，也没有 definition.call。
       const ctx = {
         tools: {
-          get: () => ({
-            call: async (args: { query: string }) => {
-              seen.push(args.query);
-              if (args.query !== '记忆') return { content: [{ text: '{"items":[]}' }] };
-              return { content: [{ text: JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] }) }] };
-            },
-          }),
+          get: () => ({ execute: async () => ({ content: [{ type: 'text', text: '{"items":[]}' }] }) }),
+          execute: async (input: { name: string; arguments: { query: string } }) => {
+            seen.push(input.arguments.query);
+            return {
+              isError: false,
+              value: {},
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    input.arguments.query === '记忆'
+                      ? JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] })
+                      : '{"items":[]}',
+                },
+              ],
+            };
+          },
         },
         on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
       };
@@ -284,6 +298,46 @@ describe('插件形状（踩过三次的坑）', () => {
       assert.ok(seen.length > 1, '应有多个查询路');
       assert.ok(seen.includes('记忆'));
       assert.equal(injected.length, 1, '2-gram 路命中后必须注入');
+    });
+
+    it('tools.execute 被 ptc 折叠拒绝时退回 definition.execute（仍能召回）', async () => {
+      const direct: string[] = [];
+      const ctx = {
+        tools: {
+          get: () => ({
+            execute: async (args: { query: string }) => {
+              direct.push(args.query);
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text:
+                      args.query === '记忆'
+                        ? JSON.stringify({ items: [{ id: 'm10', kind: 'fact', content: '记忆跨设备统一走 Cairn' }] })
+                        : '{"items":[]}',
+                  },
+                ],
+              };
+            },
+          }),
+          execute: async () => ({
+            isError: true,
+            error: { message: 'only `run_code` is callable directly — call `mcp__cairn__memory_search` from inside a `run_code` program instead' },
+            content: [{ type: 'text', text: 'Error: only run_code is callable directly' }],
+          }),
+        },
+        on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
+      };
+      apply(ctx, {});
+      const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+        (p: unknown, n?: () => unknown) => Promise<unknown>;
+      const injected: unknown[] = [];
+      await preStep({
+        agent: { inject: (m: unknown) => injected.push(m) },
+        messages: [{ role: 'user', content: [{ type: 'text', text: '帮我从记忆库里拉取一下记忆' }] }],
+      }, () => {});
+      assert.ok(direct.includes('记忆'), '折叠后必须退回定义体直调');
+      assert.equal(injected.length, 1, '退回路径也必须注入');
     });
   });
 });

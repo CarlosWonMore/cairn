@@ -34,11 +34,36 @@ export interface RecallUsage {
 
 const SUMMARY_MAX = 60;
 
+/**
+ * 取正文的「第一段有意义的内容」。
+ *
+ * 2026-11-02 实测缺陷：不少记忆以 YAML frontmatter 开头（`---\nname: ...`），
+ * 直接取首个非空行只会得到 `---`，面板上 4 条摘要全是横线。
+ * 这里跳过分隔线与 frontmatter 的 `key: value` 行，优先用 `name:` / `description:`
+ * 的值作摘要；都没有才退回首个真正的正文行。
+ */
 function firstLine(s: string): string {
-  const line = s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
-  return line.trim();
+  const lines = s.split(/\r?\n/).map((l) => l.trim());
+  const isSeparator = (l: string): boolean => l === '---' || l === '***' || l === '...';
+  const field = (key: string): string => {
+    const re = new RegExp('^' + key + '\\s*:\\s*(.+)$');
+    for (const l of lines) {
+      const m = re.exec(l);
+      if (m && m[1]) return m[1].trim().replace(/^["']|["']$/g, '');
+    }
+    return '';
+  };
+  const named = field('name');
+  if (named) return named;
+  const described = field('description');
+  if (described) return described;
+  for (const l of lines) {
+    if (!l || isSeparator(l)) continue;
+    if (/^[A-Za-z_][\w-]*\s*:/.test(l)) continue;
+    return l;
+  }
+  return '';
 }
-
 export function toSummary(content: string, max = SUMMARY_MAX): string {
   const line = firstLine(content);
   return line.length <= max ? line : line.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
