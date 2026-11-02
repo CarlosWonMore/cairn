@@ -73,6 +73,15 @@ export interface RenderResult {
   selected: number;
   truncated: number;
   bytes: number;
+  /**
+   * 实际进入文本的命中 id，按渲染顺序。
+   *
+   * 2026-11-02 教训：调用方曾用 `text.includes(toSummary(content))` 反推，
+   * 但渲染截断到 160 字符、摘要截断到 60 字符，长内容必然匹配失败，
+   * 于是 candidates>0 却 injected=[]，状态被误判为 miss。
+   * 渲染函数自己知道放进去了哪些，就别让调用方猜。
+   */
+  includedIds: string[];
 }
 
 /**
@@ -90,7 +99,7 @@ export function renderInjection(
   }
   const seen = opts.alreadyInjected ?? new Set<string>();
   const fresh = hits.filter((h) => !seen.has(h.id));
-  if (fresh.length === 0) return { text: '', selected: 0, truncated: 0, bytes: 0 };
+  if (fresh.length === 0) return { text: '', selected: 0, truncated: 0, bytes: 0, includedIds: [] };
 
   const header = '以下记忆可能相关，仅供参照：';
   // 预留省略提示的字节（最坏情况按条数估）
@@ -98,6 +107,7 @@ export function renderInjection(
   const maxNotice = noticeBytes(fresh.length);
 
   const lines: string[] = [];
+  const includedIds: string[] = [];
   let used = Buffer.byteLength(header, 'utf8') + 1;
   let truncated = 0;
 
@@ -110,6 +120,7 @@ export function renderInjection(
       break;
     }
     lines.push(line);
+    includedIds.push(h.id);
     used += lineBytes;
   }
 
@@ -126,9 +137,10 @@ export function renderInjection(
   const text = [header, ...lines].join('\n');
   return {
     text,
-    selected: lines.length - (truncated > 0 && lines.length > 0 && lines[lines.length - 1]!.startsWith('…') ? 1 : 0),
+    selected: includedIds.length,
     truncated,
     bytes: Buffer.byteLength(text, 'utf8'),
+    includedIds,
   };
 }
 

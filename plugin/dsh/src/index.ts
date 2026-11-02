@@ -14,6 +14,7 @@
  *    工具定义上的方法是 `execute(args, exec)`。**没有 `tools.call`，也没有 `definition.call`**。
  */
 
+import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +25,7 @@ import {
   shouldInject,
   type RecallHit,
 } from './recall.js';
-import { buildUsage, EMPTY_USAGE, toSummary, type RecallUsage } from './usage-state.js';
+import { buildUsage, EMPTY_USAGE, type RecallUsage } from './usage-state.js';
 
 export interface PluginConfig {
   enabled?: boolean;
@@ -77,11 +78,11 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     });
 
     // 记录本轮使用情况：三态由 buildUsage 判定，正文不进状态（只放摘要）。
-    // 判定「哪些真的进了注入文本」必须用与渲染**同一套**摘要逻辑。
-    // 2026-11-02 实测缺陷：原来取 content 首行前 20 字去 includes(rendered.text)，
-    // 对 frontmatter 记忆永远不匹配（首行是 `---`，而渲染用的是 name:），
-    // 于是 candidates=5 但 injected=[]，状态被判成 miss —— 面板显示「未命中 + 召回 5」。
-    const injectedIds = safe.filter((h) => rendered.text.includes(toSummary(h.content))).map((h) => h.id);
+    // 由渲染函数直接给出入选 id，不再靠文本比对反推。
+    // 2026-11-02 两次踩坑：先用「正文首行前 20 字」匹配（frontmatter 记忆恒失败），
+    // 后用 toSummary(60 字符) 匹配渲染行（渲染行截断在 160 字符，长内容仍失败）。
+    // 渲染函数本来就知道放进了哪些，直接返回即可。
+    const injectedIds = rendered.includedIds;
 
     lastUsage = buildUsage({
       candidates: hits.length,
@@ -355,12 +356,16 @@ export function extractStepText(payload: unknown): string {
 /**
  * 构造注入消息。
  *
- * 刻意不依赖宿主 createUserMessage：用最小可辨识形状（role/content/source），
- * 拿不到宿主工具函数时也能构造。真实宿主若要求更严格的形状，
- * 这一层就是唯一的改动点。
+ * **必须带 `id`**：宿主把消息写进 session log 后，重放时的
+ * `assertMessageEventShape`（app.asar）要求 `user/message` 的 data 本身就是一条
+ * 带非空字符串 `id` 的完整消息，否则抛
+ * `session event at seq N lacks an identified message` → 整个会话被判 corrupt、历史加载失败。
+ * 2026-11-02 实测踩坑：本函数原先只给 role/content/source，三条注入把会话写坏。
+ * 宿主自己的 `createUserMessage` 走 `createMessage`，同样是 `id: randomUUID()`。
  */
-export function makeInjectionMessage(text: string): { role: 'user'; content: { type: 'text'; text: string }[]; source: { kind: string } } {
+export function makeInjectionMessage(text: string): { id: string; role: 'user'; content: { type: 'text'; text: string }[]; source: { kind: string } } {
   return {
+    id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'cairn-memory-injection' },
@@ -595,17 +600,20 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       res.end?.(JSON.stringify({ error: 'bad request' }));
     }
   };
-  const registerUsageOn = (webServer: { register: (o: unknown) => unknown }): void => {
-    webServer.register({
-      kind: 'exact',
-      path: usagePath,
-      handler: serveUsage,
-    });
-    webServer.register({
-      kind: 'exact',
-      path: persistPath,
-      handler: servePersist,
-    });
+  // webServer.register() 返回 disposer。**必须交给 owner.effect 托管**，否则插件被
+  // HMR 重载时旧路由不会被释放：新实例注册同路径直接抛
+  // `webserver: duplicate exact route "…"`，插件整条 fiber 失败，面板端点留在旧闭包上
+  // （2026-11-02 实测：重载后 /usage 一直返回重载前的陈旧数据）。
+  // 宿主自己的 connection 包就是这么做的：`owner.effect(() => owner.webServer.register(route))`。
+  const registerUsageOn = (webServer: { register: (o: unknown) => unknown }, owner?: { effect?: (fn: () => unknown, label?: string) => unknown }): void => {
+    const routes = [
+      { kind: 'exact', path: usagePath, handler: serveUsage },
+      { kind: 'exact', path: persistPath, handler: servePersist },
+    ];
+    for (const route of routes) {
+      if (typeof owner?.effect === 'function') owner.effect(() => webServer.register(route), `cairn-dsh-memory: ${route.path}`);
+      else webServer.register(route); // 拿不到 owner 时退回裸注册（面板可用，但重载前需重启）
+    }
     usageRegistered = true;
   };
   // 第三轮面板排查（toZcode-panel.md）：include-fiber 的 ctx 形态不确定——
@@ -616,7 +624,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     if (typeof c.inject === 'function') {
       c.inject(['webServer'], (webCtx: unknown) => {
         const web = webCtx as { webServer?: { register: (o: unknown) => unknown } };
-        if (web && typeof web.webServer?.register === 'function') registerUsageOn(web.webServer);
+        if (web && typeof web.webServer?.register === 'function') registerUsageOn(web.webServer, webCtx as { effect?: (fn: () => unknown, label?: string) => unknown });
       });
     }
   } catch (e) {
@@ -625,7 +633,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   if (!usageRegistered) {
     try {
       const web = (ctx as { webServer?: { register: (o: unknown) => unknown } }).webServer;
-      if (web && typeof web.register === 'function') registerUsageOn(web);
+      if (web && typeof web.register === 'function') registerUsageOn(web, ctx as { effect?: (fn: () => unknown, label?: string) => unknown });
       else console.warn('[cairn-dsh-memory] webServer service unavailable; usage panel endpoint not registered');
     } catch (e) {
       console.warn('[cairn-dsh-memory] usage route path-2 failed:', (e as Error).message);

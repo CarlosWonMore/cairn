@@ -126,3 +126,22 @@ describe('注入与面板摘要必须同源（2026-11-02 缺陷）', () => {
     assert.ok(!/^- \[procedure\] ---$/m.test(r.text), '不能只显示横线');
   });
 });
+describe('includedIds：不靠文本反推（2026-11-02 两次踩坑）', () => {
+  it('长内容（渲染行截断 160）也必须返回在 includedIds 里', () => {
+    const long = '[标签] 正文' + 'x'.repeat(2400);
+    const r = renderInjection([{ id: 'w', kind: 'fact', content: long }], { budgetBytes: 1536 });
+    assert.deepEqual(r.includedIds, ['w'], '长内容曾被 toSummary(60) 与渲染行(160) 的长度差搞挂');
+    assert.equal(r.selected, 1);
+  });
+
+  it('被预算裁掉的条目不出现在 includedIds', () => {
+    const hits = Array.from({ length: 20 }, (_, i) => ({ id: 'id' + i, kind: 'fact', content: '内容 ' + i + ' ' + 'y'.repeat(80) }));
+    const r = renderInjection(hits, { budgetBytes: 400 });
+    assert.ok(r.includedIds.length < hits.length, '必须有被裁掉的');
+    assert.equal(r.includedIds.length, r.selected, 'includedIds 长度必须等于 selected');
+  });
+
+  it('空命中时 includedIds 为空数组', () => {
+    assert.deepEqual(renderInjection([], { budgetBytes: 1024 }).includedIds, []);
+  });
+});

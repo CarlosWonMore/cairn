@@ -13,7 +13,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
+import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, makeInjectionMessage, name } from '../src/index.js';
 import { toSummary } from '../src/usage-state.js';
 
 /** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中；
@@ -475,5 +475,55 @@ describe('状态判定：有候选且已渲染时不能是 miss（2026-11-02 实
     assert.equal(summary, '交付先归档');
     // 旧实现用 content 首行前 20 字（'---'）去 includes，永远不匹配 → miss
     assert.ok(!content.split(/\r?\n/)[0]!.trim().slice(0, 20).includes('交付先归档'));
+  });
+});
+
+describe('注入消息必须带 id（否则写坏 session log）', () => {
+  // 2026-11-02 实测：宿主 assertMessageEventShape 要求 user/message 的 data 自身
+  // 带非空字符串 id，缺失即抛 `lacks an identified message`，整段会话被判 corrupt
+  // 且无法再加载。三条注入把 session-1d2ddcb3 写坏就是这个原因。
+  it('makeInjectionMessage 产出可直接落盘的完整消息形状', () => {
+    const m = makeInjectionMessage('注入文本');
+    assert.equal(typeof m.id, 'string');
+    assert.ok(m.id.length > 0, 'id 不得为空字符串');
+    assert.equal(m.role, 'user');
+    assert.ok(Array.isArray(m.content));
+    assert.equal(m.content[0]!.type, 'text');
+    assert.equal(m.content[0]!.text, '注入文本');
+    assert.equal(m.source.kind, 'cairn-memory-injection');
+  });
+
+  it('每次调用 id 唯一，重放不撞 id', () => {
+    const ids = new Set(Array.from({ length: 50 }, () => makeInjectionMessage('x').id));
+    assert.equal(ids.size, 50);
+  });
+});
+
+describe('路由注册必须由 owner.effect 托管（HMR 重载不再撞重复路由）', () => {
+  // 2026-11-02 实测：webServer.register() 返回 disposer，裸调用丢弃它 → 插件被 HMR
+  // 重载时旧路由不释放，新实例抛 `webserver: duplicate exact route`，整条 fiber 失败，
+  // /usage 一直由旧闭包响应（返回重载前的陈旧数据）。
+  it('提供 effect 时，两条路由都通过 effect 注册', () => {
+    const registered: unknown[] = [];
+    const effects: string[] = [];
+    const ctx = {
+      webServer: { register: (o: unknown) => { registered.push(o); return () => {}; } },
+      effect: (fn: () => unknown, label?: string) => { effects.push(label ?? ''); return fn(); },
+      on: () => {},
+    };
+    apply(ctx, {});
+    assert.equal(effects.length, 2, 'usage 与 persist 各一条 effect');
+    assert.ok(effects.some((l) => l.includes('/plugins/cairn-dsh-memory/usage')), effects.join('|'));
+    assert.ok(effects.some((l) => l.includes('/plugins/cairn-dsh-memory/persist')), effects.join('|'));
+    assert.equal(registered.length, 2);
+  });
+
+  it('没有 effect（降级）时仍然注册成功', () => {
+    const registered: unknown[] = [];
+    apply({
+      webServer: { register: (o: unknown) => { registered.push(o); return () => {}; } },
+      on: () => {},
+    }, {});
+    assert.equal(registered.length, 2, '降级路径不能把面板搞没');
   });
 });
