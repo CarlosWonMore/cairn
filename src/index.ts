@@ -1,5 +1,5 @@
 /**
- * @cairn/memory 库入口：聚合核心公共 API，供以库方式消费的用户 import。
+ * @carloswon/cairn-memory 库入口：聚合核心公共 API，供以库方式消费的用户 import。
  * CLI / MCP 入口请使用 bin（cairn / cairn-mcp）或 dist 下的对应文件。
  */
 

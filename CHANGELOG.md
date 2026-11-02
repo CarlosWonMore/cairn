@@ -1,6 +1,6 @@
 # Changelog
 
-本文件记录 `@cairn/memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
 ## [0.2.0] - 2026-11-02
 
