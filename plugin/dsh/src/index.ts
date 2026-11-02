@@ -36,7 +36,8 @@ export interface PluginConfig {
 }
 
 export interface RecallFn {
-  (query: string, topK: number): Promise<RecallHit[]>;
+  /** scope：宿主 agent 对象。tools.get(name, scope) 需要它才能命中正确的可见层。 */
+  (query: string, topK: number, scope?: unknown): Promise<RecallHit[]>;
 }
 
 export interface InjectionOutcome {
@@ -55,14 +56,14 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
   /** 最近一次召回的使用情况，供 UI 面板读取。 */
   let lastUsage: RecallUsage | null = null;
 
-  async function runOnce(message: string): Promise<InjectionOutcome> {
+  async function runOnce(message: string, scope?: unknown): Promise<InjectionOutcome> {
     const decision = shouldInject({ enabled: cfg.enabled, alreadyInjected: new Set(), message });
     if (!decision.inject) {
       return { injected: false, reason: decision.reason, text: '', selected: 0, truncated: 0 };
     }
     let hits: RecallHit[] = [];
     try {
-      hits = await deps.recall(message, cfg.topK);
+      hits = await deps.recall(message, cfg.topK, scope);
     } catch (e) {
       return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0 };
     }
@@ -147,6 +148,17 @@ export function deriveQueries(message: string, max = 6): string[] {
   return out;
 }
 
+/** 召回链路诊断：记录 tools.get / definition.call 每一步的失败原因。 */
+export const recallDiag: {
+  hasTools: boolean;
+  hasGet: boolean;
+  defFound: boolean;
+  callType: string;
+  lastError?: string;
+  lastRawType?: string;
+  attempts: number;
+} = { hasTools: false, hasGet: false, defFound: false, callType: 'unknown', attempts: 0 };
+
 /**
  * 从 ctx.tools 取 Cairn 检索能力。
  *
@@ -163,14 +175,20 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
       get?: (name: string, scope?: unknown) => { call?: (args: unknown, exec: unknown) => Promise<unknown> } | undefined;
     };
   } | undefined)?.tools;
+  recallDiag.hasTools = !!tools;
+  recallDiag.hasGet = typeof tools?.get === 'function';
   if (!tools || typeof tools.get !== 'function') return null;
 
-  return async (message: string, topK: number) => {
+  return async (message: string, topK: number, scope?: unknown) => {
     const seen = new Set<string>();
     const merged: RecallHit[] = [];
     for (const query of deriveQueries(message)) {
       onOwnCall?.();
-      const def = tools.get!('mcp__cairn__memory_search');
+      // 必须带 scope：dsh-ops 一律 tools.get(name, agent)，不带会取不到可见层里的定义。
+      const def = tools.get!('mcp__cairn__memory_search', scope);
+      recallDiag.defFound = !!def;
+      recallDiag.callType = typeof def?.call;
+      recallDiag.attempts += 1;
       if (typeof def?.call !== 'function') return [];
       // execution 参数：宿主 executor 传的是执行上下文（含 signal）。
       // 这里只需最小可辨识形状；缺 signal 时工具多半不读它，实测为准。
@@ -178,8 +196,13 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
       let res: unknown;
       try {
         res = await def.call({ query, limit: topK }, exec);
-      } catch {
-        continue; // 单路查询失败不影响其它路
+      } catch (e) {
+        // 不再静默：把首个异常记进诊断，否则"召回恒 0"无法区分是查询没命中还是调用直接失败。
+        if (!recallDiag.lastError) recallDiag.lastError = (e as Error).message;
+        continue;
+      }
+      if (!recallDiag.lastRawType && res !== undefined) {
+        recallDiag.lastRawType = res === null ? 'null' : typeof res;
       }
       const text = Array.isArray((res as { content?: unknown[] })?.content)
         ? ((res as { content: { text?: string }[] }).content[0] ?? {}).text ?? ''
@@ -386,6 +409,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     lastRecall: { queries: 0, candidates: 0, ms: 0 },
     toolHookRegistered: false,
     toolEvents: 0,
+    recall: recallDiag,
   };
 
   // 活动记录（用户要求：所有经 cairn 的操作留痕）。只存摘要，正文/参数永不入条目。
@@ -595,7 +619,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           diag.lastPreStep.messageLen = stepText.length;
           diag.lastRecall.queries = stepText ? deriveQueries(stepText).length : 0;
           const startedAt = Date.now();
-          const out = await injector.runOnce(stepText);
+          const out = await injector.runOnce(stepText, payload?.agent);
           diag.lastRecall.ms = Date.now() - startedAt;
           diag.lastRecall.candidates = injector.lastUsage()?.candidates ?? 0;
           diag.lastPreStep.reason = out.reason;
