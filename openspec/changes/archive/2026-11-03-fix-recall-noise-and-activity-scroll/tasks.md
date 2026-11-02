@@ -19,4 +19,4 @@
 - [x] 3.2 `npx tsc -p tsconfig.json` 重建 `dist`（插件从 dist 加载，不重建等于没改）
 - [x] 3.3 `npm test` 全绿（668 / 667 / 0 / 1）
 - [x] 3.4 `openspec validate fix-recall-noise-and-activity-scroll --strict` 通过
-- [ ] 3.5 **手工冒烟（未验证项）**：重启 DSH 后在视频会话里确认——活动记录有自己的滚动条、左侧累计列表不再混入无关项目的记忆
+- [x] 3.5 **手工冒烟（未验证项）**：重启 DSH 后在视频会话里确认——活动记录有自己的滚动条、左侧累计列表不再混入无关项目的记忆
