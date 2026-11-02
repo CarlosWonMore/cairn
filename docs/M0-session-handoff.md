@@ -807,3 +807,43 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 - `add-dsh-memory-plugin`：DSH Cordis 插件，以 MCP 为内核做实时召回注入。插件放 monorepo `packages/dsh-plugin`，不独立建仓。
 
 决策记录：投影 2KB / 交接块 4KB；Q1–Q8 均按推荐执行。
+
+## 14. 2026-11-02 插件注入写坏会话日志（已修）
+
+**现象**：DSH 历史加载失败，报 `stored session "session-1d2ddcb3-…" is corrupt: … session event at seq 7426 lacks an identified message`。
+
+**根因**：`plugin/dsh/src/index.ts` 的 `makeInjectionMessage()` 只给了 `role/content/source`，**没有 `id`**。宿主把消息写进 session log 后，重放时 `assertMessageEventShape`（app.asar）要求 `user/message` 的 `data` 本身带非空字符串 `id`，缺失即抛上述错误，整段会话被判 corrupt。宿主自己的 `createUserMessage` 走 `createMessage()`，必带 `id: randomUUID()`——对照源码即可确认这是插件侧的形状缺陷，不是宿主问题。
+
+**影响面**：`session-1d2ddcb3` 3 条（seq 7426/7526/7543），`session-0f6517a9` 累计 111 条注入中 14 条缺 id。其余 4 个会话无注入、无问题。
+
+**修复**：
+- 插件补 `id: randomUUID()`（+2 条回归测试，`npx tsx --test tests/injector.test.ts` 29/29 通过）。
+- `scripts/repair-session-log.mjs`：逐帧解压，只给「`source.kind=cairn-memory-injection` 且缺 id」的事件补 UUID，只重压改动帧（其余帧保留原始字节，帧边界不变），先 `.bak` 再原子替换。`--scan` 扫全部会话，`--apply` 写盘。
+- 两个会话已修复并复验：0 问题、0 重复 id，`.bak-repair-*` 留档。
+
+**两条新纪律**（继「改 src 必须重建 dist」之后的下一层）：
+1. **重建 `dist` 不等于生效**——ESM 模块在进程启动时已加载，必须让 HMR 重载插件或重启宿主。
+2. **HMR 可重载已链接包**：`@deepseek-ai/dsh-hmr` 的 profile 监听会替换「已加载文件在磁盘上发生变化」的插件，包括 `node_modules` 下已安装包与已链接包的目标。touch `profiles/desktop/cordis.patch.yml`（纯注释变更即可）就触发一次重新组合，日志可见 `plugin.state` 迁移与 `cairn-memory-injection` 从改后首条起带 id。**不需要重启 DSH。**
+   - 注意：重载日志里会出现 `webserver: duplicate exact route "/plugins/cairn-dsh-memory/usage"` 与 `cannot get property "webServer" without inject`，是旧实例路由未及时释放导致的噪声，新实例仍成功进入 state 3（active）。这条噪声值得单独查。
+3. 任何往 session log 里写 `user/message` 的地方（不止插件），都必须提供非空 `id`。
+
+### 附：重载时 `duplicate exact route` 的真正根因（同日续查）
+
+`webServer.register(route)` **返回 disposer**（见 app.asar 实现：`return () => table.delete(route.path)`），宿主的用法一律是 `owner.effect(() => owner.webServer.register(route), label)`，靠 effect 在 fiber 销毁时回收路由。
+
+插件原先裸调 `register()`、把 disposer 丢掉 → HMR 重载时**旧路由不被释放**，新实例注册同路径抛
+`webserver: duplicate exact route "/plugins/cairn-dsh-memory/usage"`，整条 fiber 失败；`/usage` 从此由**旧闭包**响应，返回的是重载前的陈旧数据（实测停在 03:08:31 不动）。
+
+已修：`registerUsageOn()` 改为可走 `owner.effect` 托管，拿不到 owner 时降级裸注册（面板不丢）。+2 条测试，插件测试 **31/31 通过**。
+
+**但泄漏掉的那批旧路由补不回来**——`effect` 只对本次之后注册的路由生效。所以：
+
+- 本次会话里 `/usage` 仍会响应陈旧数据，直到**重启 DSH**。
+- 重启后 HMR 重载不再撞重复路由（新代码已带 disposer）。
+
+结论：**改插件路由注册后必须重启一次宿主**，不能只靠 HMR 指望清掉历史泄漏。这条与 §14 的两条纪律合起来构成完整规则：
+1. 改 `src/` → 必须 `npm run build`；
+2. 改路由/effect 注册 → 必须重启宿主（HMR 只能回收它自己见过 disposer 的路由）；
+3. 往 session log 写 `user/message` → 必须带非空 `id`。
+
+另记：`patch: entry "dsh-zcode-plan-bridge" not found` 是既有噪声（该插件不在当前 profile 里），与本问题无关。

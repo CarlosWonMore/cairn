@@ -20,6 +20,42 @@ function hit(id: string, content: string, extra: Partial<RecallHit> = {}): Recal
   return { id, kind: 'fact', content, ...extra };
 }
 
+import { isStopTerm, rankHits, scoreHit, containsTerm } from '../src/recall.js';
+
+describe('相关性：虚词不算证据（2026-11-02 实测：视频会话里冒出别的项目的记忆）', () => {
+  it('虚词二元组进黑名单，有实义的二字词不进', () => {
+    for (const w of ['一个', '这个', '可以', '我们', '什么', '时候']) assert.ok(isStopTerm(w), w);
+    // 误伤检查：这些是中文检索里最有效的单元，必须留住
+    for (const w of ['记忆', '投影', '视频', '剪辑', '同步', '授权']) assert.ok(!isStopTerm(w), w);
+  });
+
+  it('计分只认正文里真的出现、且不是虚词的词', () => {
+    const hit = '跨设备共享记忆统一走 Cairn';
+    assert.equal(scoreHit(hit, ['记忆']).score, 1, '实义二字词 1 分');
+    assert.equal(scoreHit(hit, ['共享记忆']).score, 2, '三字短语 2 分');
+    assert.equal(scoreHit(hit, ['一个']).score, 0, '虚词不计分');
+    assert.equal(scoreHit(hit, ['视频']).score, 0, '正文里没有的词不计分');
+    assert.ok(containsTerm('Cairn', 'cairn'), '大小写无关');
+  });
+
+  it('排序：强词命中排在被虚词捞回来的前面', () => {
+    const noise: { id: string; kind: string; content: string } = { id: 'n', kind: 'fact', content: '这个项目里有一个东西' };
+    const good: { id: string; kind: string; content: string } = { id: 'g', kind: 'fact', content: '视频剪辑要注意音量' };
+    const out = rankHits([
+      { hit: noise, terms: ['这个'] },
+      { hit: good, terms: ['视频'] },
+    ], 2);
+    assert.deepEqual(out.map((h) => h.id), ['g', 'n'], '有实义的命中必须在前');
+  });
+
+  it('截断按分数而不是按查询顺序', () => {
+    const a = { id: 'a', kind: 'fact', content: '这个' };
+    const b = { id: 'b', kind: 'fact', content: '视频剪辑' };
+    const out = rankHits([{ hit: a, terms: ['这个'] }, { hit: b, terms: ['视频剪辑'] }], 1);
+    assert.deepEqual(out.map((h) => h.id), ['b'], '预算只够一条时给最相关的那条');
+  });
+});
+
 describe('shouldInject：开关与语义门槛', () => {
   it('关闭时绝不注入', () => {
     const d = shouldInject({ enabled: false, alreadyInjected: new Set(), message: '这是一条足够长的查询' });

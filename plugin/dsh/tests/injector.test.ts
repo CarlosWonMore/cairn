@@ -13,7 +13,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, makeInjectionMessage, name } from '../src/index.js';
+import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, makeInjectionMessage, name, recallDiag } from '../src/index.js';
+import { isStopTerm } from '../src/recall.js';
 import { toSummary } from '../src/usage-state.js';
 
 /** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中；
@@ -23,21 +24,23 @@ function makeSpyCtx() {
   const injected: unknown[] = [];
   const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
   const ctx = {
-    // 真实形状：ctx.tools.execute({ callId, name, arguments, signal, agent }) → ToolExecutionResult；
-    // 工具定义上的方法是 execute(args, exec)，没有 call。
+    // 真实契约：ctx.tools.get(name, scope) → ToolDefinition，执行方法是 execute(args, exec)。
+    // 本部署默认 ptc 呈现，ctx.tools.execute 对非 run_code 的直呼必然被折叠，
+    // 所以这里刻意不提供它：主路径若退化回 tools.execute，测试会直接 0 命中。
     tools: {
-      get: () => ({ execute: async () => ({ content: [] }) }),
-      execute: async (input: { arguments: { query: string } }) => {
-        queries.push(input.arguments.query);
-        return {
-          isError: false,
-          value: {},
-          content: [{
-            type: 'text',
-            text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
-          }],
-        };
-      },
+      get: () => ({
+        execute: async (args: { query: string }) => {
+          queries.push(args.query);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
+              },
+            ],
+          };
+        },
+      }),
     },
     webServer: { register: (o: unknown) => routes.push(o as { path?: string; handler?: (req: unknown, res: unknown) => void }) },
     on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
@@ -206,6 +209,21 @@ describe('插件形状（踩过三次的坑）', () => {
     assert.match(toolEntries[0].summary, /cairn\.memory_search/);
   });
 
+  it('自动召回之后，用户手动调用 cairn 工具仍要留痕（压制窗口只该覆盖服务层自调用）', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+      (p: unknown, n?: () => unknown) => Promise<unknown>;
+    // 主路径是定义体直调，不会触发 tools/post-execute，因此不该打开压制窗口；
+    // 旧实现在每条查询前都开 3s 窗口，等于每轮把用户手工调用的 cairn 工具吞掉。
+    await preStep({ agent: { inject: () => {} }, messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }] }, () => {});
+    const onPost = (ctx as Record<string, unknown>)['tools/post-execute'] as
+      (exec: unknown, result: unknown, n?: (r?: unknown) => unknown) => Promise<unknown>;
+    await onPost({ name: 'mcp__cairn__memory_search' }, {}, () => {});
+    const parsed = readUsage() as { recent?: { kind: string }[] };
+    assert.equal(parsed.recent!.filter((e) => e.kind === 'tool').length, 1, '召回后的手工调用必须留痕');
+  });
+
   it('record.tools=false 时工具调用不留痕（record.recall 同理）', async () => {
     const { ctx, readUsage } = makeSpyCtx();
     apply(ctx, { record: { tools: false, recall: false } });
@@ -257,34 +275,42 @@ describe('插件形状（踩过三次的坑）', () => {
       assert.ok(qs.length <= 6);
       assert.ok(qs.includes('记忆'), JSON.stringify(qs));
     });
+    it('虚词二元组不当查询：它们命中什么都正常（2026-11-02 视频会话串味实测）', () => {
+      // 重复出现的实义词会被选中；虚词一个都不许当查询。
+      const qs = deriveQueries('这个项目要先看项目文档，我们现在可以看一下');
+      assert.ok(!qs.includes('可以'), JSON.stringify(qs));
+      assert.ok(!qs.includes('这个'), JSON.stringify(qs));
+      assert.ok(!qs.includes('我们'), JSON.stringify(qs));
+      assert.ok(qs.includes('项目'), `有实义的二字词必须还在，实际 ${JSON.stringify(qs)}`);
+      // 不变量：任何入选的二元组都不能是虚词（跨词边界的碎片命中率≈0，无害）。
+      for (const q of qs) assert.ok(!isStopTerm(q), `虚词不许当查询：${q}`);
+    });
     it('ASCII 词入选', () => {
       const qs = deriveQueries('检查exfiltrate正则');
       assert.ok(qs.includes('exfiltrate'), JSON.stringify(qs));
     });
-    it('多路查询去重合并命中（走 tools.execute，2-gram 路命中即注入）', async () => {
+    it('多路查询去重合并命中（走 definition.execute，2-gram 路命中即注入）', async () => {
       const seen: string[] = [];
-      // 权威契约（app.asar 内 @deepseek-ai/dsh-tools 的 api-catalog / 源码）：
-      //   ctx.tools.execute({ callId, name, arguments, signal, agent }) → ToolExecutionResult
-      //   ToolDefinition 的执行方法是 execute(args, exec)；没有 tools.call，也没有 definition.call。
+      // 真实契约：get(name, scope) → ToolDefinition，执行方法是 execute(args, exec)。
+      // 主路径是定义体直调——tools.execute 在本部署的 ptc 模式下必然被折叠。
       const ctx = {
         tools: {
-          get: () => ({ execute: async () => ({ content: [{ type: 'text', text: '{"items":[]}' }] }) }),
-          execute: async (input: { name: string; arguments: { query: string } }) => {
-            seen.push(input.arguments.query);
-            return {
-              isError: false,
-              value: {},
-              content: [
-                {
-                  type: 'text',
-                  text:
-                    input.arguments.query === '记忆'
-                      ? JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] })
-                      : '{"items":[]}',
-                },
-              ],
-            };
-          },
+          get: () => ({
+            execute: async (args: { query: string }) => {
+              seen.push(args.query);
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text:
+                      args.query === '记忆'
+                        ? JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] })
+                        : '{"items":[]}',
+                  },
+                ],
+              };
+            },
+          }),
         },
         on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
       };
@@ -301,31 +327,27 @@ describe('插件形状（踩过三次的坑）', () => {
       assert.equal(injected.length, 1, '2-gram 路命中后必须注入');
     });
 
-    it('tools.execute 被 ptc 折叠拒绝时退回 definition.execute（仍能召回）', async () => {
-      const direct: string[] = [];
+    it('定义上没有 execute 时退回 tools.execute（跨部署兜底）', async () => {
+      const viaService: string[] = [];
       const ctx = {
         tools: {
-          get: () => ({
-            execute: async (args: { query: string }) => {
-              direct.push(args.query);
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text:
-                      args.query === '记忆'
-                        ? JSON.stringify({ items: [{ id: 'm10', kind: 'fact', content: '记忆跨设备统一走 Cairn' }] })
-                        : '{"items":[]}',
-                  },
-                ],
-              };
-            },
-          }),
-          execute: async () => ({
-            isError: true,
-            error: { message: 'only `run_code` is callable directly — call `mcp__cairn__memory_search` from inside a `run_code` program instead' },
-            content: [{ type: 'text', text: 'Error: only run_code is callable directly' }],
-          }),
+          get: () => ({}),
+          execute: async (input: { arguments: { query: string } }) => {
+            viaService.push(input.arguments.query);
+            return {
+              isError: false,
+              value: {},
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    input.arguments.query === '记忆'
+                      ? JSON.stringify({ items: [{ id: 'm10', kind: 'fact', content: '记忆跨设备统一走 Cairn' }] })
+                      : '{"items":[]}',
+                },
+              ],
+            };
+          },
         },
         on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
       };
@@ -337,9 +359,87 @@ describe('插件形状（踩过三次的坑）', () => {
         agent: { inject: (m: unknown) => injected.push(m) },
         messages: [{ role: 'user', content: [{ type: 'text', text: '帮我从记忆库里拉取一下记忆' }] }],
       }, () => {});
-      assert.ok(direct.includes('记忆'), '折叠后必须退回定义体直调');
-      assert.equal(injected.length, 1, '退回路径也必须注入');
+      assert.ok(viaService.includes('记忆'), '定义体不可用时必须退回 tools.execute');
+      assert.equal(injected.length, 1, '兜底路径也必须注入');
     });
+
+    it('成功召回会清掉上一次的调用错误（旧错误不许长期污染诊断）', async () => {
+      let failing = true;
+      const ctx = {
+        tools: {
+          get: () => ({
+            execute: async () => {
+              if (failing) throw new Error('boom');
+              return {
+                content: [
+                  { type: 'text', text: JSON.stringify({ items: [{ id: 'm11', kind: 'fact', content: '投影预算是 2KB' }] }) },
+                ],
+              };
+            },
+          }),
+        },
+        on: (e: string, fn: unknown) => { (ctx as Record<string, unknown>)[e] = fn; },
+      };
+      apply(ctx, {});
+      const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+        (p: unknown, n?: () => unknown) => Promise<unknown>;
+      const step = {
+        agent: { inject: () => {} },
+        messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
+      };
+      await preStep(step, () => {});
+      assert.equal(recallDiag.lastError, 'boom', '失败必须留痕');
+      failing = false;
+      await preStep(step, () => {});
+      assert.equal(recallDiag.lastError, undefined, '成功后必须清掉旧错误');
+    });
+  });
+});
+
+describe('会话隔离（2026-11-02 用户实测：面板把多个会话叠加显示）', () => {
+  const step = (id: string, inject: (m: unknown) => void) => ({
+    agent: { id, inject },
+    messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
+  });
+
+  it('A 会话注入过的记忆，B 会话仍会注入；端点按 ?session= 切片', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+      (p: unknown, n?: () => unknown) => Promise<unknown>;
+
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    await preStep(step('sess-A', (m) => a.push(m)), () => {});
+    await preStep(step('sess-B', (m) => b.push(m)), () => {});
+
+    assert.equal(a.length, 1, 'A 应注入');
+    assert.equal(b.length, 1, 'B 不能被 A 的去重挡掉——去重集合必须是会话级的');
+
+    const ua = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-A&history=1') as Record<string, unknown>;
+    const ub = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-B&history=1') as Record<string, unknown>;
+    assert.equal(ua['session'], 'sess-A');
+    assert.equal((ua['recent'] as unknown[]).length, 1, 'A 只能看到自己的记录');
+    assert.equal((ub['recent'] as unknown[]).length, 1, 'B 只能看到自己的记录');
+    assert.equal(((ua['sessionInjected'] as { id: string }[])[0] ?? {}).id, 'm1', '本会话累计注入要带上');
+    assert.equal(((ua['recent'] as { items?: { id: string }[] }[])[0]?.items ?? [])[0]?.id, 'm1', '记录要带 items 供点选高亮');
+  });
+
+  it('同会话第二步因去重跳过，累计集合不重复增长；无 session 参数回落最近活跃会话', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as
+      (p: unknown, n?: () => unknown) => Promise<unknown>;
+
+    await preStep(step('sess-A', () => {}), () => {});
+    await preStep(step('sess-A', () => {}), () => {});
+    const ua = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-A&history=1') as Record<string, unknown>;
+    assert.equal((ua['recent'] as unknown[]).length, 2, '两步都要留痕');
+    assert.equal((ua['sessionInjected'] as unknown[]).length, 1, '同一 id 在会话累计里只出现一次');
+
+    await preStep(step('sess-B', () => {}), () => {});
+    const any = readUsage('/plugins/cairn-dsh-memory/usage?history=1') as Record<string, unknown>;
+    assert.equal(any['session'], 'sess-B', '不带 session 时取最近活跃的那个（curl 自检可用）');
   });
 });
 

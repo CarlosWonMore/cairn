@@ -10,8 +10,9 @@
  * 2. `agent/pre-step` 的真实签名是 `(payload, next)`，payload 含 { agent, signal }，
  *    且**必须 return next()** —— 不调用 next 会卡住整条链路。
  * 3. 调 MCP 工具需要 `inject: ['tools']`，工具名形如 mcp__cairn__memory_search。
- *    调用入口是 `ctx.tools.execute({ callId, name, arguments, signal, agent })`；
- *    工具定义上的方法是 `execute(args, exec)`。**没有 `tools.call`，也没有 `definition.call`**。
+ *    正确写法是 `ctx.tools.get(name, scope)` 取定义再 `definition.execute(args, exec)`；
+ *    `ctx.tools.execute({...})` 也存在，但本部署默认 ptc 呈现，它会把手动直呼折叠成
+ *    UNKNOWN_TOOL（详见 makeToolRecall 注释）。**没有 `tools.call`，也没有 `definition.call`**。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -21,6 +22,8 @@ import { join } from 'node:path';
 import {
   createDedupeState,
   filterInjectable,
+  isStopTerm,
+  rankHits,
   renderInjection,
   shouldInject,
   type RecallHit,
@@ -49,6 +52,8 @@ export interface InjectionOutcome {
   text: string;
   selected: number;
   truncated: number;
+  /** 本次实际写进上下文的记忆 id（按渲染顺序）。调用方用它记「本会话累计注入」。 */
+  injectedIds: string[];
 }
 
 const DEFAULTS = { enabled: true, budgetBytes: 1536, topK: 5 } as const;
@@ -62,13 +67,13 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
   async function runOnce(message: string, scope?: unknown): Promise<InjectionOutcome> {
     const decision = shouldInject({ enabled: cfg.enabled, alreadyInjected: new Set(), message });
     if (!decision.inject) {
-      return { injected: false, reason: decision.reason, text: '', selected: 0, truncated: 0 };
+      return { injected: false, reason: decision.reason, text: '', selected: 0, truncated: 0, injectedIds: [] };
     }
     let hits: RecallHit[] = [];
     try {
       hits = await deps.recall(message, cfg.topK, scope);
     } catch (e) {
-      return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0 };
+      return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0, injectedIds: [] };
     }
     const safe = filterInjectable(hits);
     const filteredCount = hits.length - safe.length;
@@ -112,10 +117,17 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     }
 
     if (rendered.text.length === 0) {
-      return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0 };
+      return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0, injectedIds: [] };
     }
     dedupe.add(injectedIds);
-    return { injected: true, reason: 'ok', text: rendered.text, selected: rendered.selected, truncated: rendered.truncated };
+    return {
+      injected: true,
+      reason: 'ok',
+      text: rendered.text,
+      selected: rendered.selected,
+      truncated: rendered.truncated,
+      injectedIds,
+    };
   }
 
   return {
@@ -149,7 +161,10 @@ export function deriveQueries(message: string, max = 6): string[] {
     const g = clean.slice(i, i + 2);
     if (/^[\u4e00-\u9fff]{2}$/.test(g)) cjkGrams.set(g, (cjkGrams.get(g) ?? 0) + 1);
   }
+  // 虚词二元组（「一个 / 这个 / 可以」）排在出现次数最前列，但它们命中什么都正常——
+  // 当查询用只会把无关记忆捞进来。跳过它们，从有实义的两字词里取 top2。
   [...cjkGrams.entries()]
+    .filter(([g]) => !isStopTerm(g))
     .sort((a, b) => b[1] - a[1])
     .slice(0, 2)
     .forEach(([g]) => push(g));
@@ -244,9 +259,12 @@ function errorText(res: unknown): string {
  * - 工具定义上的执行方法是 `execute(args, exec)`，**不是 `call`**——前八轮全卡在找 `call`。
  * - `tools.call(name, args)` 从不存在；`resolveExecution` 是 executor 内部用的可见性判定，不是调用入口。
  *
- * 优先走 `tools.execute`（过 pre-execute 策略/守卫/超时包装，返回已物化结果）；
- * 它在 ptc 呈现模式下会把「非 run_code 的直呼」折叠成 UNKNOWN_TOOL，那时退回
- * 直调定义体——插件是宿主侧调用方，不是模型发起的直呼。
+ * 实测（2026-11-02，本机部署）：默认是 **ptc 呈现模式**，`tools.execute` 对非
+ * `run_code` 的直呼一律折叠成 `UNKNOWN_TOOL`——所以 `tools.execute` 在这个部署里
+ * 从来不是可用路径。主路径因此是**直调定义体 `definition.execute`**：它在 native /
+ * ptc 下都成立（插件是宿主侧调用方，不是模型发起的直呼；工具可见性已由
+ * `get(name, scope)` 先判过，per-agent restrict 依然生效）。
+ * 仅当定义上没有 execute 时退回 `tools.execute`。
  */
 function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
   const tools = (ctx as {
@@ -268,42 +286,58 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
 
   let seq = 0;
 
-  /** 一次检索调用 → 文本；两条路径都失败时返回空串并把原因留在诊断里。 */
-  const searchOnce = async (def: ToolDefinitionLike, args: { query: string; limit: number }, scope: unknown): Promise<string> => {
-    if (typeof tools.execute === 'function') {
+  /**
+   * 一次检索调用 → 文本。顺序是**实测定的**，不是偏好：
+   *
+   * 本部署默认 ptc 呈现模式，`tools.execute` 对非 `run_code` 的直呼一律折叠成
+   * `UNKNOWN_TOOL`，六条查询就是六次必然失败 + 六条被写进诊断的假错误。
+   * `definition.execute` 在 native / ptc 下都成立，所以它是主路径；
+   * 只有定义上没有 execute 时才退回 `tools.execute`（那时至少还能过一遍策略）。
+   */
+  const searchOnce = async (
+    def: ToolDefinitionLike,
+    args: { query: string; limit: number },
+    scope: unknown,
+    onServiceCall?: () => void,
+  ): Promise<string> => {
+    if (typeof def.execute === 'function') {
       try {
-        const res = await tools.execute({
-          callId: `cairn-recall-${++seq}`,
-          name: RECALL_TOOL,
-          arguments: args,
-          ...(scope === undefined ? {} : { agent: scope }),
-          signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
-        });
-        if (!isErrorResult(res)) {
-          recallDiag.execPath = 'tools.execute';
-          return resultText(res);
-        }
-        recallDiag.lastError = errorText(res);
+        const res = await def.execute(args, { signal: AbortSignal.timeout(RECALL_TIMEOUT_MS) });
+        recallDiag.execPath = 'definition.execute';
+        // 成功即清空：一条早已失效的旧错误不许陪着顺利的召回一直显示（上一轮就有人被它误导）。
+        recallDiag.lastError = undefined;
+        return resultText(res);
       } catch (e) {
         recallDiag.lastError = (e as Error).message;
       }
     }
-    if (typeof def.execute !== 'function') return '';
+    if (typeof tools.execute !== 'function') return '';
+    // 只有走服务层才会触发插件自己的 tools/post-execute 留痕，压制窗口只在这种情况需要。
+    onServiceCall?.();
     try {
-      const res = await def.execute(args, { signal: AbortSignal.timeout(RECALL_TIMEOUT_MS) });
-      recallDiag.execPath = 'definition.execute';
-      return resultText(res);
+      const res = await tools.execute({
+        callId: `cairn-recall-${++seq}`,
+        name: RECALL_TOOL,
+        arguments: args,
+        ...(scope === undefined ? {} : { agent: scope }),
+        signal: AbortSignal.timeout(RECALL_TIMEOUT_MS),
+      });
+      if (!isErrorResult(res)) {
+        recallDiag.execPath = 'tools.execute';
+        recallDiag.lastError = undefined;
+        return resultText(res);
+      }
+      recallDiag.lastError = errorText(res);
     } catch (e) {
       recallDiag.lastError = (e as Error).message;
-      return '';
     }
+    return '';
   };
 
   return async (message: string, topK: number, scope?: unknown) => {
-    const seen = new Set<string>();
-    const merged: RecallHit[] = [];
+    // 每条命中带上「它被哪些查询词带回来」，用来算相关性下限（见 recall.ts）。
+    const merged = new Map<string, { hit: RecallHit; terms: string[] }>();
     for (const query of deriveQueries(message)) {
-      onOwnCall?.();
       // 必须带 scope：可见层按 agent 解析，不带只会看全局层。
       const def = tools.get!(RECALL_TOOL, scope);
       recallDiag.defFound = !!def;
@@ -311,7 +345,7 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
       recallDiag.attempts += 1;
       // 单路取不到定义不终止整轮：其余查询路仍可能命中。
       if (!def) continue;
-      const text = await searchOnce(def, { query, limit: topK }, scope);
+      const text = await searchOnce(def, { query, limit: topK }, scope, onOwnCall);
       if (text.length > 0) recallDiag.lastTextLen = text.length;
       let items: RecallHit[] = [];
       try {
@@ -321,14 +355,18 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
         /* 非 JSON 响应：本路 0 条 */
       }
       for (const hit of items) {
-        if (hit?.id && !seen.has(hit.id)) {
-          seen.add(hit.id);
-          merged.push(hit);
+        if (!hit?.id) continue;
+        const cur = merged.get(hit.id);
+        if (cur) {
+          // 同一段正文可能被多个词带回来——多一个词就多一分相关性，别去重掉。
+          if (!cur.terms.includes(query)) cur.terms.push(query);
+          continue;
         }
+        merged.set(hit.id, { hit, terms: [query] });
       }
-      if (merged.length >= topK) break;
+      if (merged.size >= topK * 2) break;
     }
-    return merged.slice(0, topK);
+    return rankHits([...merged.values()], topK);
   };
 }
 /**
@@ -397,7 +435,18 @@ export const name = 'cairn-dsh-memory';
 // ———— 活动持久化（用户开关，默认关＝仅内存）————
 // 开关状态落一个 marker 文件（存在即开），活动日志是 JSONL（每行一条摘要）。
 // 目录随 Cairn 主权根走（CAIRN_HOME 优先，否则 ~/.cairn），与记忆数据同域。
-export type ActivityEntry = { t: string; kind: 'recall' | 'tool'; summary: string };
+export type ActivityEntry = {
+  t: string;
+  kind: 'recall' | 'tool';
+  summary: string;
+  /** 归属会话；老版本落盘的行没有这个字段（见 loadPersistedActivity 的注释）。 */
+  s?: string;
+  /**
+   * 这次操作涉及的记忆（仅「自动召回」有）——面板点选时用来高亮左侧条目，
+   * 重启回放时也靠它重建「本会话累计注入」。只放摘要，不放正文。
+   */
+  items?: { id: string; kind: string; summary: string }[];
+};
 
 export const ACTIVITY_FILE = 'activity-dsh.jsonl';
 const ACTIVITY_ENABLED_MARKER = 'activity-dsh.enabled';
@@ -506,7 +555,59 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   const nullRecall: RecallFn = async () => [];
   const recall = makeToolRecall(ctx, () => { suppressToolLogUntil = Date.now() + 3000; }) ?? nullRecall;
 
-  const injector = createInjector({ recall, config });
+  // ———— 会话隔离（2026-11-02 用户实测：面板把多个会话的记录叠在一起）————
+  // 旧实现里 injector（含去重集合与 lastUsage）与 activity 都是插件级单例：
+  // A 会话注入过的记忆，B 会话就再也不会被注入；面板也永远只显示「最后跑过的那一步」。
+  // 现在所有状态都按会话键分开——Agent.id 就是 SessionId，pre-step 的 payload.agent 自带。
+  type SessionState = {
+    injector: ReturnType<typeof createInjector>;
+    activity: ActivityEntry[];
+    /** 本会话累计注入过的记忆，按首次注入顺序去重（会话内同一 id 只会注入一次）。 */
+    injected: Map<string, { id: string; kind: string; summary: string }>;
+    touched: number;
+  };
+  const DEFAULT_SESSION = 'default';
+  const sessions = new Map<string, SessionState>();
+  // 单调序号而不是时间戳：同一毫秒内连着两步会话时，时间戳分不出先后。
+  let touchSeq = 0;
+  const shortKey = (k: string): string => (k ? k.slice(0, 8) : '(none)');
+  /** 取会话键：显式 id 优先，其次 agent.id；都取不到才落到 'default'。 */
+  function sessionKey(agent: unknown, explicit?: unknown): string {
+    if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+    const id = (agent as { id?: unknown } | undefined)?.id;
+    return typeof id === 'string' && id.length > 0 ? id : DEFAULT_SESSION;
+  }
+  function stateFor(key: string): SessionState {
+    let st = sessions.get(key);
+    if (!st) {
+      st = { injector: createInjector({ recall, config }), activity: [], injected: new Map(), touched: ++touchSeq };
+      sessions.set(key, st);
+    }
+    return st;
+  }
+  /**
+   * 记下「本会话注入过这条记忆」。
+   *
+   * 会话内同一 id 只会被注入一次（renderInjection 用去重集合挡掉重复），所以这里
+   * 不需要计数；重复命中时只刷新摘要/类型（记忆可能被修订过）。
+   */
+  function rememberInjected(st: SessionState, m: { id: string; kind: string; summary: string }): void {
+    if (!m || typeof m.id !== 'string' || m.id.length === 0) return;
+    const cur = st.injected.get(m.id);
+    if (cur) {
+      cur.kind = m.kind;
+      cur.summary = m.summary;
+      return;
+    }
+    st.injected.set(m.id, { id: m.id, kind: m.kind, summary: m.summary });
+  }
+  /** 没带 session 参数时（curl 自检）挑最近活跃的那个，别让端点变成空壳。 */
+  function mostRecentKey(): string {
+    let best = '';
+    let at = -1;
+    for (const [k, st] of sessions) if (st.touched > at) { at = st.touched; best = k; }
+    return best;
+  }
 
   // 摘要级诊断（不含正文），usage?debug=1 可读：用于区分「hook 没挂上 /
   // 事件形状不符 / 召回失败」——本轮排查就是靠它才能不靠用户来回试。
@@ -515,7 +616,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     /** session/event 到达总数：0 = 事件根本没送达（fallback 失效的判据）。 */
     lastEventCount: 0,
     lastCapture: { captured: false, textLen: 0, sourceKind: '' },
-    lastPreStep: { fired: false, messageLen: 0, reason: '', selected: 0, injected: false },
+    lastPreStep: { fired: false, session: '', messageLen: 0, reason: '', selected: 0, injected: false },
     lastRecall: { queries: 0, candidates: 0, ms: 0 },
     toolHookRegistered: false,
     toolEvents: 0,
@@ -525,20 +626,39 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
 
   // 活动记录（用户要求：所有经 cairn 的操作留痕）。只存摘要，正文/参数永不入条目。
   // 持久化由用户开关控制（默认关＝内存；开＝JSONL 落盘，随 Cairn 主权根目录）。
-  const activity: ActivityEntry[] = [];
   let persistOn = readPersistEnabled();
   if (persistOn) {
-    // 重启回放：把持久化尾部并入内存环（按 t+summary 去重防重复加载）
+    // 重启回放：按会话归档。落盘行不含 items（摘要也不落盘），所以「本会话累计注入」
+    // 重启后从空开始——这是隐私取舍，不是遗漏。
+    // 旧版本落盘的行没有 s 字段，统一落到 'default' 桶：它们本来就分不清属于哪个会话，
+    // 宁可不出现在任何真实会话面板里，也不该再像以前那样叠给所有人看。
     for (const e of loadPersistedActivity()) {
-      if (!activity.some((x) => x.t === e.t && x.summary === e.summary)) activity.push(e);
+      const st = stateFor(e.s ?? DEFAULT_SESSION);
+      if (st.activity.some((x) => x.t === e.t && x.summary === e.summary)) continue;
+      st.activity.push(e);
     }
   }
   const recordCfg = { recall: config.record?.recall !== false, tools: config.record?.tools !== false };
-  const pushActivity = (kind: ActivityEntry['kind'], summary: string): void => {
-    const entry: ActivityEntry = { t: new Date().toISOString(), kind, summary };
-    activity.push(entry);
-    if (activity.length > ACTIVITY_RING_LIMIT) activity.splice(0, activity.length - ACTIVITY_RING_LIMIT);
-    if (persistOn) appendActivityFile(entry);
+  const pushActivity = (
+    key: string,
+    kind: ActivityEntry['kind'],
+    summary: string,
+    items?: { id: string; kind: string; summary: string }[],
+  ): void => {
+    const st = stateFor(key);
+    const entry: ActivityEntry = {
+      t: new Date().toISOString(),
+      kind,
+      summary,
+      s: key,
+      ...(items && items.length > 0 ? { items } : {}),
+    };
+    st.activity.push(entry);
+    if (st.activity.length > ACTIVITY_RING_LIMIT) st.activity.splice(0, st.activity.length - ACTIVITY_RING_LIMIT);
+    st.touched = ++touchSeq;
+    // 落盘**不写 items**：摘要是正文的前缀，文件是长期留存面，不能跟内存环同等待遇。
+    // 代价是重启后「本会话累计注入」从空开始——这个取舍写进 README。
+    if (persistOn) appendActivityFile({ t: entry.t, kind, summary, s: key });
   };
 
   // Client 面板通过这个端点取状态：Host 与 Client 分处两个进程，只能走 HTTP。
@@ -551,21 +671,34 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       res.end?.(JSON.stringify({ error: 'method not allowed' }));
       return;
     }
-    const usage = injector.lastUsage();
-    const payload: Record<string, unknown> = { ...(usage ?? EMPTY_USAGE), persist: persistOn };
-    // 活动记录随 payload 走：默认带最近 15 条，?history=1 带全部（上限 120）。
+    // 会话切片：?session=<SessionId> 由面板带上；不带（curl 自检）就取最近活跃的那个。
+    let requested = '';
+    let history = false;
+    let wantDebug = false;
     try {
       const u = new URL(req.url ?? '/', 'http://local');
-      if (u.searchParams.get('history') === '1') {
-        payload.recent = activity;
-        if (u.searchParams.get('debug') === '1') payload.debug = diag;
-      } else {
-        payload.recent = activity.slice(-15);
-        if (u.searchParams.get('debug') === '1') payload.debug = diag;
-      }
+      requested = u.searchParams.get('session') ?? '';
+      history = u.searchParams.get('history') === '1';
+      wantDebug = u.searchParams.get('debug') === '1';
     } catch {
-      payload.recent = activity.slice(-15);
       /* url 解析失败就当没有参数 */
+    }
+    const key = requested || mostRecentKey();
+    const st = key ? sessions.get(key) : undefined;
+    const usage = st?.injector.lastUsage() ?? null;
+    const payload: Record<string, unknown> = {
+      ...(usage ?? EMPTY_USAGE),
+      persist: persistOn,
+      session: key,
+      // 本会话累计注入（去重）。用户问的就是这个：这个会话一共注入过哪些记忆。
+      sessionInjected: st ? [...st.injected.values()] : [],
+    };
+    // 活动记录随 payload 走：默认带最近 15 条，?history=1 带全部（上限 120）。
+    const ring = st?.activity ?? [];
+    payload.recent = history ? ring : ring.slice(-15);
+    if (wantDebug) {
+      // 会话 id 只给前 8 位：够对齐面板与宿主，又不是完整标识。
+      payload.debug = { ...diag, session: { requested: requested ? shortKey(requested) : '(none)', resolved: shortKey(key), known: sessions.size } };
     }
     res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     // 兜底必须字段完备（EMPTY_USAGE）：client 详情段会读 injected 等字段，
@@ -603,9 +736,11 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           setPersistEnabled(parsed.enabled);
           persistOn = parsed.enabled;
           if (persistOn) {
-            // 开启时把已有持久化尾部并入环，避免面板瞬间只剩空环
+            // 开启时把已有持久化尾部并按会话并入，避免面板瞬间只剩空环
             for (const e of loadPersistedActivity()) {
-              if (!activity.some((x) => x.t === e.t && x.summary === e.summary)) activity.push(e);
+              const st = stateFor(e.s ?? DEFAULT_SESSION);
+              if (st.activity.some((x) => x.t === e.t && x.summary === e.summary)) continue;
+              st.activity.push(e);
             }
           }
           res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -701,13 +836,18 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     // 只记工具名与结果状态，参数与返回内容一律不留（秘密纪律）。
     hooks.on(
       'tools/post-execute',
-      async (exec: { name?: string; tool?: string }, result: unknown, next?: (r?: unknown) => unknown) => {
+      async (
+        exec: { name?: string; tool?: string; agent?: { id?: unknown } },
+        result: unknown,
+        next?: (r?: unknown) => unknown,
+      ) => {
         try {
           diag.toolEvents += 1;
           const toolName = typeof exec?.name === 'string' ? exec.name : typeof exec?.tool === 'string' ? exec.tool : '';
           if (recordCfg.tools && toolName.startsWith('mcp__cairn__') && Date.now() >= suppressToolLogUntil) {
             const failed = result && typeof result === 'object' && 'error' in (result as Record<string, unknown>);
-            pushActivity('tool', `${toolName.replace('mcp__cairn__', 'cairn.')}${failed ? ' → 错误' : ''}`);
+            // 谁调的工具就记在谁头上：exec.agent.id 就是会话 id。
+            pushActivity(sessionKey(exec?.agent), 'tool', `${toolName.replace('mcp__cairn__', 'cairn.')}${failed ? ' → 错误' : ''}`);
           }
         } catch {
           /* 留痕失败不影响工具执行 */
@@ -730,22 +870,32 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
         diag.lastPreStep.fired = true;
         try {
           const stepText = extractStepText(payload) || lastUserMessage;
+          // 会话键：payload.agent.id。整个面板都是按这个键切片的。
+          const key = sessionKey(payload?.agent);
+          const st = stateFor(key);
+          diag.lastPreStep.session = shortKey(key);
           diag.lastPreStep.messageLen = stepText.length;
           diag.lastRecall.queries = stepText ? deriveQueries(stepText).length : 0;
           const startedAt = Date.now();
-          const out = await injector.runOnce(stepText, payload?.agent);
+          const out = await st.injector.runOnce(stepText, payload?.agent);
           diag.lastRecall.ms = Date.now() - startedAt;
-          diag.lastRecall.candidates = injector.lastUsage()?.candidates ?? 0;
+          diag.lastRecall.candidates = st.injector.lastUsage()?.candidates ?? 0;
           diag.lastPreStep.reason = out.reason;
           diag.lastPreStep.selected = out.selected;
           diag.lastPreStep.injected = out.injected;
+          // 只有真的注入了才更新「本会话累计」：nothing_new 时 lastUsage 是旧的，
+          // 拿它去 bump 会把上一轮的注入重复记一遍。
+          const fresh = out.injectedIds.length > 0 ? (st.injector.lastUsage()?.injected ?? []) : [];
+          for (const m of fresh) rememberInjected(st, m);
           if (recordCfg.recall && stepText) {
-            const usage = injector.lastUsage();
+            const usage = st.injector.lastUsage();
             pushActivity(
+              key,
               'recall',
               usage
                 ? `自动召回 候选${usage.candidates} 注入${out.selected}${out.reason !== 'ok' ? ` (${out.reason})` : ''}`
                 : `自动召回 跳过 (${out.reason})`,
+              fresh,
             );
           }
           if (out.injected) {
