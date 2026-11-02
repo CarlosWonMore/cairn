@@ -83,16 +83,33 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     // 后用 toSummary(60 字符) 匹配渲染行（渲染行截断在 160 字符，长内容仍失败）。
     // 渲染函数本来就知道放进了哪些，直接返回即可。
     const injectedIds = rendered.includedIds;
-
-    lastUsage = buildUsage({
-      candidates: hits.length,
-      injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content })),
-      injectedIds,
-      matchedBy: 'fts',
-      bytesUsed: rendered.bytes,
-      bytesBudget: cfg.budgetBytes,
-      filteredCount,
+    // 运行时探针：离线正确但线上仍 miss，需要看到真实 hits/rendered 的形状。
+    Object.assign(renderProbe, {
+      hits: hits.length,
+      safe: safe.length,
+      included: rendered.includedIds.length,
+      selected: rendered.selected,
+      textLen: rendered.text.length,
+      bytes: rendered.bytes,
+      firstHitId: hits[0]?.id ?? '(none)',
+      firstIncludedId: rendered.includedIds[0] ?? '(none)',
     });
+
+    // 只在**真正有内容注入**时更新 lastUsage。
+    // 2026-11-02 缺陷：pre-step 每步都跑一次 runOnce，去重后 fresh 为空即早退；
+    // 早退若也写 lastUsage，会用「空」覆盖掉上一步的真实结果，
+    // 于是端点显示 candidates=5 但 injected=[]、status=miss —— 而注入其实发生过。
+    if (rendered.includedIds.length > 0) {
+      lastUsage = buildUsage({
+        candidates: hits.length,
+        injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content })),
+        injectedIds,
+        matchedBy: 'fts',
+        bytesUsed: rendered.bytes,
+        bytesBudget: cfg.budgetBytes,
+        filteredCount,
+      });
+    }
 
     if (rendered.text.length === 0) {
       return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0 };
@@ -152,6 +169,8 @@ export function deriveQueries(message: string, max = 6): string[] {
 }
 
 /** 召回链路诊断：记录 tools.get / tools.execute / definition.execute 每一步的失败原因。 */
+export const renderProbe: Record<string, unknown> = {};
+
 export const recallDiag: {
   hasTools: boolean;
   hasGet: boolean;
@@ -500,6 +519,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     lastRecall: { queries: 0, candidates: 0, ms: 0 },
     toolHookRegistered: false,
     toolEvents: 0,
+    render: renderProbe,
     recall: recallDiag,
   };
 

@@ -527,3 +527,44 @@ describe('路由注册必须由 owner.effect 托管（HMR 重载不再撞重复�
     assert.equal(registered.length, 2, '降级路径不能把面板搞没');
   });
 });
+describe('去重早退不得覆盖 lastUsage（2026-11-02 面板误报 miss 的真因）', () => {
+  it('第一步注入后，第二步因去重早退，lastUsage 必须保留第一步的结果', async () => {
+    let call = 0;
+    const routes: { path?: string; handler?: Function }[] = [];
+    const ctx: Record<string, unknown> = {
+      tools: {
+        get: () => ({
+          execute: async () => {
+            call += 1;
+            return { content: [{ text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }) }] };
+          },
+        }),
+      },
+      webServer: { register: (o: unknown) => routes.push(o as never) },
+      on: (e: string, fn: unknown) => { ctx[e] = fn; },
+    };
+    apply(ctx, {});
+
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    const call1 = { agent: { inject: () => {} }, messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }] };
+    await preStep(call1, () => {});
+
+    const usageHandler = (routes.find((r) => String(r.path).endsWith('/usage')) as { handler: Function }).handler;
+    const read = () => {
+      let body = '';
+      usageHandler({ method: 'GET', url: '/' }, { writeHead: () => {}, end: (s: string) => { body = s; } });
+      return JSON.parse(body) as Record<string, unknown>;
+    };
+
+    const after1 = read();
+    assert.equal(after1['status'], 'injected', '第一步应记录 injected');
+    assert.ok(Number(after1['candidates']) > 0);
+
+    // 第二步：同一条记忆被去重，fresh 为空 → 早退
+    await preStep(call1, () => {});
+    const after2 = read();
+    assert.equal(after2['status'], 'injected', '早退不得把状态改回 miss');
+    assert.equal(after2['candidates'], after1['candidates'], '早退不得清空 candidates');
+    assert.ok(Number(call) >= 2, '两次都应发起召回');
+  });
+});
