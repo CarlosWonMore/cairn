@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, name } from '../src/index.js';
+import { toSummary } from '../src/usage-state.js';
 
 /** 构造一个带 tools 间谍的 ctx：记录 recall 查询词，返回一条固定命中；
  *  同时捕获 webServer 全部路由注册（同一 apply 实例内读活动记录，避免跨实例假通过）。 */
@@ -465,5 +466,14 @@ describe('活动持久化开关（默认内存，用户 2026-11-02 决策）', (
     const bad2 = postPersist(persistHandler, 'not-json');
     assert.equal(bad2.status, 400);
     assert.equal(existsSync(join(home, 'activity-dsh.enabled')), false, '非法请求不得开落盘');
+  });
+});
+describe('状态判定：有候选且已渲染时不能是 miss（2026-11-02 实测缺陷）', () => {
+  it('frontmatter 记忆的 summary 能被 includes 匹配，status=injected', () => {
+    const content = '---\nname: 交付先归档\ndescription: 说明\n---\n正文';
+    const summary = toSummary(content);
+    assert.equal(summary, '交付先归档');
+    // 旧实现用 content 首行前 20 字（'---'）去 includes，永远不匹配 → miss
+    assert.ok(!content.split(/\r?\n/)[0]!.trim().slice(0, 20).includes('交付先归档'));
   });
 });

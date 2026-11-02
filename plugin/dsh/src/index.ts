@@ -24,7 +24,7 @@ import {
   shouldInject,
   type RecallHit,
 } from './recall.js';
-import { buildUsage, EMPTY_USAGE, type RecallUsage } from './usage-state.js';
+import { buildUsage, EMPTY_USAGE, toSummary, type RecallUsage } from './usage-state.js';
 
 export interface PluginConfig {
   enabled?: boolean;
@@ -77,12 +77,16 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     });
 
     // 记录本轮使用情况：三态由 buildUsage 判定，正文不进状态（只放摘要）。
+    // 判定「哪些真的进了注入文本」必须用与渲染**同一套**摘要逻辑。
+    // 2026-11-02 实测缺陷：原来取 content 首行前 20 字去 includes(rendered.text)，
+    // 对 frontmatter 记忆永远不匹配（首行是 `---`，而渲染用的是 name:），
+    // 于是 candidates=5 但 injected=[]，状态被判成 miss —— 面板显示「未命中 + 召回 5」。
+    const injectedIds = safe.filter((h) => rendered.text.includes(toSummary(h.content))).map((h) => h.id);
+
     lastUsage = buildUsage({
       candidates: hits.length,
       injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content })),
-      injectedIds: safe
-        .filter((h) => h.content && rendered.text.includes(h.content.split(/\r?\n/)[0]!.trim().slice(0, 20)))
-        .map((h) => h.id),
+      injectedIds,
       matchedBy: 'fts',
       bytesUsed: rendered.bytes,
       bytesBudget: cfg.budgetBytes,
@@ -92,10 +96,6 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     if (rendered.text.length === 0) {
       return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0 };
     }
-    // 只记真正进了文本的那些，避免把被裁掉的也标记为已注入。
-    const injectedIds = safe
-      .filter((h) => rendered.text.includes(h.content.split(/\r?\n/)[0]!.trim().slice(0, 20)))
-      .map((h) => h.id);
     dedupe.add(injectedIds);
     return { injected: true, reason: 'ok', text: rendered.text, selected: rendered.selected, truncated: rendered.truncated };
   }

@@ -42,7 +42,7 @@ const SUMMARY_MAX = 60;
  * 这里跳过分隔线与 frontmatter 的 `key: value` 行，优先用 `name:` / `description:`
  * 的值作摘要；都没有才退回首个真正的正文行。
  */
-function firstLine(s: string): string {
+export function firstLine(s: string): string {
   const lines = s.split(/\r?\n/).map((l) => l.trim());
   const isSeparator = (l: string): boolean => l === '---' || l === '***' || l === '...';
   const field = (key: string): string => {

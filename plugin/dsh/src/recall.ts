@@ -5,6 +5,8 @@
  * 插件只负责三件事：该不该注入、注入什么、注入多少。
  */
 
+import { firstLine } from './usage-state.js';
+
 /** 一条召回命中（来自 Cairn MCP 的返回）。 */
 export interface RecallHit {
   id: string;
@@ -60,11 +62,6 @@ export function filterInjectable(hits: readonly RecallHit[]): RecallHit[] {
 
 /** 单条注入行的摘要截断长度。 */
 const LINE_MAX = 160;
-
-function firstLine(s: string): string {
-  const line = s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
-  return line.trim();
-}
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;

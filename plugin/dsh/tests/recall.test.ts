@@ -116,3 +116,13 @@ describe('去重状态', () => {
     assert.equal(s.size(), 0);
   });
 });
+describe('注入与面板摘要必须同源（2026-11-02 缺陷）', () => {
+  it('frontmatter 记忆在注入文本里显示 name，不是 ---', () => {
+    const r = renderInjection(
+      [{ id: 'a', kind: 'procedure', content: '---\nname: 交付先归档\ndescription: 说明\n---\n正文' }],
+      { budgetBytes: 2048 },
+    );
+    assert.ok(r.text.includes('交付先归档'), '必须用 name 作摘要');
+    assert.ok(!/^- \[procedure\] ---$/m.test(r.text), '不能只显示横线');
+  });
+});
