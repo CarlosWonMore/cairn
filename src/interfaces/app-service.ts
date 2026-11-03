@@ -14,6 +14,7 @@ import {
   MEMORY_KINDS,
 } from '../core/types.js';
 import { err, ExitCode } from '../core/errors.js';
+import { readAuditConfig, AuditConfig, AuditDetail } from '../store/audit.js';
 import { contentHash } from '../core/hash.js';
 import { scopeAllowsUpstream, scopeAllowsRead } from '../core/scope.js';
 import { searchMemories, SearchInput, SearchOutput } from '../retrieval/search.js';
@@ -117,6 +118,8 @@ export interface DoctorReport {
 
 export class AppService {
   private constructor(public readonly store: CairnStore) {
+    // 操作审计配置：打开时读一次（env > config.json > 默认）；改配置重启生效
+    this.auditCfg = readAuditConfig(store.paths.home);
     registerDefaultHandlers();
     // vault 已配置时，用真实上行 handler 覆盖诚实失败 handler
     if (loadVaultConfig(store.paths.dataDir)) {
@@ -127,6 +130,28 @@ export class AppService {
         // 环境变量缺失等：保持诚实失败 handler，doctor 会如实报告
       }
     }
+  }
+
+  private readonly auditCfg: AuditConfig;
+
+  /**
+   * 操作留痕（add-operation-audit）：读取操作记 `operation` 类目。
+   * 写入操作沿用既有 `memory` 类目审计，不在这里重复记录。
+   * FAIL-OPEN：审计写入失败只进 stderr，绝不影响业务结果；受 `audit.operations` 开关控制。
+   * 摘要纪律：detail 由调用点给白名单计数字段，查询原文/参数/正文永不入审计。
+   */
+  private recordOperation(action: string, subject: { type?: string; id?: string } | undefined, detail: AuditDetail): void {
+    if (!this.auditCfg.operations) return;
+    try {
+      this.store.audit.record('operation', action, subject, detail);
+    } catch (e) {
+      console.error(`[cairn] 操作审计写入失败（不影响业务）: ${(e as Error).message}`);
+    }
+  }
+
+  /** 审计过滤查询（只读；MCP memory_audit 与 CLI cairn audit list 共用）。 */
+  auditList(filter: { category?: string; action?: string; since?: string; limit?: number } = {}) {
+    return this.store.audit.list(filter);
   }
 
   static open(home?: string): AppService {
@@ -367,6 +392,7 @@ export class AppService {
   }
 
   showMemory(id: string): MemoryDetail {
+    const startedAt = Date.now();
     const store = this.store;
     const memory = store.memories.require(id);
     const scope = store.scopes.requireById(memory.scopeId);
@@ -380,6 +406,7 @@ export class AppService {
         throw err('E_SCOPE_MISMATCH', '当前调用方无权读取该记忆详情（作用域不匹配）', { memoryId: id });
       }
     }
+    this.recordOperation('memory_get', { type: 'memory', id }, { ms: Date.now() - startedAt });
     return {
       memory,
       revisions: store.memories.revisions(id),
@@ -428,7 +455,15 @@ export class AppService {
   // -------------------------------------------------------------------------
 
   search(input: SearchInput): SearchOutput {
-    return searchMemories(this.store, input);
+    const startedAt = Date.now();
+    const r = searchMemories(this.store, input);
+    this.recordOperation('memory_search', undefined, {
+      candidates: r.results.length,
+      matchedBy: r.matchedBy,
+      degraded: r.degraded === true,
+      ms: Date.now() - startedAt,
+    });
+    return r;
   }
 
   export(input: ExportInput): ExportOutput {

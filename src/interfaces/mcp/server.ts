@@ -30,6 +30,7 @@ const TOOL_NAMES = [
   'memory_update',
   'memory_forget',
   'memory_status',
+  'memory_audit',
 ] as const;
 
 const ONBOARDING_TOOLS = ['onboarding_status', 'onboarding_next_batch', 'onboarding_propose', 'onboarding_apply'] as const;
@@ -131,6 +132,17 @@ export function createServer(home?: string): Server {
         ['id'],
       ),
       toolDef('memory_status', '返回本地库健康摘要：各状态计数、冲突数、待处理任务、设备状态。', {}, []),
+      toolDef(
+        'memory_audit',
+        '只读查询本地审计事件（摘要级：时间/类目/动作/对象/计数，不含查询原文与记忆正文）。支持 category/action/since/limit 过滤。',
+        {
+          category: { type: 'string', description: '类目过滤，如 operation / memory' },
+          action: { type: 'string', description: '动作过滤，如 memory_search / added' },
+          since: { type: 'string', description: 'ISO 时间下界（含）' },
+          limit: { type: 'number', description: '条数上限，默认 50、最大 200' },
+        },
+        [],
+      ),
     ];
     if (onboardingActive()) {
       tools.push(
@@ -363,6 +375,18 @@ async function handleTool(service: AppService, name: string, args: Record<string
 
     case 'memory_status': {
       return service.status();
+    }
+
+    case 'memory_audit': {
+      // 只读：摘要级审计事件（detail 不含查询原文/参数/正文，由写入侧构造保证）
+      return {
+        items: service.auditList({
+          category: args['category'] as string | undefined,
+          action: args['action'] as string | undefined,
+          since: args['since'] as string | undefined,
+          limit: args['limit'] != null ? Number(args['limit']) : undefined,
+        }),
+      };
     }
 
     case 'onboarding_status': {

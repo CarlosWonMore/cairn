@@ -10,7 +10,7 @@ import { PlanRepository } from './plans.js';
 import { OutboxRepository } from './outbox.js';
 import { ManagedBlockRepository, DeviceInstallationRepository } from './blocks.js';
 import { ConflictRepository } from './conflicts.js';
-import { AuditLog } from './audit.js';
+import { AuditLog, readAuditConfig } from './audit.js';
 import {
   loadIdentity,
   loadOrCreateIdentity,
@@ -121,7 +121,15 @@ export function openStore(opts: OpenStoreOptions = {}): CairnStore {
         }
         cloneCheck = checkCloneState(db, identity);
       }
-      return assembleStore(db, paths, identity, cloneCheck, readOnly);
+      const store = assembleStore(db, paths, identity, cloneCheck, readOnly);
+      if (!readOnly) {
+        // 操作审计（add-operation-audit）：幂等复合索引 + 保留期清理。
+        // 索引不进迁移框架（CREATE INDEX IF NOT EXISTS 幂等，零迁移风险）；
+        // 清理进程内每小时至多一次，失败只进 stderr。
+        db.run('CREATE INDEX IF NOT EXISTS audit_category_at ON audit_event(category, at)');
+        maybePruneOperations(store);
+      }
+      return store;
     } catch (e) {
       lastError = e as Error;
       db.close();
@@ -225,3 +233,21 @@ function assembleStore(
 }
 
 export { schemaVersion };
+
+/** 进程内节流：每小时至多跑一次保留期清理（design D4）。 */
+let lastOperationPruneAt = 0;
+
+function maybePruneOperations(store: CairnStore): void {
+  const now = Date.now();
+  if (now - lastOperationPruneAt < 3_600_000) return;
+  lastOperationPruneAt = now;
+  try {
+    const cfg = readAuditConfig(store.paths.home);
+    const deleted = store.audit.pruneOperations(cfg.retentionDays);
+    if (deleted > 0) {
+      console.error(`[cairn] 操作审计保留期清理：按 ${cfg.retentionDays} 天删除 ${deleted} 条`);
+    }
+  } catch (e) {
+    console.error(`[cairn] 操作审计清理失败（不影响使用）: ${(e as Error).message}`);
+  }
+}

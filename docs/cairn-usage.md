@@ -819,3 +819,24 @@ dsh plugin --profile web add <plugin/dsh 绝对路径>   # 装到 profile
 | `topK` | `5` | 一次召回条数上限 |
 
 **证据边界**：插件纯逻辑有 21 项自动化测试；但**与真实 DSH 的集成未手工冒烟验证**（`agent/pre-step` 是否触发、注入是否进入上下文）。能力分级保持 `fixture-only`，不虚标。
+
+## 操作审计（add-operation-audit）
+
+凡是经 Cairn 的**读取**操作（`search`/`show`、MCP `memory_search`/`memory_get`）都会在本地库留一条摘要审计（类目 `operation`：时间、动作、对象 id、候选数/命中通道/耗时）。**写入与维护**沿用既有 `memory` 类目审计，不重复记录。审计只存摘要——查询原文、调用参数、记忆正文永不入审计。
+
+```bash
+# Windows：不要直接运行 .ts/.js，用 npm scripts 或 dist 里的 main.js
+npm run cli -- audit list --category operation --limit 20
+npm run cli -- audit list --json          # 机器可读
+```
+
+MCP 侧等价只读工具：`memory_audit`（支持 `category`/`action`/`since`/`limit`）。
+
+保留期与开关（改完重启生效）：
+
+| 配置 | 环境变量 | `~/.cairn/config.json` | 默认 |
+|---|---|---|---|
+| 是否留痕读取操作 | `CAIRN_AUDIT_OPERATIONS=false` | `{"audit":{"operations":false}}` | 开 |
+| 保留天数 | `CAIRN_AUDIT_RETENTION_DAYS` | `{"audit":{"retentionDays":90}}` | 30 |
+
+治理类目（计划/审批/写入审计）**永不**被保留期自动清理；非法配置值回落默认并在 stderr 告警。

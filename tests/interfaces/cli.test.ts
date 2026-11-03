@@ -171,3 +171,21 @@ test('CLI：backup → 继续写入 → restore 到备份时点', async () => {
     }
   }
 });
+
+test('CLI：audit list 只读可查，检索留痕且零内容泄露', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  await runCli([...base, 'add', '操作审计合同测试记忆-7712']);
+  await runCli([...base, 'search', '审计合同测试']);
+  const r = await runCli([...base, 'audit', 'list', '--category', 'operation']);
+  assert.equal(r.code, 0, r.stderr);
+  const body = JSON.parse(r.stdout) as { items: { category: string; action: string; detail: Record<string, unknown> }[]; count: number };
+  assert.ok(body.items.some((i) => i.action === 'memory_search'), 'search 留了 operation 事件');
+  assert.ok(body.items.every((i) => i.category === 'operation'), 'category 过滤生效');
+  // 摘要纪律：审计输出不含查询原文与记忆正文
+  assert.ok(!r.stdout.includes('审计合同测试'), '查询原文不得入审计输出');
+  assert.ok(!r.stdout.includes('操作审计合同测试记忆-7712'), '记忆正文不得入审计输出');
+  // 过滤参数合同：action 无匹配返回空
+  const empty = JSON.parse((await runCli([...base, 'audit', 'list', '--action', 'no_such_action'])).stdout) as { count: number };
+  assert.equal(empty.count, 0);
+});

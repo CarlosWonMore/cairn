@@ -111,7 +111,7 @@ test('MCP：initialize → tools/list → tools/call；stdout 每行均为合法
     assert.equal(init.result?.serverInfo?.name, 'cairn');
     const list = await responseOf(probe, 2) as { result?: { tools?: { name: string }[] } };
     const names = (list.result?.tools ?? []).map((t) => t.name);
-    for (const t of ['memory_context', 'memory_search', 'memory_get', 'memory_add', 'memory_propose', 'memory_update', 'memory_forget', 'memory_status']) {
+    for (const t of ['memory_context', 'memory_search', 'memory_get', 'memory_add', 'memory_propose', 'memory_update', 'memory_forget', 'memory_status', 'memory_audit']) {
       assert.ok(names.includes(t), `缺少工具 ${t}`);
     }
     const add = await responseOf(probe, 3) as { result?: { content?: { text: string }[] } };
@@ -124,6 +124,33 @@ test('MCP：initialize → tools/list → tools/call；stdout 每行均为合法
     const propBody = JSON.parse(prop.result!.content![0]!.text) as { status: string; authority: string };
     assert.equal(propBody.status, 'candidate', 'propose 只产生候选');
     assert.equal(propBody.authority, 'agent_inferred');
+  } finally {
+    await probe.kill();
+    cleanupTestHome(home);
+  }
+});
+
+test('MCP：memory_audit 只读可查，检索留痕且零内容泄露', async () => {
+  const home = makeTestHome();
+  const probe = startServer(home);
+  try {
+    await waitReady(probe);
+    initialize(probe);
+    probe.send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_add', arguments: { content: '机密内容-审计零泄露-9981', kind: 'fact', sensitive: true } } });
+    probe.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'memory_search', arguments: { query: '审计零泄露' } } });
+    probe.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'memory_audit', arguments: { category: 'operation' } } });
+    probe.send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'memory_audit', arguments: { action: 'nonexistent_action_xyz' } } });
+    for (const id of [1, 2, 3, 4]) await responseOf(probe, id);
+    const audit = await responseOf(probe, 3) as { result?: { content?: { text: string }[] } };
+    const body = JSON.parse(audit.result!.content![0]!.text) as { items: { category: string; action: string }[] };
+    assert.ok(body.items.some((i) => i.action === 'memory_search'), 'search 留了 operation 事件');
+    assert.ok(body.items.every((i) => i.category === 'operation'), 'category 过滤生效');
+    const empty = await responseOf(probe, 4) as { result?: { content?: { text: string }[] } };
+    const emptyBody = JSON.parse(empty.result!.content![0]!.text) as { items: unknown[] };
+    assert.equal(emptyBody.items.length, 0, 'action 过滤无匹配返回空');
+    // 零泄露：审计响应与全部工具输出都不含查询原文与敏感正文
+    assert.ok(!JSON.stringify(body).includes('审计零泄露'), '查询原文不得入审计响应');
+    assert.ok(!JSON.stringify(body).includes('机密内容-审计零泄露-9981'), '敏感正文不得入审计响应');
   } finally {
     await probe.kill();
     cleanupTestHome(home);

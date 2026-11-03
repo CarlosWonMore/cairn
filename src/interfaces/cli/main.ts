@@ -38,6 +38,7 @@ const VALUE_FLAGS = new Set([
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
   'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
+  'category', 'action', 'since',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
@@ -211,6 +212,28 @@ async function main(): Promise<void> {
       case 'show': {
         if (!args[0]) throw new CairnError('E_VALIDATION', '用法: cairn show <id>');
         out(service.showMemory(args[0]!), flags);
+        break;
+      }
+
+      case 'audit': {
+        // 只读审计查询（add-operation-audit）：cairn audit list [--category --action --since --limit] [--json]
+        if (args[0] !== 'list') throw new CairnError('E_VALIDATION', '用法: cairn audit list [--category operation] [--action memory_search] [--since <iso>] [--limit 50]');
+        const items = service.auditList({
+          category: str(flags, 'category'),
+          action: str(flags, 'action'),
+          since: str(flags, 'since'),
+          limit: flags['limit'] != null ? Number(flags['limit']) : undefined,
+        });
+        if (json) {
+          out({ items, count: items.length }, flags);
+        } else {
+          diag(`共 ${items.length} 条`);
+          for (const it of items) {
+            const subject = it.subjectId ? ` ${it.subjectType ?? ''}:${it.subjectId.slice(0, 8)}` : '';
+            const detail = JSON.stringify(it.detail);
+            console.log(`- ${it.at} [${it.category}] ${it.action}${subject} ${detail.slice(0, 120)}`);
+          }
+        }
         break;
       }
 
