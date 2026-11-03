@@ -1,7 +1,8 @@
 # operation-audit Specification
 
 ## Purpose
-TBD - created by archiving change add-operation-audit. Update Purpose after archive.
+
+本地审计层的能力扩展：凡是经 Cairn 的**读取**类记忆操作（检索、单条读取）在本地库留一条摘要级审计事件（`operation` 类目），与既有治理/写入审计（`memory` 等类目）共同构成「任何操作皆可追溯」的本地主权记录。保留期只清理 `operation` 类目（治理与写入审计永不自动删除）；`audit.operations` 开关可停写；`memory_audit` MCP 工具与 `cairn audit list` CLI 提供只读查询。审计行由构造方式保证只含摘要计数——查询原文、调用参数与记忆正文永不入审计。
 
 ## Requirements
 
