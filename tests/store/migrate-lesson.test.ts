@@ -80,7 +80,7 @@ describe('迁移 004：lesson 类型', () => {
       db.run(`UPDATE memory SET current_revision_id='r1' WHERE id='m1'`);
 
       const before = counts(db);
-      assert.ok(before.memory >= 1 && before.memory_revision >= 1, 'fixture 必须有真实子表数据');
+      assert.ok((before.memory ?? 0) >= 1 && (before.memory_revision ?? 0) >= 1, 'fixture 必须有真实子表数据');
 
       const applied = runMigrations(db);
       assert.ok(applied.applied.includes(4), '迁移 4 必须被执行');

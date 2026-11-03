@@ -857,4 +857,4 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 - **证据**：核心 678 pass / 0 fail / 1 gated skip（+10 新测试）；e2e verdict PASS applied=336 与基线一致；`validate --specs --strict` 通过；写放大基准 ~0.13ms/search（artifacts/audit-bench-2026-11-03.txt）。
 - **DSH 面板接入审计史（原任务 5.x）延后**：面板已有独立「落盘」开关（JSONL）且经用户目视确认；审计史已可经 memory_audit/CLI 查询，面板要接审计数据源时再做。
 - **同日插件侧**（此前轮次）：记忆 tab 化、活动环+筛选器、持久化开关、Rules-of-Hooks 崩溃修复、主题对比度自适应（文字：自动/白字/黑字）。dist 已含全部变更，用户重启即生效。
-- **遗留**：migrate-lesson.test.ts 有两个先于本日存在的 TS 严格索引报错（不在本变更范围，`tsx` 运行不受影响，tsc 全量门禁未启用故未阻塞）。
+- ~~**遗留**：migrate-lesson.test.ts 两个 TS 严格索引报错~~ → 2026-11-03 已修（守卫处 `?? 0` 合并空值，断言语义不变），`npx tsc -p tsconfig.json` 全库干净。
