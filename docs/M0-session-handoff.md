@@ -847,3 +847,14 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 3. 往 session log 写 `user/message` → 必须带非空 `id`。
 
 另记：`patch: entry "dsh-zcode-plan-bridge" not found` 是既有噪声（该插件不在当前 profile 里），与本问题无关。
+
+---
+
+## 2026-11-03 追加：add-operation-audit 实现并归档（经插件开关决策后复活）
+
+- **决策轨迹**：Round-9 用户要全操作留痕 → 提案 add-operation-audit（2b60bac）→ Round-10 用户改选「插件内开关（内存默认/落盘可选）」→ 提案撤回 → Round-13 用户明确「openspec 提案帮我实现」→ 恢复提案、TDD 实现、当日归档 `2026-11-03-add-operation-audit`。
+- **实现要点**：读取操作（search/get）记 `operation` 类目；写入沿用既有 `memory` 类目**不重复记**（相对原提案的修正，归档前已改 delta）。保留期白名单只清 `operation`（治理/写入审计永不自动删）。`memory_audit` MCP 只读工具 + `cairn audit list` CLI。开关 `audit.operations`、保留期 `audit.retentionDays`（env > ~/.cairn/config.json > 默认 true/30）。FAIL-OPEN：审计坏不影响业务。
+- **证据**：核心 678 pass / 0 fail / 1 gated skip（+10 新测试）；e2e verdict PASS applied=336 与基线一致；`validate --specs --strict` 通过；写放大基准 ~0.13ms/search（artifacts/audit-bench-2026-11-03.txt）。
+- **DSH 面板接入审计史（原任务 5.x）延后**：面板已有独立「落盘」开关（JSONL）且经用户目视确认；审计史已可经 memory_audit/CLI 查询，面板要接审计数据源时再做。
+- **同日插件侧**（此前轮次）：记忆 tab 化、活动环+筛选器、持久化开关、Rules-of-Hooks 崩溃修复、主题对比度自适应（文字：自动/白字/黑字）。dist 已含全部变更，用户重启即生效。
+- **遗留**：migrate-lesson.test.ts 有两个先于本日存在的 TS 严格索引报错（不在本变更范围，`tsx` 运行不受影响，tsc 全量门禁未启用故未阻塞）。
