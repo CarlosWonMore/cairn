@@ -57,9 +57,76 @@ function truncate(s: string, max: number): string {
  * - memory.sensitivity = 'sensitive'
  * - memory.status = 'blocked'
  */
+/** 艾宾浩斯分桶（天数 → 权重）。照抄 dsh-meow-memory 的实测分桶，不自创。 */
+export function recencyWeight(days: number): number {
+  if (days < 1) return 1.0;
+  if (days < 2) return 0.9;
+  if (days < 4) return 0.8;
+  if (days < 7) return 0.65;
+  if (days < 15) return 0.5;
+  if (days < 30) return 0.35;
+  if (days < 60) return 0.25;
+  if (days < 180) return 0.15;
+  return 0.08;
+}
+
+/** 绝对地板：最差情况也保留一半基线分（prime-memory 的 max(0.5, ...)）。 */
+export const DECAY_FLOOR = 0.5;
+/** 高重要度豁免衰减的阈值。 */
+export const NO_DECAY_IMPORTANCE = 4;
+/** 「本轮高度相关」豁免衰减的比例（相对本轮最高分）。 */
+export const SUPER_MATCH_RATIO = 0.85;
+
+/**
+ * 投影排序分值（add-memory-importance-and-usage-signal D8）。
+ *
+ * `score = 基线分 × 衰减系数`，衰减系数带三重地板：
+ * ① importance >= 4 → 不衰减；
+ * ② 本轮相关度 >= 0.85 × 最高分 → 不衰减；
+ * ③ 绝对地板 0.5 → 任何记忆至少保留一半基线分。
+ *
+ * **地板不是可选装饰**：纯衰减会让「被注入过的更容易被注入」，一年后只剩几条
+ * 明星记忆被反复注入，其余成为存在于库中但不可见的僵尸——那反而加剧库膨胀。
+ *
+ * @param nowMs 当前时间（ms）。传入以保持纯函数可测。
+ */
+export function scoreCandidate(input: {
+  importance: number | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+  nowMs: number;
+  /** 本轮相关度（0-1）。拿不到时传 undefined，跳过地板②。 */
+  relevance?: number;
+  maxRelevance?: number;
+}): { score: number; decay: number; flooredBy: 'importance' | 'relevance' | 'floor' | null } {
+  const base = input.importance ?? 3;
+  const refIso = input.lastUsedAt ?? input.createdAt;
+  const refMs = Date.parse(refIso);
+  const days = Number.isFinite(refMs) ? Math.max(0, (input.nowMs - refMs) / 86_400_000) : 0;
+  let decay = recencyWeight(days);
+
+  let flooredBy: 'importance' | 'relevance' | 'floor' | null = null;
+  if (base >= NO_DECAY_IMPORTANCE) {
+    decay = 1;
+    flooredBy = 'importance';
+  } else if (
+    input.relevance !== undefined &&
+    input.maxRelevance !== undefined &&
+    input.maxRelevance > 0 &&
+    input.relevance >= SUPER_MATCH_RATIO * input.maxRelevance
+  ) {
+    decay = 1;
+    flooredBy = 'relevance';
+  } else if (decay < DECAY_FLOOR) {
+    decay = DECAY_FLOOR;
+    flooredBy = 'floor';
+  }
+  return { score: base * decay, decay, flooredBy };
+}
+
 export function selectProjectionCandidates(
   store: CairnStore,
-  opts: { scopeIds: string[]; limit?: number } = { scopeIds: [] },
+  opts: { scopeIds: string[]; limit?: number; nowMs?: number } = { scopeIds: [] },
 ): { candidates: ProjectionCandidate[]; excludedCount: number } {
   const where: string[] = ["m.status = 'active'"];
   const params: unknown[] = [];
@@ -69,19 +136,43 @@ export function selectProjectionCandidates(
     params.push(...opts.scopeIds);
   }
 
+  // 取回后在 JS 里算分并排序（add-memory-importance-and-usage-signal D8）：
+  // 衰减需要「当前时间」与可选的相关度，放进 SQL 会既难读又难调；投影每会话一次，
+  // 而 FETCH_CAP 已有上限，数据量小，性能不敏感。
   const rows = store.db.all(
-    `SELECT m.id, m.kind, m.content, m.confidence, m.updated_at, m.sensitivity, s.sync_policy
+    `SELECT m.id, m.kind, m.content, m.confidence, m.updated_at, m.created_at,
+            m.importance, m.last_used_at, m.sensitivity, s.sync_policy
        FROM memory m
        JOIN scope s ON s.id = m.scope_id
-      WHERE ${where.join(' AND ')}
-      ORDER BY CASE WHEN m.kind = 'lesson' THEN 0 ELSE 1 END ASC,
-               m.confidence DESC, m.updated_at DESC, m.id ASC`,
+      WHERE ${where.join(' AND ')}`,
     ...params,
   );
 
+  const nowMs = opts.nowMs ?? Date.now();
+  const scored = rows.map((r) => ({
+    row: r,
+    ...scoreCandidate({
+      importance: r['importance'] == null ? null : Number(r['importance']),
+      lastUsedAt: (r['last_used_at'] as string | null) ?? null,
+      createdAt: String(r['created_at'] ?? r['updated_at'] ?? ''),
+      nowMs,
+    }),
+  }));
+  scored.sort((a, b) => {
+    // lesson 优先（既有语义：承担「曾经错了，别再犯」，会话开场最该看到）
+    const la = a.row['kind'] === 'lesson' ? 0 : 1;
+    const lb = b.row['kind'] === 'lesson' ? 0 : 1;
+    if (la !== lb) return la - lb;
+    if (b.score !== a.score) return b.score - a.score;
+    const ua = String(a.row['updated_at'] ?? '');
+    const ub = String(b.row['updated_at'] ?? '');
+    if (ua !== ub) return ua < ub ? 1 : -1;
+    return String(a.row['id']) < String(b.row['id']) ? -1 : 1;
+  });
+
   const candidates: ProjectionCandidate[] = [];
   let excludedCount = 0;
-  for (const r of rows) {
+  for (const { row: r } of scored) {
     const localOnly = String(r['sync_policy']) === 'local_only';
     const sensitive = String(r['sensitivity']) !== 'normal';
     const blocked = String(r['sensitivity']) === 'blocked';

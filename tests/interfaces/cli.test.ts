@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -188,4 +188,63 @@ test('CLI：audit list 只读可查，检索留痕且零内容泄露', async () 
   // 过滤参数合同：action 无匹配返回空
   const empty = JSON.parse((await runCli([...base, 'audit', 'list', '--action', 'no_such_action'])).stdout) as { count: number };
   assert.equal(empty.count, 0);
+});
+
+/**
+ * 候选晋升 / 拒绝的 CLI 合同（add-candidate-promote-command）。
+ *
+ * 锁死：JSON 形状、四个退出码档位、非交互可跑。
+ */
+test('promote / reject：命令合同与退出码', async () => {
+  // 候选只能由 MCP 的 memory_propose 创建（CLI 无 propose 子命令），
+  // 这里先用 CLI add 造一条 active，再用 node 把它降级成候选写回同一个库。
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+
+  const toCandidate = (content: string): string => {
+    const added = JSON.parse(execFileSync(process.execPath, [
+      ...TSX, ...base, 'add', content, '--kind', 'fact',
+    ], { encoding: 'utf8' })).id as string;
+    const dbPath = join(home, 'data', 'cairn.db');
+    execFileSync(process.execPath, ['-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare("UPDATE memory SET status='candidate', authority='agent_inferred', confidence=0.5 WHERE id=?").run(${JSON.stringify(added)});
+      db.close();
+    `], { encoding: 'utf8' });
+    return added;
+  };
+
+  // 不存在的 id → 稳定非零（E_NOT_FOUND 映射到 failure=1，见 EXIT_BY_CODE 既有约定）
+  const missing = await runCli([...base, 'promote', '01a18002-0000-7000-8000-000000000000']);
+  assert.equal(missing.code, 1, `期望未找到(1)，实得 ${missing.code}: ${missing.stderr}`);
+
+  // 晋升候选 → 成功，权威 user_confirmed
+  const candId = toCandidate('候选内容：投影排序要按重要度');
+  const ok = await runCli([...base, 'promote', candId]);
+  assert.equal(ok.code, 0, ok.stderr);
+  const promoted = JSON.parse(ok.stdout);
+  assert.equal(promoted.status, 'active');
+  assert.equal(promoted.authority, 'user_confirmed');
+  assert.equal(promoted.id, candId);
+
+  // 再晋升一次 → 状态冲突档
+  const again = await runCli([...base, 'promote', candId]);
+  assert.equal(again.code, 4, `期望状态冲突(4)，实得 ${again.code}`);
+
+  // 拒绝非候选 → 状态冲突档
+  const rejBad = await runCli([...base, 'reject', candId, '已经不候选了']);
+  assert.equal(rejBad.code, 4);
+
+  // 新候选 + 拒绝 → 墓碑
+  const cand2 = toCandidate('第二条候选：会被拒绝');
+  const rej = await runCli([...base, 'reject', cand2, '内容不成立']);
+  assert.equal(rej.code, 0, rej.stderr);
+  assert.equal(JSON.parse(rej.stdout).status, 'tombstoned');
+
+  // 缺理由 → 用法错误档
+  const cand3 = toCandidate('第三条候选');
+  const noReason = await runCli([...base, 'reject', cand3]);
+  assert.equal(noReason.code, 2, `期望用法错误(2)，实得 ${noReason.code}`);
 });

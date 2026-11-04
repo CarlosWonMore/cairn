@@ -1,5 +1,11 @@
 import { CairnDb } from './db.js';
-import { MIGRATION_001_CORE, MIGRATION_002_SEARCH, MIGRATION_003_DEDUP, MIGRATION_004_KIND_LESSON } from './schema.js';
+import {
+  MIGRATION_001_CORE,
+  MIGRATION_002_SEARCH,
+  MIGRATION_003_DEDUP,
+  MIGRATION_004_KIND_LESSON,
+  MIGRATION_005_MEMORY_IMPORTANCE_USAGE,
+} from './schema.js';
 import { err } from '../core/errors.js';
 
 export interface Migration {
@@ -32,6 +38,7 @@ export const MIGRATIONS: readonly Migration[] = [
     preTransactionPragma: ['PRAGMA foreign_keys = OFF'],
     postTransactionPragma: ['PRAGMA foreign_keys = ON'],
   },
+  { version: 5, name: 'importance_usage', sql: MIGRATION_005_MEMORY_IMPORTANCE_USAGE },
 ];
 
 export interface MigrationResult {

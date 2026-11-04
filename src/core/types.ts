@@ -64,6 +64,8 @@ export interface AddMemoryInput {
   validTo?: string | null;
   expiresAt?: string | null;
   sensitivity?: Sensitivity;
+  /** 重要度 1-5（值不值占用注入预算）；NULL 表示未判断，读取侧按 3 处理。 */
+  importance?: number | null;
 }
 
 export interface MemoryRecord {
@@ -86,6 +88,10 @@ export interface MemoryRecord {
   lastVerifiedAt: string | null;
   lastUsedAt: string | null;
   expiresAt: string | null;
+  /** 重要度 1-5；NULL = 未判断（排序按 3 处理）。 */
+  importance: number | null;
+  /** 被主动请求次数（自动注入不计）。 */
+  usageCount: number;
   sensitivity: Sensitivity;
   currentRevisionId: string | null;
   contentHash: string;

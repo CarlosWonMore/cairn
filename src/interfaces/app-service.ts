@@ -391,6 +391,90 @@ export class AppService {
     return this.store.memories.archive(id);
   }
 
+  /**
+   * 候选晋升（add-candidate-promote-command）。
+   *
+   * 三件必须一起做的事：
+   * 1. 权威记为 `user_confirmed`——用户**审阅并批准**了模型推断的内容，
+   *    语义上既不是「用户亲口说的」（user_explicit），也不是「模型推断」（agent_inferred）；
+   * 2. 可选迁移作用域（含带本机路径的内容落 device-local），与晋升同事务；
+   * 3. **按新作用域重建 outbox**——旧作用域下的待同步任务若照发，
+   *    会把记忆同步到错误的云端空间（design D2）。
+   */
+  promoteCandidate(
+    id: string,
+    opts: { scopePreset?: ScopeSelection['preset']; projectId?: string } = {},
+  ): { memory: MemoryRecord; scope: ScopeRow; previousScopeId: string } {
+    const store = this.store;
+    store.assertWritable();
+    const mem = store.memories.require(id);
+    if (mem.status !== 'candidate') {
+      throw err('E_CONFLICT_STATE', `只有候选可晋升，当前 ${mem.status}`);
+    }
+    const previousScopeId = mem.scopeId;
+
+    let targetScopeId = mem.scopeId;
+    if (opts.scopePreset !== undefined) {
+      const sel: ScopeSelection = { preset: opts.scopePreset };
+      if (opts.projectId !== undefined) sel.projectId = opts.projectId;
+      targetScopeId = this.resolveScope(sel).id;
+    }
+
+    const out = store.memories.promoteToActive(id, 'user_confirmed', this.caller.agentId, {
+      scopeId: targetScopeId,
+    });
+    const scope = store.scopes.requireById(out.scopeId);
+
+    // outbox：旧作用域的任务必须作废（否则发到错空间），新作用域按新修订重新入队。
+    store.db.run(
+      "DELETE FROM outbox_job WHERE entity_type = 'memory' AND entity_id = ? AND status = 'pending'",
+      id,
+    );
+    if (scopeAllowsUpstream(scope)) {
+      store.outbox.enqueue({
+        jobType: 'sync_upstream',
+        scopeId: scope.id,
+        entityType: 'memory',
+        entityId: id,
+        payload: { op: 'memory_upsert', memoryId: id },
+        idempotencyKey: `memory:${id}:rev:${out.currentRevisionId ?? ''}`,
+      });
+    }
+
+    store.audit.record('memory', 'promoted_candidate', { type: 'memory', id }, {
+      fromScope: previousScopeId,
+      toScope: out.scopeId,
+      authority: out.authority,
+      channel: 'cli',
+      scopeChanged: previousScopeId !== out.scopeId,
+    });
+    return { memory: out, scope, previousScopeId };
+  }
+
+  /** 拒绝候选：转墓碑（不是物理删除），留审计理由；恢复需显式重做（design D4）。 */
+  rejectCandidate(id: string, opts: { reason: string }): { memory: MemoryRecord } {
+    const store = this.store;
+    store.assertWritable();
+    const mem = store.memories.require(id);
+    if (mem.status !== 'candidate') {
+      throw err('E_CONFLICT_STATE', `只有候选可拒绝，当前 ${mem.status}`);
+    }
+    const reason = opts.reason.trim();
+    if (reason.length === 0) throw err('E_VALIDATION', '拒绝理由不能为空');
+    const scan = scanText(reason);
+    if (!scan.clean) {
+      throw err('E_SECRET_DETECTED', '拒绝理由疑似包含秘密，已阻断', {
+        findings: scan.findings.map((f) => ({ kind: f.kind, masked: f.masked })),
+      });
+    }
+    const out = store.memories.forget(id, reason, this.caller.agentId);
+    store.audit.record('memory', 'rejected_candidate', { type: 'memory', id }, {
+      reason,
+      channel: 'cli',
+    });
+    return { memory: out };
+  }
+
   showMemory(id: string): MemoryDetail {
     const startedAt = Date.now();
     const store = this.store;
@@ -424,7 +508,7 @@ export class AppService {
   }
 
   /** MCP memory_propose：只生成候选，绝不静默成为高权威活动记忆（memory-governance spec）。 */
-  proposeCandidate(input: { content: string; kind?: MemoryKind; evidence?: EvidenceInput[]; sourceSessionId?: string | null }): MemoryRecord {
+  proposeCandidate(input: { content: string; kind?: MemoryKind; evidence?: EvidenceInput[]; sourceSessionId?: string | null; importance?: number }): MemoryRecord {
     const store = this.store;
     store.assertWritable();
     const scan = scanText(input.content);
@@ -443,10 +527,14 @@ export class AppService {
         sourceAgent: ctx.agentId,
         sourceSessionId: input.sourceSessionId ?? null,
         evidence: input.evidence,
+        importance: input.importance ?? null,
       },
       ctx.deviceId,
     );
-    store.audit.record('memory', 'candidate_proposed', { type: 'memory', id: m.id }, { kind: m.kind });
+    store.audit.record('memory', 'candidate_proposed', { type: 'memory', id: m.id }, {
+      kind: m.kind,
+      importance: m.importance,
+    });
     return m;
   }
 
@@ -454,9 +542,24 @@ export class AppService {
   // 检索 / 导出
   // -------------------------------------------------------------------------
 
-  search(input: SearchInput): SearchOutput {
+  /**
+   * 检索 + 使用信号（add-memory-importance-and-usage-signal）。
+   *
+   * `incrementUsage` 缺省 true（显式检索），插件自动召回传 false。
+   * 只对**实际返回**的命中小心写入——被过滤掉的候选不算「被看到」。
+   *
+   * 写痕迹失败不得影响检索结果：审计与信号都是旁路，业务不能因它们挂掉。
+   */
+  search(input: SearchInput, opts: { incrementUsage?: boolean } = {}): SearchOutput {
     const startedAt = Date.now();
     const r = searchMemories(this.store, input);
+    const incrementUsage = opts.incrementUsage ?? true;
+    try {
+      const at = nowIso();
+      for (const hit of r.results) this.store.memories.markUsed(hit.memory.id, at, incrementUsage);
+    } catch {
+      /* 使用信号是旁路：写失败不改检索结果 */
+    }
     this.recordOperation('memory_search', undefined, {
       candidates: r.results.length,
       matchedBy: r.matchedBy,

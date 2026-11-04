@@ -528,3 +528,21 @@ END;
 -- 重建后旧表的 FTS 内容已随 DROP 清空，必须从新表重建索引。
 INSERT INTO memory_fts(memory_fts) VALUES('rebuild');
 `;
+
+/**
+ * 005：重要度与使用信号（add-memory-importance-and-usage-signal）。
+ *
+ * **只加列，不重建表。** 004 之所以必须重建，是因为 `kind` 受硬编码 CHECK 约束
+ * （SQLite 不能改列约束）；`importance` / `usage_count` 的边界在应用层校验，
+ * 两个可空列用 ALTER TABLE 就够。重建要关外键 + legacy_alter_table + DROP 旧表
+ * + 重建 6 索引 3 触发器，是全项目丢数据风险最高的操作，没理由为两列再付一次。
+ *
+ * `importance` 保持可空：NULL 表示「没判断」，读取侧按 3 处理。
+ * 不回填存量——回填需要判断，而判断需要 LLM（本变更明确不做）。
+ */
+export const MIGRATION_005_MEMORY_IMPORTANCE_USAGE = /* sql */ `
+ALTER TABLE memory ADD COLUMN importance INTEGER;
+ALTER TABLE memory ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0;
+-- 投影排序用：重要度优先，同档按最近使用。
+CREATE INDEX IF NOT EXISTS memory_importance_used ON memory(importance DESC, last_used_at DESC);
+`;

@@ -15,6 +15,10 @@ export interface RecallHit {
   scopeId?: string;
   sensitivity?: string;
   syncPolicy?: string;
+  /** 重要度 1-5（MCP 带出）；NULL = 未判断。 */
+  importance?: number | null;
+  /** 被主动请求次数（自动注入不计）。 */
+  usageCount?: number;
 }
 
 export interface InjectionInput {

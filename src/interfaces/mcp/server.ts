@@ -27,6 +27,8 @@ const TOOL_NAMES = [
   'memory_get',
   'memory_add',
   'memory_propose',
+  'memory_promote',
+  'memory_reject',
   'memory_update',
   'memory_forget',
   'memory_status',
@@ -85,6 +87,10 @@ export function createServer(home?: string): Server {
           query: { type: 'string' },
           status: { type: 'string', description: '默认 active；candidate/conflicted 需显式' },
           limit: { type: 'number' },
+          increment_usage: {
+            type: 'boolean',
+            description: '默认 true。宿主插件自动召回必须传 false——注入不计「被主动请求」。',
+          },
         },
         ['query'],
       ),
@@ -116,8 +122,34 @@ export function createServer(home?: string): Server {
       toolDef(
         'memory_propose',
         '提交模型推断的候选记忆（进入待审查队列，不会直接成为活动记忆，不会覆盖用户明确记忆）。',
-        { content: { type: 'string' }, kind: { type: 'string', enum: [...MEMORY_KINDS] } },
+        {
+          content: { type: 'string' },
+          kind: { type: 'string', enum: [...MEMORY_KINDS] },
+          importance: {
+            type: 'integer',
+            description: '重要度 1-5（值不值占用注入预算，与可信度无关）。推断来源上限 3。',
+          },
+        },
         ['content'],
+      ),
+      toolDef(
+        'memory_promote',
+        '把待审查候选晋升为活动记忆（用户已批准）。权威记为 user_confirmed；可同时指定作用域（含本机路径的内容应落 device-local）。',
+        {
+          id: { type: 'string' },
+          scope_preset: {
+            type: 'string',
+            description: '可选：晋升时一并迁移作用域（personal-global / device-local / ...）',
+          },
+          project_id: { type: 'string' },
+        },
+        ['id'],
+      ),
+      toolDef(
+        'memory_reject',
+        '拒绝一条候选（转为墓碑，可审计、可恢复）。仅当用户明确表示不要这条记忆时调用。',
+        { id: { type: 'string' }, reason: { type: 'string', description: '拒绝理由，不能为空' } },
+        ['id', 'reason'],
       ),
       toolDef(
         'memory_update',
@@ -308,12 +340,17 @@ async function handleTool(service: AppService, name: string, args: Record<string
     }
 
     case 'memory_search': {
-      const r = service.search({
-        text: String(args['query'] ?? ''),
-        query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId },
-        statuses: args['status'] ? [String(args['status']) as never] : undefined,
-        limit: args['limit'] != null ? Number(args['limit']) : undefined,
-      });
+      const r = service.search(
+        {
+          text: String(args['query'] ?? ''),
+          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId },
+          statuses: args['status'] ? [String(args['status']) as never] : undefined,
+          limit: args['limit'] != null ? Number(args['limit']) : undefined,
+        },
+        // 插件自动召回传 false：注入不计「被主动请求」，否则注入频率会污染排序
+        // （add-memory-importance-and-usage-signal D5）。
+        { incrementUsage: args['increment_usage'] !== false },
+      );
       return { matchedBy: r.matchedBy, degraded: r.degraded, items: r.results.map((h) => summarize(h.memory, { matchedBy: h.matchedBy, conflictId: h.conflictId, unverifiableImport: h.unverifiableImport })) };
     }
 
@@ -359,8 +396,31 @@ async function handleTool(service: AppService, name: string, args: Record<string
       const m = service.proposeCandidate({
         content: String(args['content'] ?? ''),
         kind: args['kind'] as MemoryKind | undefined,
+        importance: args['importance'] != null ? Number(args['importance']) : undefined,
       });
       return { id: m.id, status: m.status, authority: m.authority, note: '候选已保存，等待用户审查；不会自动晋升' };
+    }
+
+    case 'memory_promote': {
+      const r = service.promoteCandidate(String(args['id'] ?? ''), {
+        scopePreset: args['scope_preset'] as never,
+        projectId: args['project_id'] as string | undefined,
+      });
+      return {
+        id: r.memory.id,
+        status: r.memory.status,
+        authority: r.memory.authority,
+        scopePreset: r.scope.preset,
+        scopeId: r.scope.id,
+        previousScopeId: r.previousScopeId,
+      };
+    }
+
+    case 'memory_reject': {
+      const r = service.rejectCandidate(String(args['id'] ?? ''), {
+        reason: String(args['reason'] ?? ''),
+      });
+      return { id: r.memory.id, status: r.memory.status };
     }
 
     case 'memory_update': {
@@ -508,7 +568,20 @@ async function handleTool(service: AppService, name: string, args: Record<string
   }
 }
 
-function summarize(m: { id: string; kind: string; status: string; authority: string; content: string; scopeId: string; updatedAt: string }, extra: { matchedBy?: string; conflictId?: string; unverifiableImport?: boolean }): unknown {
+function summarize(
+  m: {
+    id: string;
+    kind: string;
+    status: string;
+    authority: string;
+    content: string;
+    scopeId: string;
+    updatedAt: string;
+    importance?: number | null;
+    usageCount?: number;
+  },
+  extra: { matchedBy?: string; conflictId?: string; unverifiableImport?: boolean },
+): unknown {
   return {
     id: m.id,
     kind: m.kind,
@@ -516,6 +589,10 @@ function summarize(m: { id: string; kind: string; status: string; authority: str
     authority: m.authority,
     scopeId: m.scopeId,
     updated_at: m.updatedAt,
+    // 重要度与使用次数随检索结果带出：面板要显示「这条为什么被选中」，
+    // 不带出来就只能显示内容（add-memory-importance-and-usage-signal tasks 8.2.3）。
+    importance: m.importance ?? null,
+    usage_count: m.usageCount ?? 0,
     content: m.content,
     ...(extra.matchedBy ? { matched_by: extra.matchedBy } : {}),
     ...(extra.conflictId ? { conflict_id: extra.conflictId } : {}),

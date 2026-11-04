@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AppService, ExitCode } from '../app-service.js';
+import { archiveStaleMemories } from '../../governance/archive.js';
 import { CairnError, isCairnError } from '../../core/errors.js';
 import { HOST_ADAPTERS, AgentKind, resolveDshHome, setDshProfile } from '../../agents/adapters.js';
 import {
@@ -215,6 +216,37 @@ async function main(): Promise<void> {
         break;
       }
 
+      case 'promote': {
+        // 候选晋升（add-candidate-promote-command D1）：CLI 本身即批准凭据，签发通道记 cli。
+        const id = args[0];
+        if (!id) throw new CairnError('E_VALIDATION', '用法: cairn promote <id> [--scope-preset <preset>] [--scope-project <id>]');
+        const r = service.promoteCandidate(id, {
+          scopePreset: str(flags, 'scope-preset') as never,
+          projectId: str(flags, 'scope-project'),
+        });
+        out(
+          {
+            id: r.memory.id,
+            status: r.memory.status,
+            authority: r.memory.authority,
+            scopePreset: r.scope.preset,
+            scopeId: r.scope.id,
+            previousScopeId: r.previousScopeId,
+          },
+          flags,
+        );
+        break;
+      }
+
+      case 'reject': {
+        const id = args[0];
+        const reason = args.slice(1).join(' ').trim();
+        if (!id || reason === '') throw new CairnError('E_VALIDATION', '用法: cairn reject <id> "<理由>"');
+        const r = service.rejectCandidate(id, { reason });
+        out({ id: r.memory.id, status: r.memory.status }, flags);
+        break;
+      }
+
       case 'audit': {
         // 只读审计查询（add-operation-audit）：cairn audit list [--category --action --since --limit] [--json]
         if (args[0] !== 'list') throw new CairnError('E_VALIDATION', '用法: cairn audit list [--category operation] [--action memory_search] [--since <iso>] [--limit 50]');
@@ -300,6 +332,17 @@ async function main(): Promise<void> {
       }
 
       case 'doctor': {
+        // 归档长期无用记忆（add-memory-importance-and-usage-signal D7）：
+        // 只在显式 --archive-stale 时执行，默认 dry-run。
+        if (flags['archive-stale'] === true) {
+          const r = archiveStaleMemories(service.store, {
+            dryRun: flags['apply'] !== true,
+            staleDays: flags['stale-days'] != null ? Number(flags['stale-days']) : undefined,
+          });
+          out(r, flags);
+          diag(r.dryRun ? `演练：将归档 ${r.ids.length} 条（加 --apply 才写库）` : `已归档 ${r.archived} 条`);
+          break;
+        }
         const d = service.doctor();
         if (str(flags, 'host')) {
           const agentKind = str(flags, 'host') as AgentKind;

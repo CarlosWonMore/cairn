@@ -64,8 +64,9 @@ export class MemoryRepository extends WriteGuardMixin {
       this.db.run(
         `INSERT INTO memory (id, owner_id, kind, content, normalized_content, scope_id, status, authority,
            confidence, source_agent, source_session_id, source_import_batch_id, source_message_range,
-           observed_at, valid_from, valid_to, expires_at, sensitivity, content_hash, created_by, created_at, updated_at)
-         VALUES (?, 'local-user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           observed_at, valid_from, valid_to, expires_at, sensitivity, content_hash, created_by, created_at, updated_at,
+           importance, usage_count)
+         VALUES (?, 'local-user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
         id,
         input.kind,
         input.content,
@@ -87,6 +88,7 @@ export class MemoryRepository extends WriteGuardMixin {
         input.createdBy,
         at,
         at,
+        normalizeImportance(input.importance, input.authority),
       );
       const revId = uuidv7();
       this.db.run(
@@ -181,17 +183,54 @@ export class MemoryRepository extends WriteGuardMixin {
     });
   }
 
-  /** 候选晋升（真实审批后由治理层调用；agent_inferred/imported 不能静默变 active）。 */
-  promoteToActive(id: string, authority: Authority, by: string): MemoryRecord {
+  /**
+   * 候选晋升（真实审批后由治理层调用；agent_inferred/imported 不能静默变 active）。
+   *
+   * `opts.scopeId`：晋升时一并迁移作用域。候选写入时作用域已固化，而
+   * `reviseMemory()` 只改正文不动作用域——晋升是修正它的唯一时机
+   * （add-candidate-promote-command D2）。迁移与晋升在同一事务内完成。
+   */
+  promoteToActive(
+    id: string,
+    authority: Authority,
+    by: string,
+    opts: { scopeId?: string } = {},
+  ): MemoryRecord {
     this.checkWritable();
     const mem = this.require(id);
     if (mem.status !== 'candidate') throw err('E_CONFLICT_STATE', `只有候选可晋升，当前 ${mem.status}`);
     if (authority === 'agent_inferred' || authority === 'imported_unverified') {
       throw err('E_FORBIDDEN', '不允许把候选晋升回推断/未验证权威');
     }
-    this.db.run("UPDATE memory SET status = 'active', authority = ?, updated_at = ? WHERE id = ?", authority, nowIso(), id);
-    this.db.run('UPDATE memory_revision SET status = ?, authority = ? WHERE id = ?', 'active', authority, mem.currentRevisionId ?? '');
-    return this.require(id);
+    // 目标作用域必须真实存在；不存在就 E_NOT_FOUND，不静默落回原作用域。
+    if (opts.scopeId !== undefined && opts.scopeId !== mem.scopeId) {
+      const exists = this.db.get('SELECT id FROM scope WHERE id = ?', opts.scopeId);
+      if (!exists) throw err('E_NOT_FOUND', `作用域不存在: ${opts.scopeId}`);
+    }
+    const at = nowIso();
+    const newScopeId = opts.scopeId ?? mem.scopeId;
+    this.db.transaction(() => {
+      this.db.run(
+        "UPDATE memory SET status = 'active', authority = ?, scope_id = ?, updated_at = ? WHERE id = ?",
+        authority,
+        newScopeId,
+        at,
+        id,
+      );
+      this.db.run(
+        'UPDATE memory_revision SET status = ?, authority = ?, scope_id = ? WHERE id = ?',
+        'active',
+        authority,
+        newScopeId,
+        mem.currentRevisionId ?? '',
+      );
+    });
+    const out = this.require(id);
+    // 外键与子表完整性：迁移后必须复查，否则「晋升成功但子表指向旧作用域」这种
+    // 不一致会一路带到投影与同步层（add-candidate-promote-command D2）。
+    const fk = this.db.all('PRAGMA foreign_key_check') as unknown[];
+    if (fk.length > 0) throw err('E_CONFLICT_STATE', `作用域迁移后外键不完整（${fk.length} 条）`);
+    return out;
   }
 
   archive(id: string): MemoryRecord {
@@ -422,8 +461,23 @@ export class MemoryRepository extends WriteGuardMixin {
     return out;
   }
 
-  markUsed(id: string, at: string = nowIso()): void {
-    this.db.run('UPDATE memory SET last_used_at = ? WHERE id = ?', at, id);
+  /**
+   * 记使用信号（add-memory-importance-and-usage-signal D5）。
+   *
+   * `incrementUsage` 区分两种语义，**这是本变更最容易被改错的地方**：
+   * - 自动注入：只写 last_used_at（回答「最近被看到过吗」）
+   * - 显式检索：两者都写（回答「被主动要过几次」）
+   *
+   * 插件是每轮都注入的（2026-11-02 实测 202 次注入 / 6 种内容 / 97% 重复）。
+   * 若注入也计 usage_count，「注入频率」会取代「真实需求」决定排序，
+   * 形成「被注入过 → 更容易被注入」的正反馈死锁。
+   */
+  markUsed(id: string, at: string = nowIso(), incrementUsage = false): void {
+    if (incrementUsage) {
+      this.db.run('UPDATE memory SET last_used_at = ?, usage_count = usage_count + 1 WHERE id = ?', at, id);
+    } else {
+      this.db.run('UPDATE memory SET last_used_at = ? WHERE id = ?', at, id);
+    }
   }
 
   touchVerified(id: string, at: string = nowIso()): void {
@@ -466,6 +520,30 @@ function defaultConfidence(authority: Authority): number {
   }
 }
 
+/**
+ * 重要度归一（add-memory-importance-and-usage-signal D4）。
+ *
+ * - 缺省 3（「没判断」取中间档，与显式传 3 行为一致）；
+ * - 越界抛 E_VALIDATION，**不静默截断**——静默截断会让调用方以为写进去了；
+ * - `agent_inferred` 上限 3：模型不得给自主推断的内容自封 4/5 星，
+ *   否则它会倾向于认为「我刚写的很重要」，把注入预算挤爆。
+ */
+export function normalizeImportance(value: number | null | undefined, authority: Authority): number | null {
+  if (value == null) return null;
+  if (!Number.isInteger(value) || value < 1 || value > 5) {
+    throw err('E_VALIDATION', `importance 必须是 1-5 的整数，收到 ${String(value)}`);
+  }
+  if (authority === 'agent_inferred' || authority === 'imported_unverified') {
+    return Math.min(value, 3);
+  }
+  return value;
+}
+
+/** 注入排序用的有效重要度：NULL 视为 3。 */
+export function effectiveImportance(m: { importance: number | null }): number {
+  return m.importance ?? 3;
+}
+
 export function validateMemoryInput(input: AddMemoryInput): void {
   const problems: string[] = [];
   if (!(MEMORY_KINDS as readonly string[]).includes(input.kind)) problems.push(`kind 非法: ${input.kind}`);
@@ -499,6 +577,8 @@ export function mapMemory(r: Record<string, unknown>): MemoryRecord {
     validTo: (r.valid_to as string | null) ?? null,
     lastVerifiedAt: (r.last_verified_at as string | null) ?? null,
     lastUsedAt: (r.last_used_at as string | null) ?? null,
+    importance: r.importance == null ? null : Number(r.importance),
+    usageCount: Number(r.usage_count ?? 0),
     expiresAt: (r.expires_at as string | null) ?? null,
     sensitivity: r.sensitivity as Sensitivity,
     currentRevisionId: (r.current_revision_id as string | null) ?? null,

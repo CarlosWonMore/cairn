@@ -109,6 +109,15 @@
 
 ---
 
+## 4a. 使用信号不外发
+
+`usage_count`（被主动请求次数）与 `last_used_at`（最近被看到时间）是**本地行为信号**，用来决定投影排序。
+
+- `outbox_job` 的 `sync_upstream` payload 只有 `{ op: 'memory_upsert', memoryId }`——**不含** `usage_count`、`last_used_at`、`importance` 的任何取值。
+- 因此这两个信号**只在本地累积**：每台设备各算各的，不会因为同步而互相污染（否则「在我的机器上被查了 50 次」会抬高你在另一台机器上的排序）。
+- `importance` 属于记忆属性（随 `memory_upsert` 一并上行），但它是**内容判断**而非行为统计，不影响这条隔离。
+- `cairn doctor --archive-stale` 的归档动作写本地审计 `archived_stale`，与检索历史的 `operation` 类目分开保留。
+
 ## 5. 设备身份与克隆
 
 ### 5.1 机制

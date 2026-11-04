@@ -2,6 +2,33 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.0] - 2026-11-04
+
+候选的批准/拒绝出口，以及治理投影「谁进得去」的重要度与使用信号。两个 OpenSpec 变更归档，主规格 10/10 严格通过。
+
+### Added
+
+- **候选晋升与拒绝**（`add-candidate-promote-command`）：候选（`status=candidate`）此前**没有任何合法晋升入口**——唯一路径是用逐字节相同的正文再写一次，撞查重后被动晋升，且无法表达作用域意图。现在：
+  - `cairn promote <id> [--scope-preset <preset>]`、`cairn reject <id> "<理由>"`，以及 MCP 工具 `memory_promote` / `memory_reject`。
+  - 晋升后权威记为 `user_confirmed`（用户**审阅并批准**），不沿用候选的 `agent_inferred`，也不伪装成 `user_explicit`（用户亲口陈述）。
+  - 批准凭据是本地 CLI 进程本身，通道记入审计；**不可被远端或 Agent 代签**。
+  - **晋升可同时迁移作用域**，与状态更新同事务，并按新作用域**重建 outbox**（旧作用域任务若照发会把记忆同步到错误的云端空间）。
+  - 拒绝转墓碑而非物理删除，可审计、可恢复。
+- **记忆重要度 `importance`**（1–5，`add-memory-importance-and-usage-signal`）：与 `confidence`（可信度）正交。`memory_add` / `memory_propose` 可指定；缺省 3（未判断）；`agent_inferred` / `imported_unverified` 来源**上限 3**（不得自封高星挤占预算）；越界报错不静默截断。
+- **使用信号双轨**：`last_used_at`（被看到）与 `usage_count`（被主动请求）。自动注入**只写前者**——插件每轮都注入（实测 97% 重复），计入次数会让注入频率取代真实需求，形成正反馈死锁。
+- **投影排序与三条地板**：`有效重要度 × 艾宾浩斯衰减`，带 ①`importance≥4` 豁免 ②本轮高度相关豁免 ③绝对地板 0.5。没有地板的话，被注入过的更容易被注入，一年后只剩少数明星记忆可见。
+- **过期归档**：`cairn doctor --archive-stale [--apply]`，`importance=1` 且 180 天未用 → `archived`（不删除，留审计）。默认演练；**不挂在写入/检索路径上**。
+
+### Changed
+
+- MCP `memory_search` 新增 `increment_usage` 参数（缺省 `true`）。**宿主插件自动召回必须传 `false`**。
+- 检索结果 `summarize` 带出 `importance` 与 `usage_count`，供面板显示「这条为什么被选中」。
+- 迁移 005 只做 `ALTER TABLE ADD COLUMN` + 建索引，**不重建表**——与 004 不同，这两列没有硬编码 CHECK 约束，没有理由再付一次「关外键 + DROP 旧表 + 重建 6 索引 3 触发器」的风险。
+
+### Fixed
+
+- `markUsed()` 自 0.1.x 起**从未被任何代码调用**（`last_used_at` 全库 0/45），现在接上检索路径，并区分注入/检索两种增量语义。
+
 ## [0.2.0] - 2026-11-02
 
 DSH 实时记忆插件、`lesson` 类型、投影简报、跳过账本与宿主适配器。九个 OpenSpec 能力规格全部通过严格校验。

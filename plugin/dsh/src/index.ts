@@ -296,7 +296,7 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
    */
   const searchOnce = async (
     def: ToolDefinitionLike,
-    args: { query: string; limit: number },
+    args: { query: string; limit: number; increment_usage: boolean },
     scope: unknown,
     onServiceCall?: () => void,
   ): Promise<string> => {
@@ -345,7 +345,11 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
       recallDiag.attempts += 1;
       // 单路取不到定义不终止整轮：其余查询路仍可能命中。
       if (!def) continue;
-      const text = await searchOnce(def, { query, limit: topK }, scope, onOwnCall);
+      // increment_usage: false —— 自动注入**不计** usage_count（只写 last_used_at）。
+      // 插件每轮都注入（实测一个会话 202 次注入 / 6 种内容 / 97% 重复），
+      // 计入次数会让「注入频率」取代「真实需求」决定排序，形成正反馈死锁。
+      // 见 add-memory-importance-and-usage-signal D5。
+      const text = await searchOnce(def, { query, limit: topK, increment_usage: false }, scope, onOwnCall);
       if (text.length > 0) recallDiag.lastTextLen = text.length;
       let items: RecallHit[] = [];
       try {
