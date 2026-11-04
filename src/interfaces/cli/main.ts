@@ -40,6 +40,10 @@ const VALUE_FLAGS = new Set([
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
   'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
   'category', 'action', 'since',
+  // promote / reject / doctor --archive-stale（add-candidate-promote-command +
+  // add-memory-importance-and-usage-signal）。漏登记会让 parseArgs 把它们当布尔
+  // true，str() 返回 undefined —— 命令静默不生效，且看起来"成功"。
+  'scope-preset', 'scope-project', 'stale-days',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {

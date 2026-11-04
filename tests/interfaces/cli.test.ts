@@ -248,3 +248,26 @@ test('promote / reject：命令合同与退出码', async () => {
   const noReason = await runCli([...base, 'reject', cand3]);
   assert.equal(noReason.code, 2, `期望用法错误(2)，实得 ${noReason.code}`);
 });
+
+test('promote --scope-preset 真的迁移作用域（2026-11-04 flag 未登记白名单的回归）', async () => {
+  // 曾经的 bug：scope-preset 不在 VALUE_FLAGS 里，parseArgs 把它当布尔 true，
+  // str() 返回 undefined —— promote 成功但作用域没变，且终端看起来一切正常。
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+
+  const added = JSON.parse(execFileSync(process.execPath, [
+    ...TSX, ...base, 'add', '带本机路径的记忆应当落 device-local', '--kind', 'fact',
+  ], { encoding: 'utf8' })).id as string;
+  const dbPath = join(home, 'data', 'cairn.db');
+  execFileSync(process.execPath, ['-e', `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(${JSON.stringify(dbPath)});
+    db.prepare("UPDATE memory SET status='candidate', authority='agent_inferred', confidence=0.5 WHERE id=?").run(${JSON.stringify(added)});
+    db.close();
+  `], { encoding: 'utf8' });
+
+  const promoted = JSON.parse((await runCli([...base, 'promote', added, '--scope-preset', 'device-local'])).stdout);
+  assert.equal(promoted.scopePreset, 'device-local', 'scopePreset 必须是 device-local');
+  assert.notEqual(promoted.scopeId, promoted.previousScopeId, 'scopeId 必须真的变了');
+});
