@@ -2,13 +2,15 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [0.4.0] - 2026-11-10
 
-上行入队完备性与冷启动对账（OpenSpec 变更 `add-sync-outbox-completeness`）。
+上行入队完备性、冷启动对账，以及 DSH 插件召回记录的口径修正。
+两个 OpenSpec 变更归档，主规格 10/10 严格通过。
 
 ### Added
 
 - **`cairn sync backfill [--apply] [--limit N]`**：补齐「作用域允许上行但从未入队」的活动记忆。默认只读，`--apply` 才写本地 outbox；**只写本地队列，不产生任何网络请求**。判定不限制既有任务状态——只要历史上存在过任意一条 `sync_upstream`（含 done / dead）就不算缺口，否则已推过的记忆会被反复重报。
+- **`CAIRN_SYNCD_URL` 环境变量**：`vault init-remote --provider syncd` 的 `--base-url` 现可省略，缺省取该变量。优先级「命令行 > 环境变量 > 报错」。**token 仍只走环境变量、绝不写进 vault.json**；baseUrl 属配置，照旧落在 vault.json。
 - **`doctor` 的 `counts.upstreamGap`**：同一口径的上行缺口计数，健康时恒为 0；非零时在 `notes` 给出指向 `sync backfill --apply` 的提示。**不进 `problems`、不改退出码**——缺口是可自愈状态，不是库损坏。
 
 ### Fixed
@@ -16,6 +18,9 @@
 - **治理写入漏上行**：`applyPlan` 的 `add` / `keep_both` / `merge` 三条分支直接调存储层，**绕过了 outbox 入队**。实测真实库 `personal-global` 的 42 条 active 记忆里 23 条完全没有 `sync_upstream` 任务（全部来自 `plan:%`），即自动整理产出的记忆**一条都上不了云**，且 `sync push` 会安静地"成功"。现按目标记忆的实际作用域逐 op 补入队，幂等键与手工写入路径一致。
 - **`rejectCandidate` 不上行**：拒绝候选转墓碑时不入队，而 `forgetMemory` 入队——同一语义两种行为。现对齐。
 - **`applyDecision` 的 `merge` / `promote_candidate` 分支**不给目标补上行任务，现补齐。
+- **DSH 插件把「已去重」记成「注入0」**：同一记忆本会话注入过后，后续每步都返回 `nothing_new` 且 `selected=0`，活动记录因此显示「注入0 (nothing_new)」——与左栏「已注入 25 条」自相矛盾。现区分三态（已注入 / **已去重** / 未命中），措辞里带本会话累计条数。
+- **活动记录被空步淹没**：环上限 120，空步每步一条，实测 120 条里只有 3 条带真实注入，面板默认只显示最近 15 条 ⇒ 真实注入永远不可见。现把连续空步折叠为一条并记次数，**带注入条目的记录永不折叠**。
+- **去重状态不随上下文压缩重置**：`resetSession()` 此前全仓零调用点，与「直到会话上下文被压缩或重置」的要求不符——长会话越用越注入不出东西。现挂 `session/event` 判 `type === 'compaction/end'`（压缩失败即带 `error` 时不重置）。
 
 入队**刻意不下沉到 `src/store/memories.ts`**：拉取侧 `src/sync/apply.ts` 也走存储层，下沉会让 `sync pull` 给自己制造上行任务，形成回环推流。该边界用回归用例钉住。
 
