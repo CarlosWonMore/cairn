@@ -2,6 +2,22 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Plugin 0.4.1] - 2026-11-10
+
+修复 `@carloswon/cairn-dsh-memory@0.4.0` 导致 DSH 启动进入恢复模式的缺陷。
+
+### Fixed
+
+- **插件包 0.4.0 不可用**：`src/client.js` 的 `window.__ModuleLoader__.load({ id })` 仍注册改名前的短名
+  `cairn-dsh-memory`，而宿主按 `package.json` 的 `name`（`@carloswon/cairn-dsh-memory`）建立 client 图行。
+  两者不一致时 `ClientEntries.arrive()` 查不到该 factory，会退回单包 URL **再执行一次** bundle，
+  第二次 `register()` 撞到已存在的 id 并抛出
+  `duplicate factory registration for "cairn-dsh-memory"`，整个 client entry 无法激活，
+  渲染进程重试耗尽后进入恢复模式。现注册 id 改为与包名完全一致。
+- 注册 id 必须等于包名这一点已写入 `client.js` 注释，避免再次改包名时漏改。
+
+> 0.4.0 已在 npm 标记为 deprecated，仅用于留档。
+
 ## [0.4.0] - 2026-11-10
 
 上行入队完备性、冷启动对账，以及 DSH 插件召回记录的口径修正。

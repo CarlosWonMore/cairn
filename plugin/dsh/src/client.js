@@ -6,7 +6,9 @@
 // 返回），try/catch 必须放进回调本体。
 // 三态用**文字**标明，不只靠颜色；活动记录只含摘要，正文/参数永不进 UI。
 window.__ModuleLoader__.load({
-  id: 'cairn-dsh-memory',
+  // 必须与 package.json 的 name 完全一致：宿主按包名建立 client 图行，
+  // 并在 arrive() 里用该包名检查 factories；不一致会让同一 bundle 再执行一次。
+  id: '@carloswon/cairn-dsh-memory',
   factory(require) {
     const React = require('react');
     const h = React.createElement;

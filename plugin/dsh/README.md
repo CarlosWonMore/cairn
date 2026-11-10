@@ -1,9 +1,20 @@
-# cairn-dsh-memory
+# @carloswon/cairn-dsh-memory
 
 DeepSeek Harness 的 Cairn 记忆插件：在模型步骤前按当前问题召回记忆并注入。
 
 > **这是体验层，不是内核。** 记忆存储、作用域判定、审批全部由 Cairn MCP server 负责。
 > 插件只补 DSH 专属的实时召回。它不拥有数据，也不产生写入。
+
+## 这不是 DSH 专用记忆
+
+市面上有若干名字带 "cairn" / "dsh" 的记忆插件，本插件与它们定位不同：
+
+- **Cairn 是跨 Agent 的记忆主权层**：WorkBuddy / CodeBuddy / Cursor / Copilot / ZCode / DSH 共用一个本地库，换 Agent 不换记忆。
+- **本插件只是一个入口**：它通过 MCP 调用 Cairn 内核，不自己存数据。
+- **必须先装内核**：`npm i -g @carloswon/cairn-memory` 并接好 MCP，否则召回恒为空。
+- 不需要 DSH 时，内核照常可用（CLI / MCP / 其他宿主）。
+
+> 如果你要的是「只给 DSH 用的独立记忆」，本项目不是那个东西——它刻意不做单宿主绑定。
 
 ## 为什么需要插件
 
@@ -12,15 +23,21 @@ Cairn 的投影通道（写 `AGENTS.md`）只能**静态注入**：整个会话�
 
 ## 安装
 
+**从 npm 装（推荐）**
+
 ```bash
-# 构建
-cd plugin/dsh && npm run build
-
-# 装到 DSH profile
-dsh plugin --profile web add <本目录绝对路径>
-
-# 重启 DSH 后生效
+dsh plugin --profile desktop add @carloswon/cairn-dsh-memory
 ```
+
+**开发态（改源码时）**
+
+```bash
+cd plugin/dsh && npm install && npm run build
+dsh plugin --profile desktop add <本目录绝对路径>
+```
+
+> 无论哪种方式，**先装内核并接好 MCP**：`npm i -g @carloswon/cairn-memory@0.4.0`。
+> 重启 DSH 后才生效（插件从 `dist` 加载）。
 
 也可以在 DSH 的插件页手动添加。
 
@@ -140,4 +157,3 @@ dsh plugin --profile web add <本目录绝对路径>
 2. **按关联强度排序**：强词（汉字 ≥3 或 ASCII 词）2 分、实义二字词 1 分、虚词 0 分，按分降序进预算；同分保持首次命中顺序。
 
 刻意**没有**做「只命中一个二字词就丢弃」：`帮我从记忆库里拉取一下记忆` 这种消息的实义词只有「记忆」，下限会把它误杀。二字词不是天然不可靠，虚词才是。
-

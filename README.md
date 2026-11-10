@@ -10,6 +10,22 @@ Your memory lives in a local SQLite file you own. Every device holds the authori
 
 ---
 
+## 这个项目不是什么
+
+同类项目里已经有好几个名字带 "cairn" 或 "dsh" 的记忆插件，先说清区别，免得装错：
+
+| | Cairn（本项目） | DSH 专用记忆插件 |
+|---|---|---|
+| **适用范围** | **跨 Agent、跨设备**：WorkBuddy / CodeBuddy / Cursor / Copilot / ZCode / DSH 共用一个库 | 只服务 DSH 一个宿主 |
+| **权威副本** | 本机 SQLite；换 Agent 不换记忆 | 通常绑定该宿主的运行时 |
+| **DSH 插件角色** | **只是一个壳子**（`@carloswon/cairn-dsh-memory`），通过 MCP 调用内核 | 插件本身就是全部实现 |
+| **没装 DSH 时** | 内核照常工作：CLI、MCP、其他宿主都能用 | 不可用 |
+| **云端** | 可选加密中继，本地永远可用 | 视各自实现 |
+
+一句话：**DSH 插件是 Cairn 的众多入口之一，不是 Cairn 本身。** 只装插件不装内核，召回的永远是空。
+
+---
+
 ## 为什么需要它
 
 每个 Agent 都在自己攒记忆：WorkBuddy 有一份、ZCode 有一份、DSH 又有一份。你换一台机器、换一个 Agent，记忆就断了；你无法解释某条记忆从哪来，也无法确认它真的被删掉。
