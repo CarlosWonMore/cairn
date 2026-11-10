@@ -2,7 +2,7 @@
 # 注意必须是 insert 块——裸 `- id:` 行是「覆盖既有条目」，找不到目标会被静默丢弃。
 - insert:
     - id: cairn-dsh-memory
-      name: cairn-dsh-memory
+      name: "@carloswon/cairn-dsh-memory"
       config:
         enabled: true
         budgetBytes: 1536
