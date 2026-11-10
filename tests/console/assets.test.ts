@@ -169,3 +169,11 @@ test('UI_JS：策略下拉记住选择，重绘后不跳回"请选择"', () => {
   assert.ok(/sel\.value = state\.policy/.test(UI_JS), '重绘后要恢复选中项');
   assert.ok(/addEventListener\('change', function \(\) \{ state\.policy = sel\.value/.test(UI_JS), 'change 时写回 state');
 });
+
+test('UI_JS：摘令牌的局部变量不得遮蔽 qs() 工具函数', () => {
+  // 回归（2026-11-10 实测）：`var qs = keep.toString()` 把 qs() 覆盖成字符串，
+  // 点击「记忆」视图直接抛 "qs is not a function"，页面永远停在"加载中…"。
+  // 这条缺陷此前一直存在，只是没有用例真的点开记忆视图。
+  assert.equal(/var qs\s*=/.test(UI_JS), false, 'qs 是函数名，不得复用为局部变量');
+  assert.ok(UI_JS.includes('var rest = keep.toString()'), '剩余参数用独立变量名');
+});

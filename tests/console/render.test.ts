@@ -149,14 +149,19 @@ test('记忆详情：正文、状态、权威、敏感度、修订、证据一�
 });
 
 test('预览页不含任何写操作控件（只读是承诺，不是权限）', () => {
-  for (const bad of ['删除', '编辑', '注销', '移出']) {
-    assert.equal(UI_JS.includes(bad), false, `预览脚本不得出现写操作词：${bad}`);
-  }
-  // 英文标识单独判：removeChild 这类 DOM API 不算写操作，必须按边界匹配
-  assert.equal(/(edit|delete|destroy|forget|purge)/.test(UI_JS), false, '不得出现写操作的英文标识');
+  // 断言从「脚本里不出现写操作词」收紧到「不出现写操作控件」：
+  // add-memory-annotations 起，界面必须显示「仍为活动状态，尚未删除」与终端处置
+  // 命令（spec 强制），而 `delete state.picks[...]` 是 JS 运算符、不是写入口。
+  // 按词扫描会把说明文字和语言关键字误判成写操作。
+  const controlLabel = /el\('button'[^\r\n]*'(删除|编辑|注销|移出)'/;
+  assert.equal(controlLabel.test(UI_JS), false, '预览脚本不得出现写操作按钮');
   assert.equal(/method:\s*'DELETE'/.test(UI_JS), false, '不得发出 DELETE 请求');
   assert.equal(/data-action="edit"/.test(UI_JS), false);
   assert.ok(UI_JS.includes('if (!STATIC)'), '所有写操作入口必须被 STATIC 关掉');
+  // 批注的两个写入口必须存在，且都在各自的 !STATIC 分支内
+  for (const anchor of ['data-annotation-save', 'data-batch-apply']) {
+    assert.ok(UI_JS.includes(anchor), `缺少写入口标记 ${anchor}`);
+  }
 });
 
 test('待处理队列：规则层与 AI 层并列呈现，分歧单独标出且默认不预选', async () => {

@@ -8,6 +8,7 @@ import { baseHeaders, guardRequest, newToken } from './security.js';
 import { renderShell } from './assets/page.js';
 import { computeInbox, computeSuggestions } from './suggestions.js';
 import { reviewPackForBatch, reviewSubmit, readReviews } from './review-store.js';
+import { readAnnotations } from './annotations.js';
 import { OpHint, ProposedItem } from '../../governance/propose.js';
 import { promotedPredicate } from '../../onboarding/batches.js';
 import { listPolicies } from '../../onboarding/policy.js';
@@ -262,6 +263,21 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
           ai: readReviews(store, { batchId, itemId }),
         };
       }
+      if (path === '/api/annotations') {
+        // 空串是"未选择"（前端下拉的默认项就是空值），不能当成过滤值，
+        // 否则 `?status=&disposition=` 会把所有批注都筛掉。
+        const opt = (k: string): string | undefined => {
+          const v = q.get(k);
+          return v == null || v.trim().length === 0 ? undefined : v;
+        };
+        const items = readAnnotations(store, {
+          memoryId: opt('memory'),
+          disposition: opt('disposition'),
+          status: opt('status'),
+          limit: clampInt(q.get('limit'), 1, 2000, 500),
+        });
+        return { total: items.length, items };
+      }
       if (path === '/api/inbox') {
         return computeInbox(store, {
           redact,
@@ -293,6 +309,21 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
         const writer = getWriter();
         const items = Array.isArray(body['items']) ? (body['items'] as unknown[]) : [];
         return reviewSubmit(writer.store, { items, producer: 'webui', model: typeof body['model'] === 'string' ? body['model'] : null });
+      }
+      if (path === '/api/annotations') {
+        // 只写批注文件：不改记忆、不入 outbox。单条与批量共用一个端点，
+        // 批量逐条校验、分别计数（spec「批量标记」）。
+        const writer = getWriter();
+        const disposition = typeof body['disposition'] === 'string' ? body['disposition'] : '';
+        const note = typeof body['note'] === 'string' ? body['note'] : '';
+        if (Array.isArray(body['memoryIds'])) {
+          const ids = (body['memoryIds'] as unknown[]).map(String);
+          return writer.annotateBatch({ memoryIds: ids, disposition, note });
+        }
+        const memoryId = typeof body['memoryId'] === 'string' ? body['memoryId'] : '';
+        if (memoryId.length === 0) throw err('E_VALIDATION', '缺少 memoryId 或 memoryIds');
+        const annotation = writer.annotateMemory({ memoryId, disposition, note });
+        return { succeeded: 1, failed: [], annotations: [annotation] };
       }
       if (path === '/api/plans') {
         const writer = getWriter();

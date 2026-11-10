@@ -157,6 +157,13 @@ async function main() {
     // 历史那次导入才是带 blocked 的（最新一次没有），所以点历史行。
     await histRow.click();
     await page.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
+    // 条目列表是异步装的：等"原文未入库"真的出现再断言（慢一点不应误判）。
+    await page
+      .waitForFunction(() => {
+        const d = document.querySelector('aside.drawer');
+        return d != null && /原文未入库/.test(d.innerText);
+      }, { timeout: 5000 })
+      .catch(() => {});
     const oldDrawerText = await page.locator('aside.drawer').innerText();
     check('抽屉展示 blocked 计数', /BLOCKED/.test(oldDrawerText), (oldDrawerText.match(/BLOCKED\s*\d+/) || [''])[0]);
     check('blocked 条目明说"原文未入库"', /原文未入库/.test(oldDrawerText));
@@ -180,6 +187,13 @@ async function main() {
     check('地址栏记录 drawer（刷新/分享可还原）', /drawer=/.test(page.url()), page.url());
     const drawerId = new URL(page.url()).searchParams.get('drawer');
 
+    // 条目正文是异步拉取的：等抽屉里真的出现正文再断言，避免慢一点就误判。
+    await page
+      .waitForFunction(() => {
+        const d = document.querySelector('aside.drawer');
+        return d != null && /部署/.test(d.innerText);
+      }, { timeout: 5000 })
+      .catch(() => {});
     const drawerText = await dialog.innerText();
     check('抽屉展示条目正文', /部署/.test(drawerText));
 
@@ -286,7 +300,84 @@ async function main() {
       }
     }
 
-    // ---------------------------------------------------------- G. 静态导出（只读预览页）
+    // ---------------------------------------------------------- G. 批注：点选 → 批量 → 陈旧灰显 → 待删
+    const addOut = await runCli(['add', '这条记忆用于验证批注：部署窗口是周四晚十点。']);
+    if (addOut.code !== 0) throw new Error(`批注样本写入失败: ${addOut.stderr || addOut.stdout}`);
+    const memId = JSON.parse(addOut.stdout).id;
+
+    await page.click('[data-view="memories"]');
+    await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
+
+    // 5.2 详情页"写下意见"入口存在（不改正文）
+    await page.locator('div.card').filter({ has: page.locator(`input[data-pick="${memId}"]`) }).locator('button:has-text("详情 / 修订史")').click();
+    await page.waitForSelector('[data-annotation-disposition]', { timeout: 5000 });
+    check('记忆详情有"写下意见"入口（类别下拉）', (await page.locator('[data-annotation-disposition] option').count()) >= 6);
+    await page.locator('button:has-text("← 返回列表")').click();
+    await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 5000 });
+
+    // 5.3 点选 + 批量标记
+    await page.locator(`input[data-pick="${memId}"]`).check();
+    const pickLabel = await page.locator('[data-pick-count]').innerText();
+    check('勾选记忆后计数更新', /已选\s*1\s*条/.test(pickLabel), pickLabel);
+    await page.selectOption('select[data-batch-disposition]', 'needs_edit');
+    await page.fill('input[data-batch-note]', '这条日期需要核对');
+    await page.click('button[data-batch-apply]');
+    await page.waitForTimeout(800);
+    const batchText = await page.locator('body').innerText();
+    check('批量标记报告成功条数', /已标记\s*1\s*条/.test(batchText), (batchText.match(/已标记[^\n]*/) || [''])[0]);
+
+    // 5.4/5.5 批注列表：类别、意见、处置者字段；记忆本身未改
+    await page.click('[data-view="annotations"]');
+    await page.waitForSelector(`[data-annotation-id]`, { timeout: 5000 });
+    const annText = await page.locator('#view').innerText();
+    check('批注列表显示类别与意见', /需要修改/.test(annText) && /这条日期需要核对/.test(annText), annText.slice(0, 90).replace(/\n/g, ' | '));
+    const showAfterAnnotate = JSON.parse((await runCli(['show', memId])).stdout);
+    check(
+      '批注后记忆正文与状态不变',
+      showAfterAnnotate.memory.content === '这条记忆用于验证批注：部署窗口是周四晚十点。' && showAfterAnnotate.memory.status === 'active',
+      showAfterAnnotate.memory.status,
+    );
+
+    // 陈旧灰显：CLI 更正记忆后，批注不删、只灰显
+    const upd = await runCli(['update', memId, '这条记忆用于验证批注：部署窗口改为周五晚十点。']);
+    if (upd.code !== 0) throw new Error(`更新样本记忆失败: ${upd.stderr || upd.stdout}`);
+    // 控制台的文档导航必须带令牌（sessionStorage 只供 /api/* 使用），
+    // 所以"刷新"用带令牌的地址重新进入，而不是 page.reload()。
+    await page.goto(`${server.tokenUrl}&view=annotations&mode=brief`, { waitUntil: 'networkidle' });
+    await page.waitForSelector('[data-annotation-id]', { timeout: 8000 });
+    const staleState = await page.locator('[data-annotation-id]').first().getAttribute('data-stale');
+    const staleText = await page.locator('#view').innerText();
+    const staleOpacity = await page.locator('[data-annotation-id]').first().evaluate((el) => Number(getComputedStyle(el).opacity));
+    check('记忆变更后批注标为陈旧', staleState === '1' && /意见可能已过时/.test(staleText), `${staleState} / ${(staleText.match(/意见可能已过时[^\n]*/) || [''])[0]}`);
+    check('陈旧批注灰显（opacity < 1）', staleOpacity < 1, String(staleOpacity));
+
+    // pending_forget：WebUI 只标记，界面明说"尚未删除"
+    await page.click('[data-view="memories"]');
+    await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 5000 });
+    await page.locator(`input[data-pick="${memId}"]`).check();
+    await page.selectOption('select[data-batch-disposition]', 'pending_forget');
+    await page.fill('input[data-batch-note]', '确认过期');
+    await page.click('button[data-batch-apply]');
+    await page.waitForTimeout(800);
+    await page.click('[data-view="annotations"]');
+    await page.waitForSelector('[data-annotation-id]', { timeout: 5000 });
+    const pendingText = await page.locator('#view').innerText();
+    check('待删项明说"仍为活动状态，尚未删除"', /仍为活动状态，尚未删除/.test(pendingText), pendingText.slice(0, 120).replace(/\n/g, ' | '));
+    const showAfterPending = JSON.parse((await runCli(['show', memId])).stdout);
+    check('WebUI 标记待删不删除记忆', showAfterPending.memory.status === 'active', showAfterPending.memory.status);
+
+    // 7.6 端到端：真实库（副本）上 dry-run 列出清单且零删除
+    const dryPending = await runCli(['forget', '--pending', '--dry-run', '--json']);
+    const pendingBody = JSON.parse(dryPending.stdout);
+    check(
+      'forget --pending --dry-run 列出待删且不删除',
+      dryPending.code === 0 && pendingBody.pending >= 1 && pendingBody.items.some((x) => x.memoryId === memId) && pendingBody.results.length === 0,
+      `pending=${pendingBody.pending}`,
+    );
+    const showAfterDry = JSON.parse((await runCli(['show', memId])).stdout);
+    check('dry-run 后记忆仍为活动状态', showAfterDry.memory.status === 'active', showAfterDry.memory.status);
+
+    // ---------------------------------------------------------- H. 静态导出（只读预览页）
     // 导出会把 scope 后缀插进文件名（安全告知第 1 层），所以读回执里的 written，
     // 不能假定叫 preview.html。
     staticFile = join(home, 'preview.html');

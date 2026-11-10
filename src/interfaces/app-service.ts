@@ -28,6 +28,17 @@ import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
 import { findUpstreamGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
+import {
+  addAnnotation as storeAnnotation,
+  addAnnotationsBatch as storeAnnotationsBatch,
+  readAnnotations as storeReadAnnotations,
+  resolveAnnotation as storeResolveAnnotation,
+  countOpenAnnotations,
+  type AnnotationQuery,
+  type AnnotationRecord,
+  type AnnotationView,
+  type BatchAnnotateResult,
+} from './console/annotations.js';
 import { findDuplicate } from '../governance/dedup.js';
 import { decideWrite, describeJudgement, Judgement, WriteAction } from '../onboarding/judgement.js';
 import { assignBatch, batchProgress, nextBatchChunk, markItemPromoted, listSkippedItems, promotedPredicate, BatchProgress, BatchChunkItem } from '../onboarding/batches.js';
@@ -397,6 +408,34 @@ export class AppService {
     return this.store.memories.archive(id);
   }
 
+  // -------------------------------------------------------------------------
+  // 批注（OpenSpec: add-memory-annotations）
+  //
+  // 批注是派生数据，只落 console/annotations.json；这里的每个方法都刻意
+  // 不触碰记忆正文 / 状态 / 修订链 / outbox（spec「逐条批注」）。
+  // -------------------------------------------------------------------------
+
+  annotateMemory(input: { memoryId: string; disposition: string; note?: string }): AnnotationRecord {
+    return storeAnnotation(this.store, input);
+  }
+
+  annotateBatch(input: { memoryIds: string[]; disposition: string; note?: string }): BatchAnnotateResult {
+    return storeAnnotationsBatch(this.store, input);
+  }
+
+  listAnnotations(query: AnnotationQuery = {}): AnnotationView[] {
+    return storeReadAnnotations(this.store, query);
+  }
+
+  resolveAnnotation(input: { id: string; status: string; by?: string }): AnnotationRecord {
+    return storeResolveAnnotation(this.store, { id: input.id, status: input.status, by: input.by ?? this.caller.agentId });
+  }
+
+  /** 待删清单：只读查询，永不执行删除（删除入口是 `cairn forget --pending`）。 */
+  listPendingForget(): AnnotationView[] {
+    return storeReadAnnotations(this.store, { disposition: 'pending_forget', status: 'open' });
+  }
+
   /**
    * 候选晋升（add-candidate-promote-command）。
    *
@@ -637,6 +676,16 @@ export class AppService {
     const upstreamGap = findUpstreamGap(store).length;
     if (upstreamGap > 0) {
       notes.push(`上行缺口 ${upstreamGap} 条：作用域允许上行但未入队，执行 cairn sync backfill --apply 补齐`);
+    }
+    // 待办批注：与 upstreamGap 同一条纪律——只进 notes，不进 problems，不改退出码。
+    let pendingAnnotations = 0;
+    try {
+      pendingAnnotations = countOpenAnnotations(store.paths.home);
+    } catch {
+      pendingAnnotations = 0; // 批注是旁注：读不出来不得影响体检结论
+    }
+    if (pendingAnnotations > 0) {
+      notes.push(`待办批注 ${pendingAnnotations} 条：在 cairn ui 的「批注」里查看；待删项用 cairn forget --pending 处理`);
     }
     // remote 三态：not_configured / configured_untested / verified（首次成功往返后置 verified）
     let remote: DoctorReport['remote'] = 'not_configured';

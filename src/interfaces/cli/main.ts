@@ -275,7 +275,67 @@ async function main(): Promise<void> {
       }
 
       case 'forget': {
-        if (!args[0]) throw new CairnError('E_VALIDATION', '用法: cairn forget <id> [--reason "..."]');
+        // add-memory-annotations D3：WebUI 只能标记 pending_forget，真正删除只在这里。
+        // MUST 先打印全部待删清单，再逐条执行并逐条报告（spec「命令行批量确认」）。
+        if (flags['pending'] === true) {
+          const pending = service.listPendingForget();
+          const dryRun = flags['dry-run'] === true;
+          const items = pending.map((p) => ({
+            annotationId: p.id,
+            memoryId: p.memoryId,
+            summary: p.memoryExcerpt,
+            note: p.note,
+            annotatedAt: p.createdAt,
+            memoryStatus: p.memoryStatus,
+          }));
+          if (!json) {
+            if (items.length === 0) {
+              console.log('待删清单为空：没有未处理的「标记待删」批注。');
+            } else {
+              console.log(`待删清单 ${items.length} 条（WebUI 只是标记，记忆仍是活动状态）：`);
+              for (const it of items) {
+                console.log(`- ${it.memoryId}  ${it.summary ?? '(正文已掩码或不可用)'}  · 标注于 ${it.annotatedAt}`);
+              }
+            }
+          }
+          if (dryRun) {
+            if (json) out({ dryRun: true, pending: items.length, items, results: [] }, flags);
+            diag('--dry-run：只打印清单，未删除任何记忆。');
+            break;
+          }
+          const results: { memoryId: string; ok: boolean; status?: string; reason?: string }[] = [];
+          for (const p of pending) {
+            try {
+              if (p.memoryStatus == null) {
+                // 记忆已不存在：批注留着只会永远挂在待办里，标记为忽略（不是删除动作）。
+                service.resolveAnnotation({ id: p.id, status: 'ignored', by: 'cli:forget' });
+                results.push({ memoryId: p.memoryId, ok: false, reason: '记忆已不存在（批注已标记为忽略）' });
+                continue;
+              }
+              if (p.memoryStatus === 'tombstoned') {
+                service.resolveAnnotation({ id: p.id, status: 'resolved', by: 'cli:forget' });
+                results.push({ memoryId: p.memoryId, ok: true, status: 'tombstoned', reason: '此前已是墓碑' });
+                continue;
+              }
+              const m = service.forgetMemory(p.memoryId, p.note.length > 0 ? `待删清单：${p.note}` : '待删清单确认（cairn forget --pending）');
+              service.resolveAnnotation({ id: p.id, status: 'resolved', by: 'cli:forget' });
+              results.push({ memoryId: p.memoryId, ok: true, status: m.status });
+            } catch (e) {
+              results.push({ memoryId: p.memoryId, ok: false, reason: (e as Error).message });
+            }
+          }
+          if (json) {
+            out({ dryRun: false, pending: items.length, items, results }, flags);
+          } else {
+            for (const r of results) {
+              console.log(`- ${r.ok ? '已遗忘' : '未处理'} ${r.memoryId}${r.status ? ` → ${r.status}` : ''}${r.reason ? `（${r.reason}）` : ''}`);
+            }
+            const okCount = results.filter((r) => r.ok).length;
+            diag(`待删清单处理完毕：成功 ${okCount} 条，失败 ${results.length - okCount} 条。`);
+          }
+          break;
+        }
+        if (!args[0]) throw new CairnError('E_VALIDATION', '用法: cairn forget <id> [--reason "..."]；或 cairn forget --pending [--dry-run]');
         const m = service.forgetMemory(args[0]!, str(flags, 'reason') ?? null);
         out({ id: m.id, status: m.status }, flags);
         break;
@@ -832,6 +892,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   show <id>                     记忆详情（修订/证据/冲突）
   update <id> "新内容"          用户更正（新修订，历史保留）
   forget <id>                   遗忘（可审计 tombstone） [--reason]
+         --pending            先列出 WebUI 标记的待删清单，再逐条遗忘 [--dry-run]
   archive <id>                  归档
   export                        导出 [--format json|markdown] [--out FILE] [--include-archives]
   plan create|show|list         治理计划（create 需 --items-file，零写入）

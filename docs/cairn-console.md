@@ -134,6 +134,35 @@ cairn ui --export ~/tmp/preview.html
 - **审批**：页面上要手动重抄计划哈希前 8 位才能签发。签发写入审计 `issued_via_webui`（CLI 签发是 `issued_via_cli`），事后能分清谁在哪儿签的。
 - **同步**：未配置 vault 时按钮 disabled 并说明缺哪一项；配置了才允许触发 `POST /api/sync/push|pull`。
 
+## 4.1 批注与待处置队列（add-memory-annotations）
+
+批注是**人对记忆的旁注**，不是记忆本体：写在 `<home>/console/annotations.json`（与 `ai-reviews.json` 同目录），**不建表、不参与云同步、不进入任何上行包**。删掉这个文件即回到纯只读控制台，记忆本身不受任何影响。
+
+三条硬边界：
+
+- 批注**从不修改记忆**：正文、状态、修订链、outbox 都不动；写入后记忆仍可被正常检索与注入。
+- `pending_forget` **从不执行删除**：WebUI 只做标记，界面明确显示"仍为活动状态，尚未删除"。
+- 写入前复用 `scanText`：意见命中秘密或注入规则即拒绝，不回显原文、不脱敏保存。
+
+### 用法
+
+| 入口 | 能做什么 |
+| --- | --- |
+| 记忆列表 | 逐条勾选 → 选处置类别 + 意见 → 「批量标记」；单条失败不中断，报告成功/失败条数 |
+| 记忆详情 | 「写下意见」：类别下拉 + 文本域；下方列出该记忆已有的批注 |
+| 「批注」视图 | 按状态（待处理/已处置/已忽略）与类别过滤；记忆修订后批注标「意见可能已过时」并灰显，但**不删** |
+| `cairn forget --pending` | 先打印全部待删条目（id + 摘要 + 标注时间），再逐条遗忘并逐条报告 |
+| `cairn forget --pending --dry-run` | 只打印清单，零写入 |
+| MCP `memory_annotations_list` | Agent 拉取批注；**不返回记忆正文全文**，只给标识、类别、意见与短摘要 |
+| MCP `memory_annotation_resolve` | Agent 回写 `resolved` / `ignored`，记录 `mcp:<agent>` 与时间；不碰记忆 |
+| `cairn doctor` | 待办批注数进 `notes` 一行；**不进 problems、不改退出码** |
+
+处置类别：`needs_edit`（需要修改）、`needs_merge`（需要合并）、`can_delete`（可以删除）、`uncertain`（存疑待查）、`no_action`（无需处理）、`pending_forget`（标记待删）。`no_action` 不计入 doctor 的待办数。
+
+待删两段式的理由：墓碑是 sticky 的（其他设备推旧版本也救不回来），所以执行动作留在有完整上下文的终端；WebUI 误触的成本从"永久删除一条记忆"降为"多一条可随时取消的标记"。
+
+批注是**本机私有**的：跨设备只同步处置结果（修订走 `memory_update`、遗忘走既有 tombstone 上行），不同步批注本身。
+
 ## 5. 双层建议与 AI 复核
 
 建议分两层，**并列存在、互不覆盖**：
@@ -214,7 +243,7 @@ cairn review list --batch <batchId>
 - 浏览器用**系统已装的 Chrome**（`channel: 'chrome'`），不下载 Chromium。
 - 依赖是一次性的、**故意不写进 `package.json`**：缺 playwright 时脚本 exit 2 并打印 `npm i --no-save --no-package-lock playwright`，不静默跳过——静默跳过会让"UI 已验证"变成假象。
 - 全程在临时 HOME 里造数据（`init` → 同路径导两次 → 签发策略），跑完自删；`CAIRN_KEEP_E2E=1` 可保留样本。
-- 覆盖：导航替换、同源折叠的可见性、抽屉三入口与焦点归还、地址往返还原、批量面板先摊开再确认、自动整理预演/真跑/撤销确认、静态预览页无写入口、全程零脚本错误。
+- 覆盖：导航替换、同源折叠的可见性、抽屉三入口与焦点归还、地址往返还原、批量面板先摊开再确认、自动整理预演/真跑/撤销确认、批注点选/批量/陈旧灰显/待删 dry-run、静态预览页无写入口、全程零脚本错误。
 - 报告落 `artifacts/console-ui-<date>.json`（不入库）。2026-10-30 实测 46/46。
 
 它抓到的三个缺陷（已修，并在 `tests/console/assets.test.ts` 留了形状断言）：

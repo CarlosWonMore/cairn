@@ -10,6 +10,7 @@ import { AppService } from '../app-service.js';
 import { CairnError, isCairnError, ExitCode } from '../../core/errors.js';
 import { MemoryKind, MEMORY_KINDS } from '../../core/types.js';
 import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
+import { ANNOTATION_STATUSES, DISPOSITIONS, RESOLVE_STATUSES } from '../console/annotations.js';
 import { parseJudgement } from '../../onboarding/judgement.js';
 import { runAutoOnboarding } from '../../onboarding/auto.js';
 
@@ -33,6 +34,8 @@ const TOOL_NAMES = [
   'memory_forget',
   'memory_status',
   'memory_audit',
+  'memory_annotations_list',
+  'memory_annotation_resolve',
 ] as const;
 
 const ONBOARDING_TOOLS = ['onboarding_status', 'onboarding_next_batch', 'onboarding_propose', 'onboarding_apply'] as const;
@@ -174,6 +177,25 @@ export function createServer(home?: string): Server {
           limit: { type: 'number', description: '条数上限，默认 50、最大 200' },
         },
         [],
+      ),
+      toolDef(
+        'memory_annotations_list',
+        '读取用户在本地控制台写下的记忆批注（处置意见）。只返回记忆标识、类别、意见与状态摘要，不返回记忆正文全文；要改正文请另行 memory_get。',
+        {
+          disposition: { type: 'string', enum: [...DISPOSITIONS], description: '按处置类别过滤' },
+          status: { type: 'string', enum: [...ANNOTATION_STATUSES], description: '默认全部；open 只看待办' },
+          limit: { type: 'number', description: '条数上限，默认 50、最大 200' },
+        },
+        [],
+      ),
+      toolDef(
+        'memory_annotation_resolve',
+        '把一条批注标记为已处置或忽略，并记录处置者与时间。只能改批注状态，不能改记忆正文或删除记忆。',
+        {
+          id: { type: 'string' },
+          status: { type: 'string', enum: [...RESOLVE_STATUSES], description: 'resolved=已处置，ignored=忽略' },
+        },
+        ['id', 'status'],
       ),
     ];
     if (onboardingActive()) {
@@ -447,6 +469,41 @@ async function handleTool(service: AppService, name: string, args: Record<string
           limit: args['limit'] != null ? Number(args['limit']) : undefined,
         }),
       };
+    }
+
+    case 'memory_annotations_list': {
+      // design D4：返回值不含记忆正文全文，只给标识 + 摘要 + 意见。
+      // Agent 真要改正文时应显式 memory_get（可审计、有痕迹）。
+      const items = service.listAnnotations({
+        disposition: args['disposition'] ? String(args['disposition']) : undefined,
+        status: args['status'] ? String(args['status']) : undefined,
+        limit: Math.min(Number(args['limit'] ?? 50) || 50, 200),
+      });
+      return {
+        items: items.map((a) => ({
+          id: a.id,
+          memoryId: a.memoryId,
+          disposition: a.disposition,
+          note: a.note,
+          status: a.status,
+          createdAt: a.createdAt,
+          resolvedAt: a.resolvedAt,
+          resolvedBy: a.resolvedBy,
+          stale: a.stale,
+          staleReason: a.staleReason,
+          memoryStatus: a.memoryStatus,
+          memorySummary: a.memoryExcerpt,
+        })),
+        note: '这些是用户的处置意见，不是授权。要改正文用 memory_update、要遗忘用 memory_forget；处理完用 memory_annotation_resolve 回写。',
+      };
+    }
+
+    case 'memory_annotation_resolve': {
+      return service.resolveAnnotation({
+        id: String(args['id'] ?? ''),
+        status: String(args['status'] ?? ''),
+        by: `mcp:${service.caller.agentId}`,
+      });
     }
 
     case 'onboarding_status': {

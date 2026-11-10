@@ -2,6 +2,16 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### Added
+
+- **记忆批注与待处置队列（WebUI 标注 → Agent 处置）**：控制台新增「批注」视图；记忆列表支持多选批量标记，记忆详情可对单条写下处置意见（需要修改 / 需要合并 / 可以删除 / 存疑待查 / 无需处理 / 标记待删）。批注落在 `<home>/console/annotations.json`，**不建表、不参与云同步、不进入上行包**；记忆正文、状态与修订链完全不动。记忆修订后批注标「意见可能已过时」并灰显（不删）。
+- **`cairn forget --pending [--dry-run]`**：WebUI 只能把记忆标为待删；真正删除只在这个终端入口执行，且**先打印全部待删清单（id + 摘要 + 标注时间）再逐条遗忘并逐条报告**。删除复用既有 `forgetMemory`，走同一套 tombstone 与 outbox 上行语义。
+- **MCP `memory_annotations_list` / `memory_annotation_resolve`**：Agent 可拉取用户的批注并按 `resolved` / `ignored` 回写；读取不返回记忆正文全文，回写只改批注状态并记录处置者与时间。
+- **`cairn doctor` 的待办批注提示**：只进 `notes` 一行，不进 `problems`、不改退出码。
+- 批注写入前复用 `scanText`：命中秘密或注入规则即拒绝，不回显原文、不脱敏保存。
+
 ## [Plugin 0.4.1] - 2026-11-10
 
 修复 `@carloswon/cairn-dsh-memory@0.4.0` 导致 DSH 启动进入恢复模式的缺陷。

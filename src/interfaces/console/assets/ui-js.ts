@@ -30,8 +30,8 @@ export const UI_JS = String.raw`
     // 令牌进 sessionStorage 之后地址栏不需要它，剩下的状态必须原样留着。
     var keep = new URLSearchParams(location.search.slice(1));
     keep.delete('t');
-    var qs = keep.toString();
-    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+    var rest = keep.toString();
+    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
   } else {
     try { TOKEN = sessionStorage.getItem('cairn.token') || ''; } catch (e) {}
   }
@@ -57,7 +57,10 @@ export const UI_JS = String.raw`
     model: null,
     policies: [],
     policy: '',
-    aiReviews: {}
+    aiReviews: {},
+    picks: {},
+    annotationStatus: 'open',
+    annotationDisposition: ''
   };
 
   // ---------------------------------------------------------------- 基础工具
@@ -99,6 +102,15 @@ export const UI_JS = String.raw`
     archived: 'muted', tombstoned: 'danger'
   };
   var BATCH_CHIP = { awaiting_approval: 'warn', approved: 'pending', applied: 'ok', expired: 'muted', invalidated: 'danger', rejected: 'danger', draft: 'info' };
+  var DISPOSITION_LABEL = {
+    needs_edit: '需要修改', needs_merge: '需要合并', can_delete: '可以删除',
+    uncertain: '存疑待查', no_action: '无需处理', pending_forget: '标记待删'
+  };
+  var DISPOSITION_CHIP = {
+    needs_edit: 'warn', needs_merge: 'pending', can_delete: 'danger',
+    uncertain: 'info', no_action: 'muted', pending_forget: 'danger'
+  };
+  var ANN_STATUS_LABEL = { open: '待处理', resolved: '已处置', ignored: '已忽略' };
 
   function toast(msg, isErr) {
     var t = el('div', { 'class': 'warnbar' }, msg);
@@ -206,6 +218,7 @@ export const UI_JS = String.raw`
   var VIEWS = [
     { id: 'overview', label: '概览' },
     { id: 'memories', label: '记忆' },
+    { id: 'annotations', label: '批注' },
     { id: 'imports', label: '导入' },
     { id: 'approvals', label: '审批' },
     { id: 'sync', label: '同步' }
@@ -251,6 +264,7 @@ export const UI_JS = String.raw`
     if (STATIC && state.view === 'overview') return renderOverview(body);
     if (state.view === 'overview') return renderOverview(body);
     if (state.view === 'memories') return renderMemories(body);
+    if (state.view === 'annotations') return renderAnnotations(body);
     if (state.view === 'imports') return renderImports(body);
     if (state.view === 'approvals') return renderApprovals(body);
     if (state.view === 'sync') return renderSync(body);
@@ -438,10 +452,21 @@ export const UI_JS = String.raw`
 
   function paintMemories(host, list, total) {
     host.appendChild(el('div', { 'class': 'empty', style: 'padding:0 0 10px' }, '命中 ' + total + ' 条，已展示 ' + list.length + ' 条 · 模式 ' + state.mode));
+    if (!STATIC) host.appendChild(annotationBar());
     if (!list.length) { empty(host, '没有匹配的记忆。'); return; }
     list.forEach(function (mem) {
       var box = el('div', { 'class': 'card', style: 'margin-bottom:10px' });
       var head = el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px' });
+      if (!STATIC) {
+        var pick = el('input', { type: 'checkbox', 'data-pick': mem.id, title: '选中以批量标记' });
+        if (state.picks[mem.id]) pick.checked = true;
+        pick.addEventListener('change', function () {
+          if (pick.checked) state.picks[mem.id] = true;
+          else delete state.picks[mem.id];
+          refreshPickCount();
+        });
+        head.appendChild(pick);
+      }
       head.appendChild(chip(mem.kind, 'info'));
       head.appendChild(chip(mem.status, STATUS_CHIP[mem.status] || 'muted'));
       head.appendChild(chip(mem.authority, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
@@ -474,6 +499,162 @@ export const UI_JS = String.raw`
     });
   }
 
+  // ---------------------------------------------------------------- 批注
+  function pickCount() { return Object.keys(state.picks).length; }
+  function refreshPickCount() {
+    var n = document.querySelector('[data-pick-count]');
+    if (n) n.textContent = '已选 ' + pickCount() + ' 条';
+  }
+
+  /** 记忆列表上方的批量标记条：只写批注，不动记忆。 */
+  function annotationBar() {
+    var bar = el('div', { 'class': 'toolbar', 'data-batch-annotation': '1' });
+    bar.appendChild(el('span', { 'class': 'empty', style: 'padding:0;font-size:12px', 'data-pick-count': '1' }, '已选 ' + pickCount() + ' 条'));
+    var sel = el('select', { 'class': 'action', 'data-batch-disposition': '1' });
+    sel.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
+    sel.appendChild(el('option', { value: '' }, '选择处置类别…'));
+    Object.keys(DISPOSITION_LABEL).forEach(function (k) {
+      sel.appendChild(el('option', { value: k }, DISPOSITION_LABEL[k]));
+    });
+    bar.appendChild(sel);
+    var note = el('input', { type: 'text', 'data-batch-note': '1', placeholder: '意见（可选，不能含秘密）' });
+    bar.appendChild(note);
+    var apply = el('button', { type: 'button', 'class': 'action primary', 'data-batch-apply': '1' }, '批量标记');
+    apply.addEventListener('click', function () {
+      var ids = Object.keys(state.picks);
+      if (!ids.length) { toast('先勾选至少一条记忆', true); return; }
+      if (!sel.value) { toast('先选择处置类别', true); return; }
+      apply.disabled = true;
+      api('/api/annotations', { method: 'POST', body: { memoryIds: ids, disposition: sel.value, note: note.value } })
+        .then(function (r) {
+          apply.disabled = false;
+          toast('已标记 ' + r.succeeded + ' 条' + (r.failed.length ? '，失败 ' + r.failed.length + ' 条' : ''), r.failed.length > 0);
+          state.picks = {};
+          render();
+        })
+        .catch(function (e) { apply.disabled = false; toast('标记失败：' + e.message, true); });
+    });
+    bar.appendChild(apply);
+    var clearBtn = el('button', { type: 'button', 'class': 'action' }, '清除选择');
+    clearBtn.addEventListener('click', function () { state.picks = {}; render(); });
+    bar.appendChild(clearBtn);
+    return bar;
+  }
+
+  function annotationCard(a) {
+    // 陈旧只灰显、不隐藏：意见仍是人的判断，只是可能已过时。
+    var c = el('div', {
+      'class': 'card', 'data-annotation-id': a.id, 'data-stale': a.stale ? '1' : '0',
+      style: 'margin-bottom:8px' + (a.stale ? ';opacity:.55' : '')
+    });
+    var h = el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px' });
+    h.appendChild(chip(DISPOSITION_LABEL[a.disposition] || a.disposition, DISPOSITION_CHIP[a.disposition] || 'muted'));
+    h.appendChild(chip(ANN_STATUS_LABEL[a.status] || a.status, a.status === 'open' ? 'warn' : 'muted'));
+    if (a.stale) h.appendChild(chip('意见可能已过时', 'warn'));
+    if (a.memoryStatus === 'tombstoned') h.appendChild(chip('记忆已遗忘', 'muted'));
+    h.appendChild(el('span', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11.5px' }, String(a.memoryId).slice(0, 8)));
+    if (a.memoryExcerpt) h.appendChild(el('span', { 'class': 'empty', style: 'padding:0;font-size:11.5px' }, short(a.memoryExcerpt, 46)));
+    c.appendChild(h);
+    if (a.note) c.appendChild(el('div', { style: 'white-space:pre-wrap;word-break:break-word;font-size:12.5px' }, a.note));
+    c.appendChild(el('div', { 'class': 'empty', style: 'padding:4px 0 0;font-size:11.5px' },
+      '标注于 ' + fmtTime(a.createdAt) + (a.resolvedAt ? ' · ' + (a.resolvedBy || '') + ' 于 ' + fmtTime(a.resolvedAt) : '')));
+    if (a.disposition === 'pending_forget' && a.status === 'open') {
+      c.appendChild(el('div', { 'class': 'warnbar', style: 'margin-top:8px' },
+        '仍为活动状态，尚未删除。真正删除需要终端执行 cairn forget --pending（会先列出清单再逐条确认）。'));
+    }
+    return c;
+  }
+
+  function annotationForm(memoryId, onSaved) {
+    var box = el('div', { 'class': 'card', style: 'margin-top:10px' });
+    var sel = el('select', { 'class': 'action', 'data-annotation-disposition': '1' });
+    sel.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
+    sel.appendChild(el('option', { value: '' }, '选择处置类别…'));
+    Object.keys(DISPOSITION_LABEL).forEach(function (k) {
+      sel.appendChild(el('option', { value: k }, DISPOSITION_LABEL[k]));
+    });
+    box.appendChild(sel);
+    var ta = el('textarea', { rows: '3', 'data-annotation-note': '1', placeholder: '这条记忆该怎么处理？（不能含秘密；批注不会修改记忆）' });
+    ta.style.cssText = 'display:block;width:100%;margin-top:8px;box-sizing:border-box;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font:inherit;font-size:12.5px';
+    box.appendChild(ta);
+    var btn = el('button', { type: 'button', 'class': 'action primary', 'data-annotation-save': '1', style: 'margin-top:8px' }, '保存批注');
+    btn.addEventListener('click', function () {
+      if (!sel.value) { toast('先选择处置类别', true); return; }
+      btn.disabled = true;
+      api('/api/annotations', { method: 'POST', body: { memoryId: memoryId, disposition: sel.value, note: ta.value } })
+        .then(function () {
+          btn.disabled = false;
+          ta.value = '';
+          toast('批注已保存（记忆未改动）');
+          if (onSaved) onSaved();
+        })
+        .catch(function (e) { btn.disabled = false; toast('保存失败：' + e.message, true); });
+    });
+    box.appendChild(btn);
+    return box;
+  }
+
+  function loadAnnotationCards(memoryId, host) {
+    api('/api/annotations?memory=' + encodeURIComponent(memoryId)).then(function (d) {
+      clear(host);
+      if (!d.items.length) { empty(host, '这条记忆还没有批注。'); return; }
+      d.items.forEach(function (a) { host.appendChild(annotationCard(a)); });
+    }).catch(function (e) { clear(host); fail(host, e); });
+  }
+
+  function renderAnnotations(host) {
+    if (STATIC) {
+      empty(host, '静态导出不含批注：批注是本机私有数据，不参与导出、也不参与云同步。');
+      return;
+    }
+    var bar = el('div', { 'class': 'toolbar' });
+    var st = el('select', { 'class': 'action', 'data-ann-status': '1' });
+    st.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
+    [['', '全部状态'], ['open', '待处理'], ['resolved', '已处置'], ['ignored', '已忽略']].forEach(function (v) {
+      var o = el('option', { value: v[0] }, v[1]);
+      if (v[0] === state.annotationStatus) o.setAttribute('selected', 'selected');
+      st.appendChild(o);
+    });
+    bar.appendChild(st);
+    var dp = el('select', { 'class': 'action', 'data-ann-disposition': '1' });
+    dp.style.cssText = st.style.cssText;
+    dp.appendChild(el('option', { value: '' }, '全部类别'));
+    Object.keys(DISPOSITION_LABEL).forEach(function (k) {
+      var o = el('option', { value: k }, DISPOSITION_LABEL[k]);
+      if (k === state.annotationDisposition) o.setAttribute('selected', 'selected');
+      dp.appendChild(o);
+    });
+    bar.appendChild(dp);
+    var refresh = el('button', { type: 'button', 'class': 'action' }, '刷新');
+    bar.appendChild(refresh);
+    host.appendChild(bar);
+
+    var listHost = el('div');
+    host.appendChild(listHost);
+
+    function load() {
+      state.annotationStatus = st.value;
+      state.annotationDisposition = dp.value;
+      clear(listHost);
+      loading(listHost);
+      api('/api/annotations?status=' + encodeURIComponent(st.value) + '&disposition=' + encodeURIComponent(dp.value) + '&limit=500')
+        .then(function (d) {
+          clear(listHost);
+          var staleN = d.items.filter(function (a) { return a.stale; }).length;
+          listHost.appendChild(el('div', { 'class': 'empty', style: 'padding:0 0 10px' },
+            '共 ' + d.total + ' 条' + (staleN ? ' · 陈旧 ' + staleN + ' 条（灰显）' : '') +
+            ' · 批注只在本机，删除批注文件不影响任何记忆'));
+          if (!d.items.length) { empty(listHost, '没有匹配的批注。'); return; }
+          d.items.forEach(function (a) { listHost.appendChild(annotationCard(a)); });
+        })
+        .catch(function (e) { clear(listHost); fail(listHost, e); });
+    }
+    st.addEventListener('change', load);
+    dp.addEventListener('change', load);
+    refresh.addEventListener('click', load);
+    load();
+  }
+
   function openDetail(id) {
     var host = document.getElementById('view');
     api('/api/memories/' + encodeURIComponent(id) + '?mode=' + state.mode + '&redact=0').then(function (d) {
@@ -497,6 +678,14 @@ export const UI_JS = String.raw`
         meta.appendChild(tr);
       });
       host.appendChild(meta);
+
+      if (!STATIC) {
+        host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '写下意见（不修改记忆）'));
+        var annHost = el('div', { 'data-memory-annotations': '1' });
+        host.appendChild(annotationForm(d.memory.id, function () { loadAnnotationCards(d.memory.id, annHost); }));
+        host.appendChild(annHost);
+        loadAnnotationCards(d.memory.id, annHost);
+      }
 
       host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '修订史（' + d.revisions.length + '）'));
       d.revisions.forEach(function (r) {
@@ -1082,7 +1271,7 @@ export const UI_JS = String.raw`
     if (ev.key === 'p' || ev.key === 'P') { ev.preventDefault(); go('imports', true); return; }
     if (ev.key === 't' || ev.key === 'T') { ev.preventDefault(); toggleTheme(); return; }
     if (ev.key === 'm' || ev.key === 'M') { ev.preventDefault(); toggleMode(); return; }
-    if (ev.key === '?') { ev.preventDefault(); toast('快捷键：1-5 切视图 · / 检索 · P 导入 · M 摘要/全文 · T 主题 · Esc 关闭抽屉', false); }
+    if (ev.key === '?') { ev.preventDefault(); toast('快捷键：1-6 切视图 · / 检索 · P 导入 · M 摘要/全文 · T 主题 · Esc 关闭抽屉', false); }
   });
 
   window.addEventListener('popstate', function () { readUrl(); renderNav(); render(); });
