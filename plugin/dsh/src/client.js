@@ -170,8 +170,18 @@ window.__ModuleLoader__.load({
     }
 
     var KIND_LABEL = { recall: '自动召回', tool: '工具调用' };
-    /** 活动条目的稳定键：同一毫秒同一类型的重复记录几乎不存在，够用且不依赖数组下标。 */
-    function entryKey(e) { return String(e && e.t) + '|' + String(e && e.kind); }
+    /**
+     * 活动条目的稳定键：折叠会刷新 t，所以有 firstT 时用它——否则用户点选高亮后，
+     * 下一次轮询的折叠会把键改掉，选中项跳走。
+     */
+    function entryKey(e) { return String((e && (e.firstT || e.t)) || '') + '|' + String(e && e.kind); }
+    /** 旧记录（nothing_new 时代）把「命中但已去重」写成了「注入0」，展示时按新口径重述。 */
+    function displaySummary(e) {
+      var s = e && typeof e.summary === 'string' ? e.summary : '';
+      if (s.indexOf('nothing_new') < 0) return s;
+      var out = s.replace(/注入0/g, '已去重').replace(/\s*\(nothing_new\)/g, '');
+      return out.indexOf('已去重') >= 0 ? out : out + '（旧记录：已去重）';
+    }
 
     function MemoryUsageView(props) {
       const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : '';
@@ -398,6 +408,9 @@ window.__ModuleLoader__.load({
                       h('code', { style: { flex: 'none', opacity: .65, fontSize: 11 } }, m.kind || '?'),
                       h('span', { title: m.id, style: { minWidth: 0, overflowWrap: 'anywhere' } }, m.summary || ''));
                   })),
+            // 口径行：左栏是累计去重集合，右栏是每一步（含折叠后的多次）——两个数字不是一回事。
+            h('div', { style: { flex: 'none', marginTop: 6, fontSize: 11, opacity: .55, lineHeight: 1.7 } },
+              sessionItems.length + ' 条 · 右栏记录每一步，本栏按去重累计'),
           ], { flex: '1 1 auto' })),
 
         // ——— 分栏拖拽手柄 ———
@@ -461,6 +474,7 @@ window.__ModuleLoader__.load({
               : h('div', { style: { flex: '1 1 auto', minHeight: 0, maxHeight: '56vh', overflow: 'auto', fontSize: 12, lineHeight: 1.75 } },
                   entries.map(function (e, i) {
                     var k = entryKey(e);
+                    var count = Number(e.count) > 0 ? Number(e.count) : 1;
                     // 只有「自动召回」带 items，才有可高亮的对象；工具调用行保持纯展示。
                     var selectable = Array.isArray(e.items) && e.items.length > 0;
                     var on = selectable && selectedKey === k;
@@ -486,11 +500,17 @@ window.__ModuleLoader__.load({
                       },
                     },
                       h('span', {
+                        title: count > 1 && e.firstT
+                          ? '首次 ' + hhmmss(e.firstT) + ' · 最近 ' + hhmmss(e.t) + ' · ' + count + ' 次'
+                          : undefined,
                         style: { flex: 'none', opacity: .5, fontVariantNumeric: 'tabular-nums', fontSize: 11 },
                       }, hhmmss(e.t)),
                       h('span', { style: { flex: 'none', opacity: .75, minWidth: 52 } }, KIND_LABEL[e.kind] || e.kind),
+                      count > 1
+                        ? h('span', { style: { flex: 'none', opacity: .6, fontSize: 11, fontVariantNumeric: 'tabular-nums' } }, count + ' 次')
+                        : null,
                       filters.detail === 'full'
-                        ? h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, e.summary || '')
+                        ? h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, displaySummary(e))
                         : null,
                       selectable
                         ? h('span', { 'aria-hidden': true, style: { flex: 'none', opacity: on ? .9 : .35, fontSize: 11 } }, on ? '◉' : '○')

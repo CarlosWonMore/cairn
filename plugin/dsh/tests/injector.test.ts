@@ -9,11 +9,11 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import defaultExport, { ACTIVITY_FILE, apply, deriveQueries, extractStepText, extractText, inject, makeInjectionMessage, name, recallDiag } from '../src/index.js';
+import defaultExport, { ACTIVITY_FILE, apply, createInjector, deriveQueries, extractStepText, extractText, inject, loadPersistedActivity, makeInjectionMessage, name, recallDiag } from '../src/index.js';
 import { isStopTerm } from '../src/recall.js';
 import { toSummary } from '../src/usage-state.js';
 
@@ -567,6 +567,18 @@ describe('活动持久化开关（默认内存，用户 2026-11-02 决策）', (
     assert.equal(bad2.status, 400);
     assert.equal(existsSync(join(home, 'activity-dsh.enabled')), false, '非法请求不得开落盘');
   });
+
+  it('4.3 回放旧行：缺 count 按 1 处理（向后兼容）', () => {
+    useTempHome();
+    writeFileSync(
+      join(home, ACTIVITY_FILE),
+      JSON.stringify({ t: '2026-11-01T00:00:00.000Z', kind: 'recall', summary: '自动召回 候选1 注入1' }) + '\n',
+      'utf8',
+    );
+    const entries = loadPersistedActivity();
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]!.count, 1, '老行没有 count，读取时必须按 1 处理');
+  });
 });
 describe('状态判定：有候选且已渲染时不能是 miss（2026-11-02 实测缺陷）', () => {
   it('frontmatter 记忆的 summary 能被 includes 匹配，status=injected', () => {
@@ -575,6 +587,219 @@ describe('状态判定：有候选且已渲染时不能是 miss（2026-11-02 实
     assert.equal(summary, '交付先归档');
     // 旧实现用 content 首行前 20 字（'---'）去 includes，永远不匹配 → miss
     assert.ok(!content.split(/\r?\n/)[0]!.trim().slice(0, 20).includes('交付先归档'));
+  });
+});
+
+describe('召回结果三态：候选/去重/未命中必须分得开（fix-memory-panel-drift D1）', () => {
+  const hit = { id: 'm1', kind: 'fact', content: '投影预算是 2KB' };
+
+  it('1.1 同一记忆第二次被召回：reason=all_seen、deduped>=1、injectedIds 为空', async () => {
+    const inj = createInjector({ recall: async () => [hit] });
+    const first = await inj.runOnce('投影预算是多少');
+    assert.equal(first.reason, 'ok');
+    const second = await inj.runOnce('投影预算是多少');
+    assert.equal(second.reason, 'all_seen');
+    assert.ok(second.deduped >= 1, '必须报出被去重挡掉的条数');
+    assert.equal(second.injectedIds.length, 0);
+    assert.equal(second.candidates, 1, '候选仍应如实计数');
+    assert.equal(second.sessionTotal, 1);
+  });
+
+  it('1.2 候选为空：reason=miss，MUST NOT 标成 all_seen', async () => {
+    const inj = createInjector({ recall: async () => [] });
+    const out = await inj.runOnce('投影预算是多少');
+    assert.equal(out.reason, 'miss');
+    assert.equal(out.candidates, 0);
+    assert.equal(out.deduped, 0);
+  });
+
+  it('1.3 真实注入：reason=ok 且 sessionTotal 等于去重集合大小', async () => {
+    const inj = createInjector({ recall: async () => [hit] });
+    const out = await inj.runOnce('投影预算是多少');
+    assert.equal(out.reason, 'ok');
+    assert.equal(out.sessionTotal, inj.seenCount());
+    assert.equal(out.sessionTotal, 1);
+  });
+});
+
+describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/4）', () => {
+  type MutableHit = { id: string; kind: string; content: string };
+
+  /** 可换命中集的最小 ctx：同一轮里所有查询路都返回同一批条目。 */
+  function makeMutableCtx() {
+    let items: MutableHit[] = [];
+    const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
+    const ctx: Record<string, unknown> = {
+      tools: {
+        get: () => ({
+          execute: async () => ({ content: [{ type: 'text', text: JSON.stringify({ items }) }] }),
+        }),
+      },
+      webServer: { register: (o: unknown) => routes.push(o as never) },
+      on: (e: string, fn: unknown) => { ctx[e] = fn; },
+    };
+    function read(): Record<string, unknown> {
+      let body = '';
+      const handler = routes.find((r) => r.path === '/plugins/cairn-dsh-memory/usage')!.handler!;
+      handler({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage?session=sess-A&history=1' }, { writeHead: () => {}, end: (b: string) => { body = b; } });
+      return JSON.parse(body) as Record<string, unknown>;
+    }
+    return { ctx, read, setItems: (next: MutableHit[]) => { items = next; } };
+  }
+
+  const step = () => ({
+    agent: { id: 'sess-A', inject: () => {} },
+    messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
+  });
+
+  it('3.2 已去重：措辞含累计条数，且不含「注入0」', async () => {
+    const { ctx, read, setItems } = makeMutableCtx();
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    await preStep(step(), () => {});
+    await preStep(step(), () => {});
+    const recent = read()['recent'] as { summary: string }[];
+    const last = recent[recent.length - 1]!;
+    assert.match(last.summary, /已去重 1 条（本会话已注入 1 条）/, `实际 ${last.summary}`);
+    assert.ok(!last.summary.includes('注入0'), 'MUST NOT 出现「注入0」');
+  });
+
+  it('3.3 未命中：候选为空时写「未命中」，不写「已去重」', async () => {
+    const { ctx, read } = makeMutableCtx();
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep(step(), () => {});
+    const recent = read()['recent'] as { summary: string }[];
+    assert.equal(recent[recent.length - 1]!.summary, '自动召回 未命中');
+  });
+
+  it('4.4 连续 20 次空步折叠成一条 count=20；中间真实注入仍独立成条', async () => {
+    const { ctx, read, setItems } = makeMutableCtx();
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    await preStep(step(), () => {});
+    for (let i = 0; i < 20; i++) await preStep(step(), () => {});
+
+    let recent = read()['recent'] as { summary: string; items?: { id: string }[]; count?: number }[];
+    assert.equal(recent.length, 2, '20 次空步必须折叠');
+    assert.equal(recent[0]!.items?.[0]?.id, 'm1', '真实注入仍独立成条');
+    assert.equal(recent[1]!.count, 20, `折叠次数应为 20，实际 ${recent[1]!.count}`);
+    assert.match(recent[1]!.summary, /已去重/);
+
+    // 夹一次真实注入：新记忆进来，前一段折叠必须断开。
+    setItems([{ id: 'm2', kind: 'fact', content: '库入口在 docs' }]);
+    await preStep(step(), () => {});
+    for (let i = 0; i < 5; i++) await preStep(step(), () => {});
+
+    recent = read()['recent'] as typeof recent;
+    assert.equal(recent.length, 4, '折叠段 + 注入 + 折叠段 必须各占一条');
+    assert.equal(recent[2]!.items?.[0]?.id, 'm2', '真实注入永远单独成条');
+    assert.equal(recent[2]!.count, undefined, '带 items 的记录不得带 count');
+    assert.equal(recent[3]!.count, 5);
+  });
+
+  it('4.2 连续两次真实注入永不折叠（带 items 各自成条）', async () => {
+    const { ctx, read, setItems } = makeMutableCtx();
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    await preStep(step(), () => {});
+    setItems([{ id: 'm2', kind: 'fact', content: '库入口在 docs' }]);
+    await preStep(step(), () => {});
+
+    const recent = read()['recent'] as { items?: { id: string }[]; count?: number }[];
+    assert.equal(recent.length, 2, '两次真实注入都必须独立成条');
+    assert.deepEqual(recent.map((e) => e.items?.[0]?.id), ['m1', 'm2']);
+    assert.ok(recent.every((e) => e.count === undefined), '带 items 的记录不得被折叠');
+  });
+
+  it('4.5 折叠条目保留 firstT（首次）与 t（最近），可算时间跨度', async () => {
+    const { ctx, read, setItems } = makeMutableCtx();
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    await preStep(step(), () => {});
+    await preStep(step(), () => {});
+    await new Promise((r) => setTimeout(r, 5));
+    await preStep(step(), () => {});
+    await preStep(step(), () => {});
+
+    const recent = read()['recent'] as { firstT?: string; t: string; count?: number }[];
+    const folded = recent[recent.length - 1]!;
+    assert.equal(folded.count, 3);
+    assert.ok(folded.firstT, '折叠条目必须保留首次时间');
+    assert.ok(Date.parse(folded.firstT!) <= Date.parse(folded.t), 'firstT 不得晚于 t');
+    assert.ok(Date.parse(folded.t) > Date.parse(folded.firstT!), 't 必须刷新为最近一次');
+  });
+});
+
+describe('去重重置：会话 id 变化与上下文压缩（fix-memory-panel-drift 5.4/5.2）', () => {
+  const step = (id: string, inject: (m: unknown) => void) => ({
+    agent: { id, inject },
+    messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
+  });
+
+  it('5.4 会话 id 变化 → 新会话状态为空、同一记忆可再次注入', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    const before = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-B&history=1') as {
+      sessionInjected?: unknown[];
+      recent?: unknown[];
+    };
+    assert.deepEqual(before.sessionInjected, [], '新会话开始时累计列表必须为空');
+    assert.deepEqual(before.recent, [], '新会话开始时活动记录必须为空');
+
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    await preStep(step('sess-A', (m) => a.push(m)), () => {});
+    await preStep(step('sess-B', (m) => b.push(m)), () => {});
+    assert.equal(a.length, 1);
+    assert.equal(b.length, 1, '会话 id 变化必须视为新会话，同一记忆可再次注入');
+    const after = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-B&history=1') as {
+      sessionInjected?: { id: string }[];
+    };
+    assert.deepEqual(after.sessionInjected?.map((m) => m.id), ['m1']);
+  });
+
+  it('5.2 压缩成功（compaction/end）后清空去重与本会话累计，同一记忆可再次注入', async () => {
+    const { ctx, readUsage } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    const onEvent = (ctx as Record<string, unknown>)['session/event'] as (s: unknown, e: unknown) => void;
+    assert.ok(onEvent, 'session/event 必须已注册');
+
+    const first: unknown[] = [];
+    await preStep(step('sess-C', (m) => first.push(m)), () => {});
+    assert.equal(first.length, 1);
+    const deduped: unknown[] = [];
+    await preStep(step('sess-C', (m) => deduped.push(m)), () => {});
+    assert.equal(deduped.length, 0, '未压缩时同一记忆不得重复注入');
+
+    // asar 实锤的 session 事件类型；上下文被重写后去重集合必须清空。
+    onEvent({ id: 'sess-C' }, { type: 'compaction/end', data: { compactionId: 'c1', turn: 1 } });
+    const afterReset = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-C&history=1') as { sessionInjected?: unknown[] };
+    assert.deepEqual(afterReset.sessionInjected, [], '压缩后本会话累计必须清空');
+
+    const again: unknown[] = [];
+    await preStep(step('sess-C', (m) => again.push(m)), () => {});
+    assert.equal(again.length, 1, '压缩后被重新召回的记忆必须能再次注入');
+    const after = readUsage('/plugins/cairn-dsh-memory/usage?session=sess-C&history=1') as { sessionInjected?: unknown[] };
+    assert.equal(after.sessionInjected?.length, 1, '左栏按会话重新累计');
+  });
+
+  it('5.2 压缩失败（compaction/end 带 error）不重置：未注入的记忆仍被去重', async () => {
+    const { ctx } = makeSpyCtx();
+    apply(ctx, {});
+    const preStep = (ctx as Record<string, unknown>)['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    const onEvent = (ctx as Record<string, unknown>)['session/event'] as (s: unknown, e: unknown) => void;
+    await preStep(step('sess-D', () => {}), () => {});
+    onEvent({ id: 'sess-D' }, { type: 'compaction/end', data: { compactionId: 'c2', turn: 2, error: 'boom' } });
+    const after: unknown[] = [];
+    await preStep(step('sess-D', (m) => after.push(m)), () => {});
+    assert.equal(after.length, 0, '压缩失败时上下文没变，去重必须继续生效');
   });
 });
 

@@ -414,8 +414,23 @@ async function main(): Promise<void> {
           out(r ?? { pushed: false, note: '没有待上行任务' }, flags);
         } else if (sub === 'pull') {
           out(await service.syncPullCmd(), flags);
+        } else if (sub === 'backfill') {
+          // 冷启动对账：默认只读；只写本地 outbox，不与云端交互（spec cloud-sync）。
+          const rawLimit = str(flags, 'limit');
+          const limit = rawLimit == null ? undefined : Number(rawLimit);
+          if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
+            throw new CairnError('E_VALIDATION', '--limit 必须是正整数');
+          }
+          const apply = flags['apply'] === true;
+          const r = service.syncBackfillCmd({ apply, limit });
+          out(r, flags);
+          diag(
+            apply
+              ? `已新增 ${r.enqueued} 条上行任务，已存在 ${r.existing} 条，排除 ${r.excluded} 条（只写本地队列，未与云端交互）`
+              : `只读预演：候选 ${r.candidates} 条；加 --apply 才写本地队列（不与云端交互）`,
+          );
         } else {
-          throw new CairnError('E_VALIDATION', '用法: cairn sync push|pull');
+          throw new CairnError('E_VALIDATION', '用法: cairn sync push|pull|backfill [--apply] [--limit N]');
         }
         break;
       }
@@ -826,7 +841,8 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   ui                            只读控制台（回环 HTTP；端口默认 7767，占用则随机）
                                 [--port N] [--no-open] [--export <file.html>] [--redact]
   vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd）
-  sync push|pull                加密同步上行 / 下行（详见 docs/cairn-sync.md）
+  sync push|pull|backfill       加密同步上行 / 下行；backfill 补齐未入队的上行任务
+                                [--apply] [--limit N]（默认只读，不与云端交互；详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复
   doctor                        健康检查 [--host <agent>]（诚实分级，无模型无云端核心可用）
   status                        库状态摘要

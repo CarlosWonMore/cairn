@@ -17,6 +17,10 @@ dist-*/
 # M0 审计证据与运行产物：不是生产源码，公开分发不得打入（见 AGENTS.md 目录职责）
 artifacts/
 
+
+# CLI 派发的本地运行日志与临时脚本（不入库）
+.cli-runs/
+
 # 工具本地状态
 .codebuddy/
 .workbuddy/

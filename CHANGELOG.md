@@ -2,6 +2,23 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+上行入队完备性与冷启动对账（OpenSpec 变更 `add-sync-outbox-completeness`）。
+
+### Added
+
+- **`cairn sync backfill [--apply] [--limit N]`**：补齐「作用域允许上行但从未入队」的活动记忆。默认只读，`--apply` 才写本地 outbox；**只写本地队列，不产生任何网络请求**。判定不限制既有任务状态——只要历史上存在过任意一条 `sync_upstream`（含 done / dead）就不算缺口，否则已推过的记忆会被反复重报。
+- **`doctor` 的 `counts.upstreamGap`**：同一口径的上行缺口计数，健康时恒为 0；非零时在 `notes` 给出指向 `sync backfill --apply` 的提示。**不进 `problems`、不改退出码**——缺口是可自愈状态，不是库损坏。
+
+### Fixed
+
+- **治理写入漏上行**：`applyPlan` 的 `add` / `keep_both` / `merge` 三条分支直接调存储层，**绕过了 outbox 入队**。实测真实库 `personal-global` 的 42 条 active 记忆里 23 条完全没有 `sync_upstream` 任务（全部来自 `plan:%`），即自动整理产出的记忆**一条都上不了云**，且 `sync push` 会安静地"成功"。现按目标记忆的实际作用域逐 op 补入队，幂等键与手工写入路径一致。
+- **`rejectCandidate` 不上行**：拒绝候选转墓碑时不入队，而 `forgetMemory` 入队——同一语义两种行为。现对齐。
+- **`applyDecision` 的 `merge` / `promote_candidate` 分支**不给目标补上行任务，现补齐。
+
+入队**刻意不下沉到 `src/store/memories.ts`**：拉取侧 `src/sync/apply.ts` 也走存储层，下沉会让 `sync pull` 给自己制造上行任务，形成回环推流。该边界用回归用例钉住。
+
 ## [0.3.0] - 2026-11-04
 
 候选的批准/拒绝出口，以及治理投影「谁进得去」的重要度与使用信号。两个 OpenSpec 变更归档，主规格 10/10 严格通过。

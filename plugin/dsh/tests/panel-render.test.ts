@@ -135,12 +135,48 @@ describe('记忆面板渲染结构（左右两栏，2026-11-02）', () => {
   });
 
   it('右侧＝活动记录，且没有「条目数量」按钮', () => {
-    const { texts, buttons } = collect(renderPanel(BASE).tree);
+    const { texts, nodes } = collect(renderPanel(BASE).tree);
     const all = texts.join('\n');
     assert.ok(all.includes('活动记录') && all.includes('自动召回'), '活动记录在右侧');
-    assert.ok(!/\d+\s*条/.test(all), '不得再出现「15条/30条/120条」');
-    assert.equal(buttons, 10, '筛选/开关 2+2+3+2 再加一个「重置布局」');
+    // 左侧口径行会带「N 条」，所以只对**按钮文字**做限制。
+    const buttonLabels = nodes.filter((n) => n.type === 'button').map((n) => collect(n).texts.join(''));
+    assert.ok(!buttonLabels.some((l) => /\d+\s*条/.test(l)), '不得再出现「15条/30条/120条」按钮');
+    assert.equal(buttonLabels.length, 10, '筛选/开关 2+2+3+2 再加一个「重置布局」');
     assert.ok(all.includes('重置布局'), '必须有恢复默认布局的入口');
+  });
+
+  it('左栏口径行：累计条数 + 「右栏记录每一步，本栏按去重累计」', () => {
+    const all = collect(renderPanel(BASE).tree).texts.join('\n');
+    assert.ok(all.includes('1 条 · 右栏记录每一步，本栏按去重累计'), '左栏必须解释两栏口径不同');
+  });
+
+  it('折叠记录显示次数与最近时间，title 给出首末时间', () => {
+    const folded = {
+      ...BASE,
+      recent: [{
+        t: '2026-11-02T04:40:00.000Z',
+        firstT: '2026-11-02T04:30:00.000Z',
+        kind: 'recall',
+        count: 20,
+        summary: '自动召回 已去重 1 条（本会话已注入 1 条）',
+      }],
+    };
+    const { texts, nodes } = collect(renderPanel(folded).tree);
+    const hhmmss = (iso: string) => new Date(iso).toTimeString().slice(0, 8);
+    assert.ok(texts.join('\n').includes('20 次'), '折叠条目必须显示发生次数');
+    assert.ok(texts.join('\n').includes(hhmmss('2026-11-02T04:40:00.000Z')), '时间列显示最近一次');
+    const timed = nodes.find((n) => typeof n.props.title === 'string' && n.props.title.includes('首次 ' + hhmmss('2026-11-02T04:30:00.000Z')) && n.props.title.includes('20 次'));
+    assert.ok(timed, 'title 必须能看出时间跨度');
+  });
+
+  it('旧 nothing_new 记录按「已去重」展示，不出现「注入0」', () => {
+    const legacy = {
+      ...BASE,
+      recent: [{ t: '2026-11-02T04:36:09.916Z', kind: 'recall', summary: '自动召回 候选5 注入0 (nothing_new)' }],
+    };
+    const all = collect(renderPanel(legacy).tree).texts.join('\n');
+    assert.ok(!all.includes('注入0'), '旧记录也不许把「已去重」读成「注入0」');
+    assert.ok(all.includes('已去重'), '旧 nothing_new 行按「已去重」一类展示');
   });
 
   it('栏宽：没拖过用自适应基准，拖过用固定占比，越界值忽略', () => {

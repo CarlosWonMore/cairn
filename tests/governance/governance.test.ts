@@ -625,3 +625,109 @@ test('propose：注入候选被拒（reason 指明注入，findings 为空），
     assert.ok(!JSON.stringify(out).includes(injectionContent), '输出不得包含注入正文');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 上行入队（spec cloud-sync「上行入队完备性」/ memory-governance「治理写入保持上行完备」）
+// ---------------------------------------------------------------------------
+
+/** outbox 中指向某记忆（省略则全部）的 sync_upstream 行。 */
+function upstreamJobs(store: CairnStore, entityId?: string): Record<string, unknown>[] {
+  return entityId
+    ? store.db.all("SELECT * FROM outbox_job WHERE job_type = 'sync_upstream' AND entity_id = ?", entityId)
+    : store.db.all("SELECT * FROM outbox_job WHERE job_type = 'sync_upstream'");
+}
+
+test('apply：add / keep_both / merge 三类操作各自补一条上行任务，幂等键与写入路径一致', async () => {
+  await withStore((store) => {
+    const scope = store.scopes.resolvePreset('personal-global');
+    const deviceId = store.identity.deviceId;
+    // 目标记忆直写存储层（不入队），用来验证 merge 自己补任务
+    const mergeTarget = store.memories.add(
+      { kind: 'fact', content: '合并目标原文', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' },
+      deviceId,
+    );
+    const keepTarget = store.memories.add(
+      { kind: 'fact', content: '双保留目标原文', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' },
+      deviceId,
+    );
+    assert.equal(upstreamJobs(store).length, 0, '前置：直写存储层不入队');
+
+    const out = propose(store, [
+      { content: '计划新增条目', kind: 'fact' },
+      { content: '计划双保留条目', kind: 'fact', opHint: 'keep_both', targetMemoryId: keepTarget.id, targetExpectedRevision: keepTarget.currentRevisionId! },
+      { content: '合并后的目标内容', kind: 'fact', opHint: 'merge', targetMemoryId: mergeTarget.id, targetExpectedRevision: mergeTarget.currentRevisionId! },
+    ]);
+    const { approvalId } = approve(store, out);
+    const report = applyOut(store, out, approvalId);
+    assert.equal(report.applied, 3);
+
+    for (const idx of [0, 1]) {
+      const mem = store.memories.require(report.results[idx]!.memoryId!);
+      const jobs = upstreamJobs(store, mem.id);
+      assert.equal(jobs.length, 1, `${report.results[idx]!.opType} 产生的记忆应有一条上行任务`);
+      assert.equal(jobs[0]!.idempotency_key, `memory:${mem.id}`);
+      assert.deepEqual(JSON.parse(String(jobs[0]!.payload)), { op: 'memory_upsert', memoryId: mem.id });
+      assert.equal(jobs[0]!.scope_id, scope.id);
+      assert.equal(jobs[0]!.status, 'pending');
+    }
+
+    // merge：目标内容被替换 → 按目标实际作用域入队，键含新修订
+    const mergeRev = store.memories.revisions(mergeTarget.id)[1]!;
+    const mergeJobs = upstreamJobs(store, mergeTarget.id);
+    assert.equal(mergeJobs.length, 1, 'merge 的目标应有一条上行任务');
+    assert.equal(mergeJobs[0]!.idempotency_key, `memory:${mergeTarget.id}:rev:${mergeRev.id}`);
+    assert.deepEqual(JSON.parse(String(mergeJobs[0]!.payload)), { op: 'memory_upsert', memoryId: mergeTarget.id });
+    assert.equal(upstreamJobs(store, keepTarget.id).length, 0, 'keep_both 不改写目标，不给目标加任务');
+  });
+});
+
+test('apply：设备限定作用域的计划写入成功但零 outbox 行（不报错、不判 failed）', async () => {
+  await withStore((store) => {
+    const deviceId = store.identity.deviceId;
+    const local = store.scopes.resolvePreset('device-local', { deviceId });
+    const target = store.memories.add(
+      { kind: 'fact', content: '本机限定目标原文', scopeId: local.id, authority: 'user_explicit', createdBy: 'cli' },
+      deviceId,
+    );
+    const { plan } = store.plans.createPlan({
+      scopeId: local.id,
+      ops: [
+        { opType: 'add', content: '设备限定新增条目', kind: 'fact' },
+        { opType: 'merge', content: '设备限定合并内容', kind: 'fact', targetMemoryId: target.id, targetExpectedRevision: target.currentRevisionId! },
+      ],
+      proposedBy: 'agent:test',
+      keyPrefix: 'governance',
+    });
+    const { approval } = store.plans.issueApproval({ planId: plan.id, channel: 'cli' });
+    const report = applyPlan(store, { planId: plan.id, approvalId: approval.id, deviceId, scan: fakeScan });
+
+    assert.equal(report.applied, 2, '写入成功');
+    assert.equal(report.failed, 0, '作用域排除不得让 op 失败');
+    assert.equal(store.memories.require(report.results[0]!.memoryId!).scopeId, local.id);
+    assert.equal(store.memories.require(target.id).content, '设备限定合并内容');
+    assert.equal(upstreamJobs(store).length, 0, '设备限定内容不得产生任何上行任务');
+  });
+});
+
+test('apply 幂等重跑：中途续跑后 outbox 与单次成功应用一致', async () => {
+  await withStore((store) => {
+    const out = propose(store, [
+      { content: '幂等重跑条目甲', kind: 'fact' },
+      { content: '幂等重跑条目乙', kind: 'fact' },
+    ]);
+    const { approvalId } = approve(store, out);
+    const first = applyOut(store, out, approvalId);
+    assert.equal(first.applied, 2);
+    const before = upstreamJobs(store).map((j) => j.id);
+    assert.equal(before.length, 2);
+
+    // 恢复路径：退役已消耗审批 → 重新签发 → 再次应用（op 全部已 applied，幂等跳过）
+    store.plans.revokeApproval(approvalId);
+    store.plans.setStatus(out.plan.id, 'awaiting_approval');
+    const again = approve(store, out);
+    const second = applyOut(store, out, again.approvalId);
+    assert.equal(second.applied, 0);
+    assert.equal(second.skipped, 2);
+    assert.deepEqual(upstreamJobs(store).map((j) => j.id), before, '重跑不得产生第二条上行任务');
+  });
+});

@@ -372,3 +372,41 @@ test('协议：依赖等待（parentHash 未知不应用、游标不推进）', 
     cleanupTestHome(b.home);
   }
 });
+
+test('协议：pull 应用远端事件（新增 + 修订）不产生上行任务', async () => {
+  const remote = new MemRemote();
+  const a = newDevice();
+  const vault = vaultFor(a.keys);
+  const b = deviceFromRecovery(a);
+  const upstreamPending = (s: CairnStore): number =>
+    Number(s.db.get("SELECT COUNT(*) AS n FROM outbox_job WHERE job_type = 'sync_upstream' AND status = 'pending'")!.n);
+  try {
+    const memId = addMemoryWithJob(a.store, '拉取侧零入队基线', 'k1');
+    await syncPush(a.store, remote, vault);
+    // B 侧先有一条自己的待办：用它证明"数量不变"，而不是"恒为零"
+    addMemoryWithJob(b.store, 'B 本机已有的待办', 'b1');
+    const before = upstreamPending(b.store);
+    assert.equal(before, 1);
+
+    await syncPull(b.store, remote, vault); // 远端新增 → B 侧新建记忆
+    a.store.memories.revise(memId, '远端修订后的版本', { author: 'a' }, a.store.identity.deviceId);
+    a.store.outbox.enqueue({
+      jobType: 'sync_upstream',
+      scopeId: a.store.scopes.resolvePreset('personal-global').id,
+      entityType: 'memory',
+      entityId: memId,
+      idempotencyKey: 'k2',
+    });
+    await syncPush(a.store, remote, vault);
+    const pulled = await syncPull(b.store, remote, vault); // 远端修订 → B 侧修订
+
+    assert.ok(pulled.totalApplied >= 1, '远端修订应被应用');
+    assert.ok(b.store.memories.list({ status: 'active' }).some((m) => m.content === '远端修订后的版本'));
+    assert.equal(upstreamPending(b.store), before, '拉取路径不得产生新的上行任务');
+  } finally {
+    a.store.close();
+    b.store.close();
+    cleanupTestHome(a.home);
+    cleanupTestHome(b.home);
+  }
+});

@@ -48,12 +48,19 @@ export interface RecallFn {
 
 export interface InjectionOutcome {
   injected: boolean;
+  /** 'ok' | 'disabled' | 'empty_message' | 'all_seen' | 'miss' | 'nothing_new' | 'recall_failed: …' */
   reason: string;
   text: string;
   selected: number;
   truncated: number;
   /** 本次实际写进上下文的记忆 id（按渲染顺序）。调用方用它记「本会话累计注入」。 */
   injectedIds: string[];
+  /** 本轮召回候选数（过滤前）。 */
+  candidates: number;
+  /** 本轮因会话内去重而未注入的条数。 */
+  deduped: number;
+  /** 本轮结束时本会话累计注入条数（去重集合大小）。 */
+  sessionTotal: number;
 }
 
 const DEFAULTS = { enabled: true, budgetBytes: 1536, topK: 5 } as const;
@@ -67,16 +74,18 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
   async function runOnce(message: string, scope?: unknown): Promise<InjectionOutcome> {
     const decision = shouldInject({ enabled: cfg.enabled, alreadyInjected: new Set(), message });
     if (!decision.inject) {
-      return { injected: false, reason: decision.reason, text: '', selected: 0, truncated: 0, injectedIds: [] };
+      return { injected: false, reason: decision.reason, text: '', selected: 0, truncated: 0, injectedIds: [], candidates: 0, deduped: 0, sessionTotal: dedupe.size() };
     }
     let hits: RecallHit[] = [];
     try {
       hits = await deps.recall(message, cfg.topK, scope);
     } catch (e) {
-      return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0, injectedIds: [] };
+      return { injected: false, reason: 'recall_failed: ' + (e as Error).message, text: '', selected: 0, truncated: 0, injectedIds: [], candidates: 0, deduped: 0, sessionTotal: dedupe.size() };
     }
     const safe = filterInjectable(hits);
     const filteredCount = hits.length - safe.length;
+    // 去重挡掉几条必须在渲染前算：renderInjection 内部那层过滤不对外暴露数量。
+    const deduped = safe.filter((h) => dedupe.has(h.id)).length;
     const rendered = renderInjection(safe, {
       budgetBytes: cfg.budgetBytes,
       alreadyInjected: { has: (id: string) => dedupe.has(id) } as unknown as ReadonlySet<string>,
@@ -116,8 +125,13 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
       });
     }
 
-    if (rendered.text.length === 0) {
-      return { injected: false, reason: 'nothing_new', text: '', selected: 0, truncated: 0, injectedIds: [] };
+    // 判定顺序（design D1）：先判候选再判去重——候选为 0 时 deduped 恒 0，
+    // 顺序写反会把「什么都没找到」误标成「已去重」。
+    // 守卫用 includedIds 而不是 text.length：预算极小时 renderInjection 只回一行
+    // 表头，text 非空但一条记忆都没进去，那不算 ok。
+    if (rendered.includedIds.length === 0) {
+      const reason = hits.length === 0 ? 'miss' : deduped > 0 ? 'all_seen' : 'nothing_new';
+      return { injected: false, reason, text: '', selected: 0, truncated: 0, injectedIds: [], candidates: hits.length, deduped, sessionTotal: dedupe.size() };
     }
     dedupe.add(injectedIds);
     return {
@@ -127,6 +141,9 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
       selected: rendered.selected,
       truncated: rendered.truncated,
       injectedIds,
+      candidates: hits.length,
+      deduped,
+      sessionTotal: dedupe.size(),
     };
   }
 
@@ -450,7 +467,24 @@ export type ActivityEntry = {
    * 重启回放时也靠它重建「本会话累计注入」。只放摘要，不放正文。
    */
   items?: { id: string; kind: string; summary: string }[];
+  /** 连续同类空步折叠后的发生次数；老行没有该字段，读取时按 1 处理。 */
+  count?: number;
+  /** 折叠段的首次发生时间（t 是最近一次）。面板用它算时间跨度与稳定键。 */
+  firstT?: string;
+  /** 折叠键：recall 的语义结果。不落盘，仅供写入时判断「同类」。 */
+  reason?: string;
 };
+
+/** 活动记录措辞：三种召回结果必须一眼可分（spec: 召回结果按语义区分记录）。 */
+function recallSummary(out: InjectionOutcome): string {
+  if (out.reason === 'ok') return `自动召回 候选${out.candidates} 注入${out.selected}`;
+  if (out.reason === 'all_seen') return `自动召回 已去重 ${out.deduped} 条（本会话已注入 ${out.sessionTotal} 条）`;
+  if (out.reason === 'miss') return '自动召回 未命中';
+  // 候选存在但一条都没进去（全被安全规则过滤 / 预算连一行都放不下）：保留旧语义，
+  // 但不能写成「注入0」——那和「什么都没发生」读起来一样。
+  if (out.reason === 'nothing_new') return `自动召回 候选${out.candidates} 未注入 (nothing_new)`;
+  return `自动召回 跳过 (${out.reason})`;
+}
 
 export const ACTIVITY_FILE = 'activity-dsh.jsonl';
 const ACTIVITY_ENABLED_MARKER = 'activity-dsh.enabled';
@@ -504,7 +538,9 @@ export function loadPersistedActivity(limit = ACTIVITY_RING_LIMIT): ActivityEntr
       try {
         const e = JSON.parse(line) as ActivityEntry;
         if (e && typeof e.t === 'string' && (e.kind === 'recall' || e.kind === 'tool') && typeof e.summary === 'string') {
-          out.push({ t: e.t, kind: e.kind, summary: e.summary });
+          // 老行没有 count：按 1 条处理（design「迁移与回滚」）。
+          const count = typeof e.count === 'number' && e.count > 0 ? e.count : 1;
+          out.push({ t: e.t, kind: e.kind, summary: e.summary, count, ...(typeof e.firstT === 'string' ? { firstT: e.firstT } : {}) });
         }
       } catch {
         /* 坏行跳过 */
@@ -648,13 +684,37 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     kind: ActivityEntry['kind'],
     summary: string,
     items?: { id: string; kind: string; summary: string }[],
+    reason?: string,
   ): void => {
     const st = stateFor(key);
+    const t = new Date().toISOString();
+    const last = st.activity[st.activity.length - 1];
+    // 写入时折叠（design D2）：与上一条同 reason、且两边都没有注入条目才合并。
+    // 带 items 的记录永远单独成条——真实注入不许被空步吃掉。
+    const foldable =
+      kind === 'recall' &&
+      reason !== undefined &&
+      last !== undefined &&
+      last.kind === 'recall' &&
+      last.reason === reason &&
+      (!last.items || last.items.length === 0) &&
+      (!items || items.length === 0);
+    if (foldable) {
+      last.count = (last.count ?? 1) + 1;
+      last.firstT = last.firstT ?? last.t;
+      last.t = t;
+      last.summary = summary;
+      st.touched = ++touchSeq;
+      // 落盘仍是每步一行：文件是审计面，折叠只解决内存环被空步挤占的问题。
+      if (persistOn) appendActivityFile({ t, kind, summary, s: key });
+      return;
+    }
     const entry: ActivityEntry = {
-      t: new Date().toISOString(),
+      t,
       kind,
       summary,
       s: key,
+      ...(reason !== undefined ? { reason } : {}),
       ...(items && items.length > 0 ? { items } : {}),
     };
     st.activity.push(entry);
@@ -813,11 +873,29 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       'session/event',
       (
         _session: unknown,
-        evt: { type?: string; data?: { content?: unknown; source?: { kind?: string } }; message?: { content?: { text?: string }[] } },
+        evt: {
+          type?: string;
+          data?: { content?: unknown; source?: { kind?: string }; error?: unknown };
+          message?: { content?: { text?: string }[] };
+        },
       ) => {
         try {
           diag.lastEventCount += 1;
           diag.lastEventType = evt?.type ?? '(no type)';
+          // asar 实锤：compaction/end 是宿主 session 事件类型（KNOWN_SESSION_EVENT_TYPES），
+          // 真实消费者就在 `ctx.on("session/event", (session, event) => …)` 里按 event.type 分发。
+          // 压缩成功后上下文被重写：清空去重集合与本会话累计，否则被挤出的记忆再也回不来。
+          // 压缩失败（data.error 存在）上下文没变，不重置。
+          if (evt?.type === 'compaction/end') {
+            if (!evt.data?.error) {
+              const st = sessions.get(sessionKey(_session));
+              if (st) {
+                st.injector.resetSession();
+                st.injected.clear();
+              }
+            }
+            return;
+          }
           if (evt?.type !== 'user/message') return;
           // 真实宿主形状：消息体在 evt.data（含 source.kind）。只认真实用户输入，
           // agent-instructions 之类的 user-role 注入不驱动召回。
@@ -883,24 +961,16 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           const startedAt = Date.now();
           const out = await st.injector.runOnce(stepText, payload?.agent);
           diag.lastRecall.ms = Date.now() - startedAt;
-          diag.lastRecall.candidates = st.injector.lastUsage()?.candidates ?? 0;
+          diag.lastRecall.candidates = out.candidates;
           diag.lastPreStep.reason = out.reason;
           diag.lastPreStep.selected = out.selected;
           diag.lastPreStep.injected = out.injected;
-          // 只有真的注入了才更新「本会话累计」：nothing_new 时 lastUsage 是旧的，
+          // 只有真的注入了才更新「本会话累计」：all_seen / miss 时 lastUsage 是旧的，
           // 拿它去 bump 会把上一轮的注入重复记一遍。
           const fresh = out.injectedIds.length > 0 ? (st.injector.lastUsage()?.injected ?? []) : [];
           for (const m of fresh) rememberInjected(st, m);
           if (recordCfg.recall && stepText) {
-            const usage = st.injector.lastUsage();
-            pushActivity(
-              key,
-              'recall',
-              usage
-                ? `自动召回 候选${usage.candidates} 注入${out.selected}${out.reason !== 'ok' ? ` (${out.reason})` : ''}`
-                : `自动召回 跳过 (${out.reason})`,
-              fresh,
-            );
+            pushActivity(key, 'recall', recallSummary(out), fresh, out.reason);
           }
           if (out.injected) {
             const agent = payload?.agent;

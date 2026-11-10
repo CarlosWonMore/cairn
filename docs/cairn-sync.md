@@ -50,6 +50,22 @@ npm run cli -- vault init-remote --provider syncd --base-url http://<内网IP>:8
 - 数据目录备份由运维负责；云端（OBS/syncd）损坏可从本地权威库全量重推。
 - 提示：syncd 所在主机上的客户端建议配置独立监听或使用回环地址——自连 Tailscale IP 每次请求有秒级开销（实测）。
 
+## 冷启动对账（`sync backfill`）
+
+上行队列是写入时逐条产生的。历史上任何一次写入漏了入队（例如 0.3.0 及更早版本里治理计划应用的写入不产生任务），那条记忆就永远不会上云，而且**没有任何地方会报错**。
+
+补齐方式：
+
+```bash
+cairn sync backfill            # 只读预演，报告候选条数与 id 列表，不改库
+cairn sync backfill --apply    # 真正补入本地队列（默认每次至多 500 条，--limit 可调）
+cairn sync push                # 补完仍需显式上传；backfill 从不联网
+```
+
+判定口径：作用域为 `encrypted` 且不绑定具体设备、状态 active、且**历史上从未有过任何** `sync_upstream` 任务（不论状态）的记忆。只看 pending 会把已推送过的记忆重报为缺口，因此刻意不限制任务状态。
+
+`cairn doctor` 的 `counts.upstreamGap` 报告同一口径的缺口数，健康时恒为 0；非零时在 `notes` 里给出一条指向本命令的提示，但**不进 `problems`、不改退出码**——缺口是可自愈状态，不是库损坏。
+
 ## 命令与诊断
 
 | 命令 | 说明 |
@@ -58,6 +74,7 @@ npm run cli -- vault init-remote --provider syncd --base-url http://<内网IP>:8
 | `vault import-key --recovery-file` | 用恢复材料在新设备加入同一 vault |
 | `vault status` / `vault export-key` | 状态 / 导出恢复材料 |
 | `sync push` / `sync pull` | 上行 / 下行（幂等，可中断重试） |
+| `sync backfill` | 冷启动对账：补齐「作用域允许上行但未入队」的记忆 `[--apply] [--limit N]`，**默认只读** |
 | `doctor` | remote 三态：not_configured / configured_untested / verified |
 
 doctor 的 remote 状态反映【当前环境】的可用性：远端已配置但缺少凭据环境变量时，如实降级为 configured_untested 并在 notes 说明。
@@ -67,5 +84,6 @@ doctor 的 remote 状态反映【当前环境】的可用性：远端已配置�
 - 密钥文件与恢复材料是本地明文（与 SQLite 库文件同等信任边界）；Windows 文件权限不构成加密，建议配合全盘加密。
 - 秘密/注入扫描不覆盖上行包内容之外的全部形态；正则防线非完备。
 - syncd 无多租户、无 TLS（设计上只绑内网/Tailscale 接口）；公网暴露面由云安全组收敛。
+- `sync backfill` 只写本地 outbox，**不产生任何网络请求**；它不改变云端内容，补齐后仍需显式 `sync push`。
 - 已验证环境：Windows x64 ↔ Linux x64 双设备、真实 OBS 与真实 ECS syncd；macOS 未验证。
 - Obsidian 等既有桶内前缀（`obsidian/`、`famboard/`）与本产品前缀（`cairn/`）互不干涉；本产品从不读写其他前缀。

@@ -26,6 +26,7 @@ import { loadVaultConfig } from '../sync/vault.js';
 import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } from '../sync/cryptoutil.js';
 import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
+import { findUpstreamGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
 import { findDuplicate } from '../governance/dedup.js';
 import { decideWrite, describeJudgement, Judgement, WriteAction } from '../onboarding/judgement.js';
@@ -108,6 +109,8 @@ export interface DoctorReport {
     plansByStatus: Record<string, number>;
     outboxByStatus: Record<string, number>;
     openConflicts: number;
+    /** 作用域允许上行但没有过任何 sync_upstream 任务的活动记忆数（design D4）。 */
+    upstreamGap: number;
   };
   remote: 'not_configured' | 'configured_untested' | 'verified';
   remoteProvider?: string;
@@ -281,6 +284,7 @@ export class AppService {
         store.memories.addEvidence(target.id, target.currentRevisionId, ev);
       }
       store.audit.record('memory', 'write_merged', { type: 'memory', id: target.id }, auditDetail);
+      enqueueMemoryUpstream(store, target.id, target.scopeId, 'memory_upsert', `memory:${target.id}`);
       return { action: 'merge', basis: decision.basis, memory: store.memories.require(target.id), duplicateOf: target.id };
     }
 
@@ -299,6 +303,8 @@ export class AppService {
       for (const ev of input.evidence ?? []) {
         store.memories.addEvidence(promoted.id, promoted.currentRevisionId, ev);
       }
+      // 与 promoteCandidate() 对齐：晋升即内容对外可见，补一条带修订标识的上行任务。
+      enqueueMemoryUpstream(store, promoted.id, promoted.scopeId, 'memory_upsert', `memory:${promoted.id}:rev:${promoted.currentRevisionId ?? ''}`);
       store.audit.record('memory', 'write_promoted_candidate', { type: 'memory', id: promoted.id }, auditDetail);
       return { action: 'promote_candidate', basis: decision.basis, memory: promoted, duplicateOf: promoted.id };
     }
@@ -468,6 +474,8 @@ export class AppService {
       });
     }
     const out = store.memories.forget(id, reason, this.caller.agentId);
+    // 与 forgetMemory 同形：拒绝候选同样是墓碑语义，必须同样上行。
+    enqueueMemoryUpstream(store, id, mem.scopeId, 'memory_tombstone', `memory:${id}:tombstone`);
     store.audit.record('memory', 'rejected_candidate', { type: 'memory', id }, {
       reason,
       channel: 'cli',
@@ -624,6 +632,12 @@ export class AppService {
       plansByStatus[String(r.status)] = Number(r.n);
     }
     const archiveCounts = store.archives.counts();
+    // 上行缺口：不是"库坏了"，是可自愈状态——只进 counts 与 notes，绝不进 problems
+    // （进 problems 会让 doctor 以非零退出码结束，破坏"健康即 0"语义）。
+    const upstreamGap = findUpstreamGap(store).length;
+    if (upstreamGap > 0) {
+      notes.push(`上行缺口 ${upstreamGap} 条：作用域允许上行但未入队，执行 cairn sync backfill --apply 补齐`);
+    }
     // remote 三态：not_configured / configured_untested / verified（首次成功往返后置 verified）
     let remote: DoctorReport['remote'] = 'not_configured';
     let remoteProvider: string | undefined;
@@ -657,6 +671,7 @@ export class AppService {
         plansByStatus,
         outboxByStatus: store.outbox.counts(),
         openConflicts: store.conflicts.countOpen(),
+        upstreamGap,
       },
       remote,
       remoteProvider,
@@ -711,6 +726,14 @@ export class AppService {
     const r = await syncPull(this.store, ctx.remote, ctx.vault);
     this.markSyncOk();
     return r;
+  }
+
+  /**
+   * 冷启动对账（spec cloud-sync「冷启动对账」）：只补本地 outbox，默认只读。
+   * 刻意不经过 requireSyncContext —— 未配置云端时同样可用，也不接触任何远端实现。
+   */
+  syncBackfillCmd(opts: { apply: boolean; limit?: number }): BackfillReport {
+    return backfillUpstream(this.store, opts);
   }
 
   private requireSyncContext(): SyncContext {
@@ -883,6 +906,29 @@ export class AppService {
   }
 }
 
+
+/**
+ * 编排层上行落点（spec cloud-sync「上行入队完备性」）：准入判定复用 `scopeAllowsUpstream`，
+ * 作用域不允许上行时静默返回——这是正常结果，不是错误。
+ */
+function enqueueMemoryUpstream(
+  store: CairnStore,
+  memoryId: string,
+  scopeId: string,
+  op: 'memory_upsert' | 'memory_tombstone',
+  idempotencyKey: string,
+): void {
+  const scope = store.scopes.requireById(scopeId);
+  if (!scopeAllowsUpstream(scope)) return;
+  store.outbox.enqueue({
+    jobType: 'sync_upstream',
+    scopeId: scope.id,
+    entityType: 'memory',
+    entityId: memoryId,
+    payload: { op, memoryId },
+    idempotencyKey,
+  });
+}
 
 /** 扫描命中错误：秘密优先；仅注入命中 → E_INJECTION_SUSPECTED。均不回显原文。 */
 function scanError(scan: ReturnType<typeof scanText>): Error {

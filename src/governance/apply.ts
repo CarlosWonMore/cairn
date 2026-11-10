@@ -1,5 +1,6 @@
 import { err, isCairnError } from '../core/errors.js';
 import { EvidenceInput, SecretScanResult } from '../core/types.js';
+import { scopeAllowsUpstream } from '../core/scope.js';
 import { CairnStore } from '../store/open.js';
 import { PlanOpRecord, PlanRecord } from '../store/plans.js';
 
@@ -22,9 +23,11 @@ import { PlanOpRecord, PlanRecord } from '../store/plans.js';
  *   - 应用前秘密复检（op.content 存在时）：不干净 → op 标记 failed（只存 masked
  *     摘要）、剩余 op 保持 pending、撤销已消耗审批、抛 E_SECRET_DETECTED
  *     （details 只含 {kind, masked}，绝不回显原文）；
- *   - add/keep_both：memories.add(authority='user_confirmed', createdBy='plan:<id>')；
+ *   - add/keep_both：memories.add(authority='user_confirmed', createdBy='plan:<id>')，
+ *     落库后按新记忆的实际作用域入队（幂等键 memory:<id>）；
  *     keep_both 且带 target 时补 addRelation(new, target, 'contradicts')；
- *   - merge：memories.revise(target, …, expectedCurrentRevisionId=快照)；
+ *   - merge：memories.revise(target, …, expectedCurrentRevisionId=快照)，
+ *     落库后按目标记忆的实际作用域入队（幂等键 memory:<targetId>:rev:<revisionId>）；
  *     E_TARGET_CHANGED → op failed('target_changed')、剩余 pending、原样抛出
  *     （拒绝基于过期目标应用，spec「目标在批准后变化」）；
  *   - 其他每 op 错误：op failed(error code) 并继续其余 op（失败计数进报告）；
@@ -216,6 +219,7 @@ function applyOp(
       if (op.opType === 'keep_both' && op.targetMemoryId) {
         store.memories.addRelation(memory.id, op.targetMemoryId, 'contradicts');
       }
+      enqueueUpstream(store, memory.id, memory.scopeId, `memory:${memory.id}`);
       return memory.id;
     }
     case 'merge': {
@@ -236,9 +240,27 @@ function applyOp(
         deviceId,
       );
       for (const ev of evidence) store.memories.addEvidence(memory.id, revision.id, ev);
+      enqueueUpstream(store, memory.id, memory.scopeId, `memory:${memory.id}:rev:${revision.id}`);
       return memory.id;
     }
   }
+}
+
+/**
+ * 治理写入的上行落点（spec cloud-sync「上行入队完备性」）。
+ * 准入判定复用 `scopeAllowsUpstream`；作用域不允许上行属正常结果，不入队也不报错，
+ * 因此不会让计划应用失败、不会把 op 标记 failed（design D1/D2）。
+ */
+function enqueueUpstream(store: CairnStore, memoryId: string, scopeId: string, idempotencyKey: string): void {
+  if (!scopeAllowsUpstream(store.scopes.requireById(scopeId))) return;
+  store.outbox.enqueue({
+    jobType: 'sync_upstream',
+    scopeId,
+    entityType: 'memory',
+    entityId: memoryId,
+    payload: { op: 'memory_upsert', memoryId },
+    idempotencyKey,
+  });
 }
 
 function evidenceForOp(op: PlanOpRecord, evidenceByItem: Record<string, EvidenceInput[]>): EvidenceInput[] {

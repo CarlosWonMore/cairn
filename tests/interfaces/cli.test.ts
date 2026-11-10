@@ -271,3 +271,41 @@ test('promote --scope-preset 真的迁移作用域（2026-11-04 flag 未登记�
   assert.equal(promoted.scopePreset, 'device-local', 'scopePreset 必须是 device-local');
   assert.notEqual(promoted.scopeId, promoted.previousScopeId, 'scopeId 必须真的变了');
 });
+
+test('CLI sync backfill：默认只读、--apply 补齐、--limit 非法值退出码 2', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+  const id = JSON.parse((await runCli([...base, 'add', 'CLI 对账测试记忆'])).stdout).id as string;
+
+  // 造缺口：删掉 add 自动入队的待办任务，模拟历史遗漏
+  const dbPath = join(home, 'data', 'cairn.db');
+  execFileSync(process.execPath, ['-e', `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(${JSON.stringify(dbPath)});
+    db.prepare("DELETE FROM outbox_job").run();
+    db.close();
+  `], { encoding: 'utf8' });
+
+  const dry = await runCli([...base, 'sync', 'backfill']);
+  assert.equal(dry.code, 0, dry.stderr);
+  const d = JSON.parse(dry.stdout);
+  assert.equal(d.candidates, 1);
+  assert.equal(d.enqueued, 0, '默认只读');
+  assert.deepEqual(d.memoryIds, [id], 'dry-run 报告将会入队的记忆标识');
+
+  assert.equal(JSON.parse((await runCli([...base, 'sync', 'backfill'])).stdout).candidates, 1, '只读预演不改变库');
+
+  const applied = await runCli([...base, 'sync', 'backfill', '--apply']);
+  assert.equal(applied.code, 0, applied.stderr);
+  assert.equal(JSON.parse(applied.stdout).enqueued, 1);
+
+  assert.equal(JSON.parse((await runCli([...base, 'sync', 'backfill'])).stdout).candidates, 0, '--apply 后缺口归零');
+
+  const badLimit = await runCli([...base, 'sync', 'backfill', '--limit', 'abc']);
+  assert.equal(badLimit.code, 2, '非法 --limit 属用法错误档');
+
+  const help = await runCli(['help']);
+  assert.ok(help.stdout.includes('sync push|pull|backfill'), '帮助文本应列出 backfill');
+  assert.ok(help.stdout.includes('不与云端交互'), '帮助文本应标注不与云端交互');
+});
