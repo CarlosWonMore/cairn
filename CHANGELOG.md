@@ -11,6 +11,7 @@
 - **MCP `memory_annotations_list` / `memory_annotation_resolve`**：Agent 可拉取用户的批注并按 `resolved` / `ignored` 回写；读取不返回记忆正文全文，回写只改批注状态并记录处置者与时间。
 - **`cairn doctor` 的待办批注提示**：只进 `notes` 一行，不进 `problems`、不改退出码。
 - 批注写入前复用 `scanText`：命中秘密或注入规则即拒绝，不回显原文、不脱敏保存。
+- **DSH 插件压缩后重注入**（`@carloswon/cairn-dsh-memory`）：插件在本会话内追踪「涉及过的记忆」——注入过的，以及经 MCP `memory_get` / `memory_add` / `memory_update` 读过写过的；`compaction/end`（无 `error`）时按独立预算（`budgetBytes × reinjectBudgetRatio`，默认一半）重渲染并在下一步 `pre-step` 投递，不依赖下一句是否命中关键词。表头与常规召回措辞不同；重注入的 id 立刻回填去重集合，避免下一步重复注入；追踪集合纯内存、上限 `trackMax`（默认 200，超出按最近使用淘汰）。压缩失败不重注入、不清去重。回滚：`reinjectOnCompaction: false`。
 
 ## [Plugin 0.4.1] - 2026-11-10
 

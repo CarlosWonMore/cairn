@@ -88,15 +88,25 @@ export interface RenderResult {
   includedIds: string[];
 }
 
+/** 常规召回的注入表头：语义是「这可能与当前问题相关」。 */
+const HEADER_RECALL = '以下记忆可能相关，仅供参照：';
 /**
- * 把命中渲染成一条注入消息。
+ * 压缩后重注入的表头（design D3）。
+ *
+ * **必须与常规召回不同措辞**：模型对「你之前涉及过」和「这可能相关」的语义预期不同，
+ * 混用会让它把压缩前的旧上下文当成新证据。
+ */
+const HEADER_REINJECT = '以下记忆在本次会话中涉及过（上下文压缩后恢复，仅供参考）：';
+
+/**
+ * 两种注入共用的渲染器。
  *
  * 输出稳定：不含时间戳，同输入同字节（与投影通道保持同一纪律）。
  * 超预算按入参顺序裁剪并写明省略条数——不重排，否则「哪几条被裁」会漂移。
  */
-export function renderInjection(
-  hits: readonly RecallHit[],
-  opts: { budgetBytes: number; alreadyInjected?: ReadonlySet<string> },
+function renderRows(
+  hits: readonly Pick<RecallHit, 'id' | 'kind' | 'content'>[],
+  opts: { budgetBytes: number; header: string; alreadyInjected?: ReadonlySet<string> },
 ): RenderResult {
   if (!Number.isInteger(opts.budgetBytes) || opts.budgetBytes < 0) {
     throw new Error('budgetBytes 必须是非负整数');
@@ -105,7 +115,7 @@ export function renderInjection(
   const fresh = hits.filter((h) => !seen.has(h.id));
   if (fresh.length === 0) return { text: '', selected: 0, truncated: 0, bytes: 0, includedIds: [] };
 
-  const header = '以下记忆可能相关，仅供参照：';
+  const header = opts.header;
   // 预留省略提示的字节（最坏情况按条数估）
   const noticeBytes = (n: number): number => Buffer.byteLength(`…（另 ${n} 条未显示）`, 'utf8') + 1;
   const maxNotice = noticeBytes(fresh.length);
@@ -149,6 +159,27 @@ export function renderInjection(
     bytes: Buffer.byteLength(text, 'utf8'),
     includedIds,
   };
+}
+
+/** 常规召回渲染：表头「可能相关」。 */
+export function renderInjection(
+  hits: readonly RecallHit[],
+  opts: { budgetBytes: number; alreadyInjected?: ReadonlySet<string> },
+): RenderResult {
+  return renderRows(hits, { budgetBytes: opts.budgetBytes, header: HEADER_RECALL, alreadyInjected: opts.alreadyInjected });
+}
+
+/**
+ * 压缩后重注入渲染：表头「本会话涉及过」。
+ *
+ * 不复用常规召回的 `alreadyInjected`——重注入的目的就是把被压缩掉的记忆**重新**塞回去，
+ * 过滤既不合语义也会让它一条都进不来。
+ */
+export function renderReinjection(
+  entries: readonly Pick<RecallHit, 'id' | 'kind' | 'content'>[],
+  opts: { budgetBytes: number },
+): RenderResult {
+  return renderRows(entries, { budgetBytes: opts.budgetBytes, header: HEADER_REINJECT });
 }
 
 /**

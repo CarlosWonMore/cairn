@@ -7,3 +7,10 @@
         enabled: true
         budgetBytes: 1536
         topK: 5
+        # 上下文压缩成功后主动重注入本会话涉及过的记忆（默认开）。
+        # 置 false 即退回旧行为：只清去重集合，能不能再出来取决于下一句的关键词。
+        reinjectOnCompaction: true
+        # 重注入预算占总预算的比例（默认 0.5）。独立于常规召回：留一半给下一步的新信息。
+        reinjectBudgetRatio: 0.5
+        # 每会话追踪的记忆上限（默认 200），超出按最近使用淘汰。追踪只在内存，不写盘。
+        trackMax: 200

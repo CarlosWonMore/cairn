@@ -25,15 +25,22 @@ import {
   isStopTerm,
   rankHits,
   renderInjection,
+  renderReinjection,
   shouldInject,
   type RecallHit,
 } from './recall.js';
-import { buildUsage, EMPTY_USAGE, type RecallUsage } from './usage-state.js';
+import { buildUsage, EMPTY_USAGE, toSummary, type RecallUsage } from './usage-state.js';
 
 export interface PluginConfig {
   enabled?: boolean;
   budgetBytes?: number;
   topK?: number;
+  /** 上下文压缩成功后是否主动重注入本会话涉及过的记忆（默认开）。 */
+  reinjectOnCompaction?: boolean;
+  /** 重注入预算占总预算的比例（默认 0.5，独立于常规召回，避免挤占下一步）。 */
+  reinjectBudgetRatio?: number;
+  /** 每会话追踪的记忆上限，超出按最近使用淘汰（默认 200）。 */
+  trackMax?: number;
   /**
    * 留痕配置（活动记录写哪些动作）。
    * 审计完整性原则：记录默认全开；展示层的筛选/程度/时长由面板自己配。
@@ -63,13 +70,15 @@ export interface InjectionOutcome {
   sessionTotal: number;
 }
 
-const DEFAULTS = { enabled: true, budgetBytes: 1536, topK: 5 } as const;
+const DEFAULTS = { enabled: true, budgetBytes: 1536, topK: 5, reinjectOnCompaction: true, reinjectBudgetRatio: 0.5, trackMax: 200 } as const;
 
 export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }) {
   const cfg = { ...DEFAULTS, ...(deps.config ?? {}) };
   const dedupe = createDedupeState();
   /** 最近一次召回的使用情况，供 UI 面板读取。 */
   let lastUsage: RecallUsage | null = null;
+  /** 最近一次真实注入的原文（面板只要摘要，重注入要原文，所以两者分开存）。 */
+  let lastInjectedItems: RecallHit[] = [];
 
   async function runOnce(message: string, scope?: unknown): Promise<InjectionOutcome> {
     const decision = shouldInject({ enabled: cfg.enabled, alreadyInjected: new Set(), message });
@@ -123,6 +132,8 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
         bytesBudget: cfg.budgetBytes,
         filteredCount,
       });
+      const allow = new Set(injectedIds);
+      lastInjectedItems = safe.filter((h) => allow.has(h.id));
     }
 
     // 判定顺序（design D1）：先判候选再判去重——候选为 0 时 deduped 恒 0，
@@ -147,9 +158,36 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     };
   }
 
+  /**
+   * 压缩后重注入：把本会话涉及过的记忆按**独立预算**重新渲染（design D2）。
+   *
+   * 成功后把这些 id 加回去重集合：压缩后第一步的常规召回会命中同一批，
+   * 不先占位就会在相邻两步里各注入一遍（spec: 重注入后不重复）。
+   */
+  function reinject(entries: readonly Pick<RecallHit, 'id' | 'kind' | 'content'>[]): {
+    text: string;
+    ids: string[];
+    bytes: number;
+    truncated: number;
+    /** 实际进文本的条目（摘要形状），供面板的「本会话累计注入」重新累计。 */
+    items: { id: string; kind: string; summary: string }[];
+  } | null {
+    if (!cfg.reinjectOnCompaction || entries.length === 0) return null;
+    // 比例来自配置，是外部输入：夹到 [0,1]，否则能突破总预算。
+    const ratio = Math.min(1, Math.max(0, cfg.reinjectBudgetRatio));
+    const rendered = renderReinjection(entries, { budgetBytes: Math.floor(cfg.budgetBytes * ratio) });
+    if (rendered.includedIds.length === 0) return null;
+    dedupe.add(rendered.includedIds);
+    const allow = new Set(rendered.includedIds);
+    const items = entries.filter((e) => allow.has(e.id)).map((e) => ({ id: e.id, kind: e.kind, summary: toSummary(e.content) }));
+    return { text: rendered.text, ids: rendered.includedIds, bytes: rendered.bytes, truncated: rendered.truncated, items };
+  }
+
   return {
     runOnce,
+    reinject,
     lastUsage: () => lastUsage,
+    lastInjectedItems: () => lastInjectedItems,
     resetSession: () => dedupe.reset(),
     seenCount: () => dedupe.size(),
   };
@@ -228,6 +266,11 @@ export const recallDiag: {
 
 /** Cairn 检索工具的公开名（dsh-mcp-client 命名契约：mcp__<server>__<raw>）。 */
 const RECALL_TOOL = 'mcp__cairn__memory_search';
+/**
+ * 带明确 id、可记入「本会话涉及过」的 cairn 工具（design D1）。
+ * `memory_search` 不在这里：它返回 preview 列表，参数里没有 id。
+ */
+const TRACKED_TOOLS = new Set(['memory_get', 'memory_add', 'memory_update']);
 /** 召回卡在 pre-step 里，必须有上限：一次挂起的 MCP 调用不能拖死整轮。 */
 const RECALL_TIMEOUT_MS = 3000;
 
@@ -604,6 +647,17 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     activity: ActivityEntry[];
     /** 本会话累计注入过的记忆，按首次注入顺序去重（会话内同一 id 只会注入一次）。 */
     injected: Map<string, { id: string; kind: string; summary: string }>;
+    /**
+     * 本会话涉及过的记忆（注入过 + 经 MCP 读过/写过），供压缩后重注入。
+     *
+     * 只在内存：Map 的插入顺序就是最近使用顺序（touch 时先删后插），
+     * 超出 `trackMax` 从头部淘汰。**不写盘、不参与同步**（spec: 追踪有界）。
+     */
+    touchedMemories: Map<string, { id: string; kind: string; summary: string; content: string; at: number }>;
+    /** 已渲染、等下一步 pre-step 投递的重注入文本（session/event 里拿不到 agent）。 */
+    pendingReinject: { text: string; items: { id: string; kind: string; summary: string }[]; count: number; bytes: number } | null;
+    /** 上次重注入的摘要，仅 `usage?debug=1` 暴露。 */
+    lastReinject: { count: number; bytes: number; at: string } | null;
     touched: number;
   };
   const DEFAULT_SESSION = 'default';
@@ -620,10 +674,65 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   function stateFor(key: string): SessionState {
     let st = sessions.get(key);
     if (!st) {
-      st = { injector: createInjector({ recall, config }), activity: [], injected: new Map(), touched: ++touchSeq };
+      st = {
+        injector: createInjector({ recall, config }),
+        activity: [],
+        injected: new Map(),
+        touchedMemories: new Map(),
+        pendingReinject: null,
+        lastReinject: null,
+        touched: ++touchSeq,
+      };
       sessions.set(key, st);
     }
     return st;
+  }
+  const trackMax = Math.max(0, config.trackMax ?? DEFAULTS.trackMax);
+  /** 记一条「本会话涉及过」的记忆；同一 id 再次涉及只刷新内容与顺序（LRU）。 */
+  function touchMemory(st: SessionState, m: { id: string; kind: string; content: string }): void {
+    if (!m.id || !m.content) return;
+    st.touchedMemories.delete(m.id);
+    st.touchedMemories.set(m.id, {
+      id: m.id,
+      kind: m.kind || 'memory',
+      summary: toSummary(m.content),
+      content: m.content,
+      at: Date.now(),
+    });
+    while (st.touchedMemories.size > trackMax) {
+      const oldest = st.touchedMemories.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      st.touchedMemories.delete(oldest);
+    }
+  }
+  /**
+   * 从 `tools/post-execute` 的 exec 参数/结果里提取被读写的记忆。
+   *
+   * id 在 `memory_get|memory_update` 的参数里，`memory_add` 的 id 只在结果里；
+   * 正文在 `memory_get` 的结果里，写入类在参数里。`memory_search` 不追踪
+   * （返回 preview，参数里没有 id，见 design D1）。
+   */
+  function trackToolMemory(st: SessionState, rawArgs: unknown, result: unknown): void {
+    const args = (rawArgs && typeof rawArgs === 'object' ? rawArgs : {}) as { id?: unknown; content?: unknown; kind?: unknown };
+    let id = typeof args.id === 'string' ? args.id : '';
+    let kind = typeof args.kind === 'string' ? args.kind : 'memory';
+    let content = typeof args.content === 'string' ? args.content : '';
+    if (!id || !content) {
+      type ToolResult = { id?: unknown; memory?: { content?: unknown; kind?: unknown } };
+      let parsed: ToolResult | null;
+      try {
+        parsed = JSON.parse(resultText(result)) as ToolResult;
+      } catch {
+        parsed = null;
+      }
+      if (!id && parsed && typeof parsed.id === 'string') id = parsed.id;
+      const mem = parsed?.memory;
+      if (!content && mem && typeof mem.content === 'string') {
+        content = mem.content;
+        if (typeof mem.kind === 'string') kind = mem.kind;
+      }
+    }
+    if (id) touchMemory(st, { id, kind, content });
   }
   /**
    * 记下「本会话注入过这条记忆」。
@@ -762,7 +871,13 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     payload.recent = history ? ring : ring.slice(-15);
     if (wantDebug) {
       // 会话 id 只给前 8 位：够对齐面板与宿主，又不是完整标识。
-      payload.debug = { ...diag, session: { requested: requested ? shortKey(requested) : '(none)', resolved: shortKey(key), known: sessions.size } };
+      payload.debug = {
+        ...diag,
+        session: { requested: requested ? shortKey(requested) : '(none)', resolved: shortKey(key), known: sessions.size },
+        // 压缩后重注入的两个观测点（design 可观测性）：上次重注入摘要与本会话追踪条数。
+        lastReinject: st?.lastReinject ?? null,
+        trackedCount: st?.touchedMemories.size ?? 0,
+      };
     }
     res.writeHead?.(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     // 兜底必须字段完备（EMPTY_USAGE）：client 详情段会读 injected 等字段，
@@ -887,11 +1002,18 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           // 压缩成功后上下文被重写：清空去重集合与本会话累计，否则被挤出的记忆再也回不来。
           // 压缩失败（data.error 存在）上下文没变，不重置。
           if (evt?.type === 'compaction/end') {
+            // D5：只有 `data.error` 为真才算失败；字段缺失/版本变化一律按成功处理——
+            // 宁可多重注入一次，也不要该恢复时不恢复。
             if (!evt.data?.error) {
               const st = sessions.get(sessionKey(_session));
               if (st) {
                 st.injector.resetSession();
                 st.injected.clear();
+                // 只清去重集合只解决「允许再注入」，下条消息不命中关键词模型照样失忆。
+                // 这里立刻把本会话涉及过的记忆重渲染，等下一步 pre-step 投递。
+                const r = st.injector.reinject([...st.touchedMemories.values()]);
+                st.pendingReinject = r ? { text: r.text, items: r.items, count: r.ids.length, bytes: r.bytes } : null;
+                if (r) st.lastReinject = { count: r.ids.length, bytes: r.bytes, at: new Date().toISOString() };
               }
             }
             return;
@@ -919,13 +1041,17 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     hooks.on(
       'tools/post-execute',
       async (
-        exec: { name?: string; tool?: string; agent?: { id?: unknown } },
+        exec: { name?: string; tool?: string; agent?: { id?: unknown }; arguments?: unknown },
         result: unknown,
         next?: (r?: unknown) => unknown,
       ) => {
         try {
           diag.toolEvents += 1;
           const toolName = typeof exec?.name === 'string' ? exec.name : typeof exec?.tool === 'string' ? exec.tool : '';
+          // 追踪不受 record.tools 开关影响：那是「留痕」，这是「压缩后能恢复」的功能前提。
+          if (toolName.startsWith('mcp__cairn__') && TRACKED_TOOLS.has(toolName.slice('mcp__cairn__'.length))) {
+            trackToolMemory(stateFor(sessionKey(exec?.agent)), exec?.arguments, result);
+          }
           if (recordCfg.tools && toolName.startsWith('mcp__cairn__') && Date.now() >= suppressToolLogUntil) {
             const failed = result && typeof result === 'object' && 'error' in (result as Record<string, unknown>);
             // 谁调的工具就记在谁头上：exec.agent.id 就是会话 id。
@@ -955,6 +1081,16 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           // 会话键：payload.agent.id。整个面板都是按这个键切片的。
           const key = sessionKey(payload?.agent);
           const st = stateFor(key);
+          // 压缩后重注入的投递点：session/event 的 session 对象没有 inject（Agent 才有），
+          // 所以渲染留在压缩事件里、投递放在这里。位置在常规召回之前，
+          // 且**不看本轮消息**——这正是「不依赖关键词再次命中」的实现。
+          if (st.pendingReinject && typeof payload?.agent?.inject === 'function') {
+            payload.agent.inject(makeInjectionMessage(st.pendingReinject.text));
+            // 重注入也是「注入过」：面板的本会话累计必须跟着重建，否则左栏空着、
+            // 而模型其实已经拿回了这些记忆。
+            for (const m of st.pendingReinject.items) rememberInjected(st, m);
+            st.pendingReinject = null;
+          }
           diag.lastPreStep.session = shortKey(key);
           diag.lastPreStep.messageLen = stepText.length;
           diag.lastRecall.queries = stepText ? deriveQueries(stepText).length : 0;
@@ -969,6 +1105,8 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
           // 拿它去 bump 会把上一轮的注入重复记一遍。
           const fresh = out.injectedIds.length > 0 ? (st.injector.lastUsage()?.injected ?? []) : [];
           for (const m of fresh) rememberInjected(st, m);
+          // 注入过 = 涉及过：把原文记进追踪集合（只存内存，压缩后靠它重注入）。
+          if (out.injected) for (const m of st.injector.lastInjectedItems()) touchMemory(st, m);
           if (recordCfg.recall && stepText) {
             pushActivity(key, 'recall', recallSummary(out), fresh, out.reason);
           }

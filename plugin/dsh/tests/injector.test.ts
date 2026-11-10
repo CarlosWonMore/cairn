@@ -893,3 +893,152 @@ describe('去重早退不得覆盖 lastUsage（2026-11-02 面板误报 miss 的�
     assert.ok(Number(call) >= 2, '两次都应发起召回');
   });
 });
+
+describe('压缩后重注入（add-compaction-reinject）', () => {
+  type Hit = { id: string; kind: string; content: string };
+
+  function makeCtx(initial: Record<string, Hit[]> = {}) {
+    const items = new Map<string, Hit[]>(Object.entries(initial));
+    const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
+    const ctx: Record<string, unknown> = {
+      tools: {
+        get: (_name: string, scope?: { id?: string }) => ({
+          execute: async () => ({
+            content: [{ type: 'text', text: JSON.stringify({ items: items.get(scope?.id ?? '') ?? [] }) }],
+          }),
+        }),
+      },
+      webServer: { register: (o: unknown) => routes.push(o as never) },
+      on: (e: string, fn: unknown) => { ctx[e] = fn; },
+    };
+    function read(session: string, debug = false): Record<string, unknown> {
+      let body = '';
+      const handler = routes.find((r) => String(r.path).endsWith('/usage'))!.handler!;
+      handler(
+        { method: 'GET', url: `/plugins/cairn-dsh-memory/usage?session=${session}&debug=${debug ? '1' : '0'}` },
+        { writeHead: () => {}, end: (s: string) => { body = s; } },
+      );
+      return JSON.parse(body) as Record<string, unknown>;
+    }
+    return { ctx, items, read };
+  }
+
+  const pre = (ctx: Record<string, unknown>) =>
+    ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+  const onEvent = (ctx: Record<string, unknown>) => ctx['session/event'] as (s: unknown, e: unknown) => void;
+  const step = (id: string, inject: (m: unknown) => void, text = '投影预算是多少') => ({
+    agent: { id, inject },
+    messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  });
+  const textOf = (m: unknown): string => (m as { content?: { text?: string }[] }).content?.[0]?.text ?? '';
+
+  it('4.1 压缩成功后重注入涉及过的记忆，表头区别于常规召回', async () => {
+    const { ctx } = makeCtx({ 'sess-A': [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] });
+    apply(ctx, {});
+    const first: unknown[] = [];
+    await pre(ctx)(step('sess-A', (m) => first.push(m)), () => {});
+    assert.equal(first.length, 1);
+    assert.match(textOf(first[0]), /以下记忆可能相关/, '常规召回用「可能相关」表头');
+    assert.doesNotMatch(textOf(first[0]), /压缩后恢复/);
+    onEvent(ctx)({ id: 'sess-A' }, { type: 'compaction/end', data: { compactionId: 'c1', turn: 1 } });
+    const after: unknown[] = [];
+    await pre(ctx)(step('sess-A', (m) => after.push(m), '继续'), () => {});
+    assert.equal(after.length, 1, '压缩后应重注入一条');
+    const text = textOf(after[0]);
+    assert.match(text, /压缩后恢复/, '重注入表头必须区别于常规召回');
+    assert.match(text, /投影预算是 2KB/, '必须注入原文');
+    assert.doesNotMatch(text, /以下记忆可能相关/, '重注入不得复用常规召回措辞');
+  });
+
+  it('4.2 压缩失败（带 error）不重注入、不清去重', async () => {
+    const { ctx } = makeCtx({ 'sess-F': [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] });
+    apply(ctx, {});
+    await pre(ctx)(step('sess-F', () => {}), () => {});
+    onEvent(ctx)({ id: 'sess-F' }, { type: 'compaction/end', data: { compactionId: 'c9', turn: 2, error: 'boom' } });
+    const after: unknown[] = [];
+    await pre(ctx)(step('sess-F', (m) => after.push(m)), () => {});
+    assert.equal(after.length, 0, '压缩失败时上下文没变：不重注入，去重也必须继续生效');
+  });
+
+  it('4.2b 压缩失败时即使有可重注入内容也不会泄漏', async () => {
+    const { ctx } = makeCtx({ 'sess-G': [{ id: 'g1', kind: 'fact', content: '压缩失败不该重注入的正文' }] });
+    apply(ctx, {});
+    const first: unknown[] = [];
+    await pre(ctx)(step('sess-G', (m) => first.push(m)), () => {});
+    assert.equal(first.length, 1, '前置：先真正注入一次，填充 touchedMemories');
+    onEvent(ctx)({ id: 'sess-G' }, { type: 'compaction/end', data: { compactionId: 'cE', turn: 2, error: 'boom' } });
+    const after: unknown[] = [];
+    await pre(ctx)(step('sess-G', (m) => after.push(m), '继续'), () => {});
+    assert.equal(after.length, 0, '压缩失败：即使有可重注入内容，也必须一条都不注入');
+  });
+
+  it('4.3 重注入超预算时裁剪并写明省略条数，不抛错', async () => {
+    const { ctx, items } = makeCtx();
+    apply(ctx, { budgetBytes: 600 });
+    for (let i = 1; i <= 8; i++) {
+      items.set('sess-T', [{ id: `m${i}`, kind: 'fact', content: `第 ${i} 条记忆的内容` }]);
+      await pre(ctx)(step('sess-T', () => {}), () => {});
+    }
+    onEvent(ctx)({ id: 'sess-T' }, { type: 'compaction/end', data: { compactionId: 'c3', turn: 3 } });
+    const after: unknown[] = [];
+    await pre(ctx)(step('sess-T', (m) => after.push(m), '继续'), () => {});
+    assert.equal(after.length, 1);
+    const text = textOf(after[0]);
+    assert.match(text, /另 \d+ 条未显示/, `超预算必须写明省略条数，实际 ${text}`);
+    assert.match(text, /第 1 条记忆的内容/);
+    assert.ok(Buffer.byteLength(text, 'utf8') <= Math.floor(600 * 0.5), '重注入必须守住独立预算');
+  });
+
+  it('4.4 重注入后常规召回不重复注入同一批', async () => {
+    const { ctx } = makeCtx({ 'sess-R': [{ id: 'r1', kind: 'fact', content: '投影预算是 2KB' }] });
+    apply(ctx, {});
+    await pre(ctx)(step('sess-R', () => {}), () => {});
+    onEvent(ctx)({ id: 'sess-R' }, { type: 'compaction/end', data: { compactionId: 'c4', turn: 1 } });
+    const rein: unknown[] = [];
+    await pre(ctx)(step('sess-R', (m) => rein.push(m), '继续'), () => {});
+    assert.equal(rein.length, 1, '前置：重注入应发生一次');
+    const again: unknown[] = [];
+    await pre(ctx)(step('sess-R', (m) => again.push(m), '投影预算是多少'), () => {});
+    assert.equal(again.length, 0, '重注入过的记忆不得被常规召回再注入一次');
+  });
+
+  it('4.5 会话隔离：A 压缩不影响 B', async () => {
+    const { ctx } = makeCtx({
+      'sess-AD': [{ id: 'a1', kind: 'fact', content: 'A 会话专属记忆正文' }],
+      'sess-BD': [{ id: 'b1', kind: 'fact', content: 'B 会话专属记忆正文' }],
+    });
+    apply(ctx, {});
+    await pre(ctx)(step('sess-AD', () => {}), () => {});
+    await pre(ctx)(step('sess-BD', () => {}), () => {});
+    onEvent(ctx)({ id: 'sess-AD' }, { type: 'compaction/end', data: { compactionId: 'c5', turn: 1 } });
+    const a: unknown[] = [];
+    await pre(ctx)(step('sess-AD', (m) => a.push(m), '继续'), () => {});
+    assert.equal(a.length, 1);
+    assert.match(textOf(a[0]), /A 会话专属记忆正文/);
+    assert.doesNotMatch(textOf(a[0]), /B 会话专属/, 'A 的重注入不得含 B 的记忆');
+    const bm: unknown[] = [];
+    await pre(ctx)(step('sess-BD', (m) => bm.push(m), '继续'), () => {});
+    assert.equal(bm.length, 0, 'B 未被压缩，不得有重注入');
+  });
+
+  it('4.6 追踪集合有上限，超出淘汰最旧', async () => {
+    const { ctx, items, read } = makeCtx();
+    apply(ctx, { trackMax: 3 });
+    for (let i = 0; i <= 4; i++) {
+      const id = 'e' + String(i).padStart(3, '0');
+      items.set('sess-L', [{ id, kind: 'fact', content: '追踪上限第 ' + id + ' 条正文' }]);
+      await pre(ctx)(step('sess-L', () => {}), () => {});
+    }
+    const dbg = read('sess-L', true);
+    // trackedCount 在 debug 子对象里（payload.debug.trackedCount），不是顶层
+    const dbgInner = dbg['debug'] as Record<string, unknown>;
+    assert.equal(dbgInner['trackedCount'], 3, '追踪集合必须被裁到 trackMax');
+    onEvent(ctx)({ id: 'sess-L' }, { type: 'compaction/end', data: { compactionId: 'c6', turn: 1 } });
+    const after: unknown[] = [];
+    await pre(ctx)(step('sess-L', (m) => after.push(m), '继续'), () => {});
+    assert.ok(after.length >= 1, '压缩后应至少重注入一条');
+    const text = after.map(textOf).join('\n');
+    assert.doesNotMatch(text, /追踪上限第 e000 条正文/, '最旧的已被淘汰');
+    assert.doesNotMatch(text, /追踪上限第 e001 条正文/, '前两条都该被淘汰');
+  });
+});
