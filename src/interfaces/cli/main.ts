@@ -19,6 +19,7 @@ import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review
 import { judgementFromFlags } from '../../onboarding/judgement.js';
 import { loadPolicy, listPolicies, revokePolicy, signPolicy } from '../../onboarding/policy.js';
 import { revokeByPolicy, runAutoOnboarding } from '../../onboarding/auto.js';
+import { ENV } from '../../sync/vault.js';
 import { join } from 'node:path';
 
 /**
@@ -387,7 +388,7 @@ async function main(): Promise<void> {
               bucket: str(flags, 'bucket') ?? throwUsage('--bucket 必填'),
               prefix: str(flags, 'prefix') ?? 'cairn/',
             } : undefined,
-            syncd: provider === 'syncd' ? { baseUrl: str(flags, 'base-url') ?? throwUsage('--base-url 必填') } : undefined,
+            syncd: provider === 'syncd' ? { baseUrl: str(flags, 'base-url') ?? (process.env[ENV.syncdUrl] || throwUsage('--base-url 必填（或用环境变量 CAIRN_SYNCD_URL）')) } : undefined,
           });
           out({ vaultId: r.vault!.vaultId, provider: r.vault!.provider, recovery: r.recovery, warning: '恢复材料请抄写到安全位置；密钥丢失 = 云端数据不可恢复' }, flags);
         } else if (sub === 'status') {
@@ -840,7 +841,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   policy sign|list|show|revoke  自动整理策略（签发只在终端或本机控制台）[--file] [--id] [--force]
   ui                            只读控制台（回环 HTTP；端口默认 7767，占用则随机）
                                 [--port N] [--no-open] [--export <file.html>] [--redact]
-  vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd）
+  vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd；syncd 的 --base-url 可省，取 CAIRN_SYNCD_URL）
   sync push|pull|backfill       加密同步上行 / 下行；backfill 补齐未入队的上行任务
                                 [--apply] [--limit N]（默认只读，不与云端交互；详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复

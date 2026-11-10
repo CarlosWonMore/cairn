@@ -56,12 +56,13 @@ export function saveVaultConfig(dataDir: string, cfg: Omit<VaultConfig, 'created
 /**
  * 环境变量名约定（与 GITHUB_TOKEN 同模式，用户级注入）：
  * OBS: OBS_ACCESS_KEY_ID / OBS_SECRET_ACCESS_KEY（+ vault.json 的 endpoint/bucket/prefix）
- * syncd: CAIRN_SYNCD_TOKEN
+ * syncd: CAIRN_SYNCD_TOKEN（凭据）；CAIRN_SYNCD_URL（baseUrl 缺省值，命令行 --base-url 优先）
  */
 export const ENV = {
   obsAk: 'OBS_ACCESS_KEY_ID',
   obsSk: 'OBS_SECRET_ACCESS_KEY',
   syncdToken: 'CAIRN_SYNCD_TOKEN',
+  syncdUrl: 'CAIRN_SYNCD_URL',
 } as const;
 
 /** 本变更首版同步的个人空间键（跨设备稳定标识；项目/自定义空间同步属后续边界）。 */

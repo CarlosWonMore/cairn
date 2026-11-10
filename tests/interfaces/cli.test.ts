@@ -309,3 +309,49 @@ test('CLI sync backfill：默认只读、--apply 补齐、--limit 非法值退�
   assert.ok(help.stdout.includes('sync push|pull|backfill'), '帮助文本应列出 backfill');
   assert.ok(help.stdout.includes('不与云端交互'), '帮助文本应标注不与云端交互');
 });
+
+test('vault init-remote syncd：--base-url 显式值优先于 CAIRN_SYNCD_URL', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+
+  const r = await runCli(
+    [...base, 'vault', 'init-remote', '--provider', 'syncd', '--base-url', 'http://192.0.2.10:8471'],
+    { CAIRN_SYNCD_URL: 'http://192.0.2.11:8471' },
+  );
+  assert.equal(r.code, 0, r.stderr);
+
+  const saved = JSON.parse(readFileSync(join(home, 'data', 'vault.json'), 'utf8'));
+  assert.equal(saved.provider, 'syncd');
+  assert.equal(saved.syncd.baseUrl, 'http://192.0.2.10:8471', '命令行参数必须压过环境变量');
+});
+
+test('vault init-remote syncd：缺省 --base-url 回落到 CAIRN_SYNCD_URL', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+
+  const r = await runCli(
+    [...base, 'vault', 'init-remote', '--provider', 'syncd'],
+    { CAIRN_SYNCD_URL: 'http://192.0.2.12:8471' },
+  );
+  assert.equal(r.code, 0, r.stderr);
+
+  const saved = JSON.parse(readFileSync(join(home, 'data', 'vault.json'), 'utf8'));
+  assert.equal(saved.syncd.baseUrl, 'http://192.0.2.12:8471', '环境变量写进 vault.json');
+});
+
+test('vault init-remote syncd：参数与环境变量都缺 → 用法退出码 2 且不写 vault.json', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  assert.equal((await runCli([...base, 'init'])).code, 0);
+
+  // 显式置空以隔离宿主环境里可能已设置的 CAIRN_SYNCD_URL
+  const r = await runCli(
+    [...base, 'vault', 'init-remote', '--provider', 'syncd'],
+    { CAIRN_SYNCD_URL: '' },
+  );
+  assert.equal(r.code, 2, `期望用法错误(2)，实得 ${r.code}: ${r.stderr}`);
+  assert.ok(r.stdout.includes('CAIRN_SYNCD_URL'), '错误文案要点出环境变量这条路（--json 时错误走 stdout）');
+  assert.equal(existsSync(join(home, 'data', 'vault.json')), false, '失败不得留下 vault.json');
+});
