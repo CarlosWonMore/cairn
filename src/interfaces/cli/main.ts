@@ -22,6 +22,8 @@ import { judgementFromFlags } from '../../onboarding/judgement.js';
 import { loadPolicy, listPolicies, revokePolicy, signPolicy } from '../../onboarding/policy.js';
 import { revokeByPolicy, runAutoOnboarding } from '../../onboarding/auto.js';
 import { ENV } from '../../sync/vault.js';
+import { syncContext } from '../../sync/orchestrate.js';
+import { uploadRemoteBackup, listRemoteBackups, restoreRemoteBackup } from '../../sync/backup-store.js';
 import { join } from 'node:path';
 
 /**
@@ -42,7 +44,7 @@ const VALUE_FLAGS = new Set([
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
   'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
-  'category', 'action', 'since', 'ids-file',
+  'category', 'action', 'since', 'ids-file', 'keep', 'from-remote', 'to',
   // promote / reject / doctor --archive-stale（add-candidate-promote-command +
   // add-memory-importance-and-usage-signal）。漏登记会让 parseArgs 把它们当布尔
   // true，str() 返回 undefined —— 命令静默不生效，且看起来"成功"。
@@ -580,6 +582,39 @@ async function main(): Promise<void> {
       }
 
       case 'backup': {
+        // add-cloud-backup：--upload 走加密上传（独立前缀 + 设备密钥）；默认仍是本地快照。
+        if (flags['list-remote'] === true) {
+          const ctx = syncContext(service.store);
+          if (!ctx) throw new CairnError('E_VALIDATION', '远端未配置：先 cairn vault init-remote（备份通道与同步共用同一远端配置）');
+          const items = await listRemoteBackups(ctx.remote, service.store.identity.deviceId);
+          if (json) {
+            out({ device: service.store.identity.deviceId, total: items.length, items }, flags);
+          } else {
+            diag(`设备 ${service.store.identity.deviceId} 的远端备份共 ${items.length} 份：`);
+            for (const it of items) {
+              console.log(`- ${it.name}  ${(it.sealedBytes / 1024).toFixed(1)} KB  · ${it.uploadedAt ?? '时间未知'}`);
+            }
+          }
+          break;
+        }
+        if (flags['upload'] === true) {
+          const ctx = syncContext(service.store);
+          if (!ctx) throw new CairnError('E_VALIDATION', '远端未配置：先 cairn vault init-remote（备份必须端到端加密上传，不产生明文产物）');
+          const r = await uploadRemoteBackup(service.store, ctx.remote, ctx.vault, {
+            keep: flags['keep'] != null ? Number(flags['keep']) : undefined,
+            targetPath: str(flags, 'out'),
+          });
+          if (json) {
+            out(r, flags);
+          } else {
+            console.log(`已上传 ${r.key}（密文 ${(r.sealedBytes / 1024).toFixed(1)} KB，明文快照 ${r.localSnapshot.path}）`);
+            if (r.pruned.length > 0) {
+              for (const p of r.pruned) console.log(`已按保留策略淘汰：${p}`);
+            }
+            if (r.pruneWarning) diag(r.pruneWarning);
+          }
+          break;
+        }
         const target = str(flags, 'out') ?? join(service.store.paths.backupsDir, `cairn-backup-${Date.now()}.db`);
         const b = backupDatabase(service.store.db, target);
         out(b, flags);
@@ -587,6 +622,28 @@ async function main(): Promise<void> {
       }
 
       case 'restore': {
+        // add-cloud-backup D5：远端恢复默认到新路径，绝不覆盖当前库；
+        // --force 的顺序是「先自动备份当前库 → 还原到暂存路径（全部校验）→ 通过才关库覆盖」。
+        const fromRemote = str(flags, 'from-remote');
+        if (fromRemote) {
+          const ctx = syncContext(service.store);
+          if (!ctx) throw new CairnError('E_VALIDATION', '远端未配置：先 cairn vault init-remote');
+          if (flags['force'] === true) {
+            const safety = backupDatabase(service.store.db, join(service.store.paths.backupsDir, `pre-restore-${Date.now()}.db`));
+            diag(`已自动备份当前库：${safety.path}`);
+            // 先走完整校验链还原到暂存路径；任何一步失败都会抛错，当前库不受影响
+            const staging = await restoreRemoteBackup(service.store, ctx.remote, ctx.vault, fromRemote, {});
+            service.close();
+            const { resolvePaths } = await import('../../store/open.js');
+            const paths = resolvePaths(home ?? (process.env['CAIRN_HOME'] ?? ''));
+            restoreFromBackup(staging.restoredTo, paths.dbPath);
+            out({ overwritten: paths.dbPath, stagedFrom: staging.restoredTo, plainSha256: staging.plainSha256, safetyBackup: safety.path }, flags);
+            break;
+          }
+          const r = await restoreRemoteBackup(service.store, ctx.remote, ctx.vault, fromRemote, { toDir: str(flags, 'to') });
+          out({ restoredTo: r.restoredTo, plainSha256: r.plainSha256, verified: r.verified }, flags);
+          break;
+        }
         const backupPath = args[0];
         if (!backupPath) throw new CairnError('E_VALIDATION', '用法: cairn restore <backup.db> [--home <dir>]');
         service.close();
@@ -1134,6 +1191,9 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   sync push|pull|backfill       加密同步上行 / 下行；backfill 补齐未入队的上行任务
                                 [--apply] [--limit N]（默认只读，不与云端交互；详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复
+         --upload             加密上传到远端（独立前缀 backups/<设备>/）[--keep N]（默认保留 5 份）
+         --list-remote        列出本设备的远端备份（名称/时间/密文字节）
+  restore --from-remote <name>  下载解密校验后还原；默认到新路径，--force 覆盖当前库前自动备份之 [--to <dir>]
   doctor                        健康检查 [--host <agent>]（诚实分级，无模型无云端核心可用）
   status                        库状态摘要
   project resolve|list          项目身份：id 是 UUID，路径/URL 只作别名

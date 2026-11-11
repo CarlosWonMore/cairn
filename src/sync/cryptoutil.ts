@@ -46,6 +46,8 @@ const MIN_BLOB_LEN = VERSION_LEN + NONCE_LEN + TAG_LEN;
 
 /** HKDF salt 固定串。info 携带协议版本与 spaceId；tests/sync 有字面量锚定测试防止无意变更。 */
 const SPACE_KEY_SALT = 'cairn-space-key';
+/** 备份派生路径的独立 salt：与 space 密钥不同域，两类密文不可互换（add-cloud-backup D2）。 */
+const BACKUP_KEY_SALT = 'cairn-backup-key';
 
 const KEYS_FILE = 'keys.json';
 const KEYS_FORMAT = 'cairn-vault-keys';
@@ -58,8 +60,8 @@ const RECOVERY_VERSION = 1;
 
 const textEncoder = new TextEncoder();
 
-/** AAD 对象类型：chunk（一批同步事件）或 manifest（设备 manifest）。 */
-export type EncryptedObjectKind = 'chunk' | 'manifest';
+/** AAD 对象类型：chunk（一批同步事件）、manifest（设备 manifest）、backup（设备备份快照）。 */
+export type EncryptedObjectKind = 'chunk' | 'manifest' | 'backup';
 
 /**
  * AAD 绑定字段：协议版本、vault、space、对象类型与对象 ID 全部入册
@@ -105,6 +107,26 @@ export function deriveSpaceKey(vaultKey: Uint8Array, spaceId: string): Uint8Arra
     throw err('E_VALIDATION', 'space_id_invalid');
   }
   return hkdf(sha256, vaultKey, textEncoder.encode(SPACE_KEY_SALT), textEncoder.encode(`v1|${spaceId}`), KEY_LEN);
+}
+
+/**
+ * 派生设备备份密钥（add-cloud-backup D2）：HKDF-SHA256(vaultKey, salt='cairn-backup-key', info=`v1|${deviceId}`)。
+ * 与 deriveSpaceKey 平行但不同域（不同 salt）：
+ * - 复用 vaultKey → 用户不需要多抄一份恢复材料；
+ * - 混入 deviceId → 备份只能由生成它的设备解开（其他设备拿到密文也无密钥材料）；
+ * - 密文不可被当 chunk 解开、反之亦然（spec：两类对象密文不可互相替换）。
+ */
+export function deriveBackupKey(vaultKey: Uint8Array, deviceId: string): Uint8Array {
+  if (!(vaultKey instanceof Uint8Array) || vaultKey.length !== KEY_LEN) {
+    throw err('E_VALIDATION', 'vault_key_invalid_length', {
+      expected: KEY_LEN,
+      got: vaultKey instanceof Uint8Array ? vaultKey.length : null,
+    });
+  }
+  if (typeof deviceId !== 'string' || deviceId.length === 0) {
+    throw err('E_VALIDATION', 'device_id_invalid');
+  }
+  return hkdf(sha256, vaultKey, textEncoder.encode(BACKUP_KEY_SALT), textEncoder.encode(`v1|${deviceId}`), KEY_LEN);
 }
 
 /**
@@ -322,7 +344,7 @@ function assertAad(aad: CipherAad): void {
     aad.spaceId.length === 0 ||
     typeof aad.objectId !== 'string' ||
     aad.objectId.length === 0 ||
-    (aad.kind !== 'chunk' && aad.kind !== 'manifest')
+    (aad.kind !== 'chunk' && aad.kind !== 'manifest' && aad.kind !== 'backup')
   ) {
     throw err('E_VALIDATION', 'aad_invalid');
   }

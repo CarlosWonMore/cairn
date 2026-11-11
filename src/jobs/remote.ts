@@ -13,6 +13,12 @@ export interface RemoteStore {
   list(prefix: string, cursor?: string): Promise<{ keys: string[]; nextCursor?: string }>;
   getManifest(space: string, device: string): Promise<unknown | null>;
   putManifest(space: string, device: string, manifest: unknown, expectedGeneration: number): Promise<void>;
+  /**
+   * 可选删除（add-cloud-backup：备份保留策略需要）。**不在常规同步接口语义里**——
+   * 同步链是追加式的，永不删除对象；只有备份保留清理会调用。
+   * 后端不支持时留空（如 syncd 无 DELETE 路由）：调用方必须诚实降级，不得假装删了。
+   */
+  deleteObject?(key: string): Promise<void>;
   /** false = 一切上行调用都必须被拒绝（诚实降级，不假装同步成功）。 */
   readonly configured: boolean;
 }

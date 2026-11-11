@@ -859,6 +859,32 @@ cairn rescope --pending --scope-preset device-local [--dry-run]
 
 ---
 
+## 设备备份的云端容灾（add-cloud-backup）
+
+`cairn backup` 的本地快照只在同一块硬盘上；硬盘坏了 `device-local` 记忆全丢。备份通道把快照**端到端加密后上传**到远端（与同步同一 vault、同一凭据，但独立前缀与独立密钥派生）：
+
+```bash
+# 加密上传（先 vault init-remote；无 vault 明确拒绝，不产生弱加密产物）
+cairn backup --upload              # 默认保留最近 5 份 [--keep N]
+
+# 列出本设备的远端备份（名称 / 时间 / 密文字节）
+cairn backup --list-remote
+
+# 恢复：默认还原到新路径（~/.cairn/restore-<时间戳>/），当前库完全不动
+cairn restore --from-remote <name> [--to <dir>]
+
+# 覆盖当前库：必须 --force，且会先把当前库自动备份一份（pre-restore-*.db）
+cairn restore --from-remote <name> --force
+```
+
+三条后果要记住：
+
+- **只有本机解得开**：备份密钥混入设备身份，其他设备拿到密文也解不开。所以 **`device.json` 丢了 = 旧备份全部解不开**——重装前备份它，或用 `device re-enroll` 恢复同一身份。
+- **syncd 暂不支持删除**：保留策略在 OBS 后端自动淘汰；syncd 后端只上传不删除（输出有提示），旧备份手动清理。
+- **上传不碰本地库**：`backup --upload` 只读快照 + 写远端，失败不影响任何记忆读写。
+
+---
+
 ## 8. 命令与退出码速查
 
 | 命令 | 作用 |

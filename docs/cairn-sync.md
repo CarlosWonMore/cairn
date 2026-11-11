@@ -97,3 +97,22 @@ doctor 的 remote 状态反映【当前环境】的可用性：远端已配置�
 - `sync backfill` 只写本地 outbox，**不产生任何网络请求**；它不改变云端内容，补齐后仍需显式 `sync push`。
 - 已验证环境：Windows x64 ↔ Linux x64 双设备、真实 OBS 与真实 ECS syncd；macOS 未验证。
 - Obsidian 等既有桶内前缀（`obsidian/`、`famboard/`）与本产品前缀（`cairn/`）互不干涉；本产品从不读写其他前缀。
+
+## 备份通道：设备快照的云端容灾（与同步是两回事）
+
+同步的语义是「让对端持有等价副本」；备份的语义是「只有本机能读的容灾快照」。两条通道共用同一远端配置与 vault 密钥体系，但**互不干扰**：
+
+| | 同步链 | 备份通道 |
+|---|---|---|
+| 对象前缀 | `<space>/devices/...` | `backups/<设备>/...` |
+| 密钥 | `deriveSpaceKey(vaultKey, space)` | `deriveBackupKey(vaultKey, deviceId)`（不同 HKDF 域，混入设备维度） |
+| 内容 | 逐条事件（chunk/manifest） | 整库快照（VACUUM INTO + sha256） |
+| 删除 | 永不（追加语义） | 保留策略按份淘汰 |
+
+关键语义：
+
+- **只有生成它的设备能解开**：备份密钥混入 `deviceId`，其他设备拿到密文也没有对应密钥材料——这是特性不是缺陷。
+- **设备身份丢失会导致旧备份解不开**：`~/.cairn/data/device.json` 决定 deviceId；重装系统前备份它，或用 `device re-enroll` 恢复同一身份。密钥材料本身来自 vault（`keys.json` / 恢复材料），不需要额外抄写。
+- **前缀严格隔离**：同步 list 扫不到备份对象、备份清理碰不到 chunk/manifest；一方不可用不影响另一方。
+- **syncd 暂不支持删除**：保留策略（默认保留最近 5 份）在 OBS 后端可自动淘汰；syncd 后端诚实降级为只上传不删除（输出里有提示），旧备份需手动清理。恢复链路（下载 → 解密 → sha256 比对 → 快照校验）两个后端一致。
+- 上传不改本地库状态；恢复默认还原到新路径，覆盖当前库必须 `--force` 且会先自动备份当前库。
