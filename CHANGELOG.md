@@ -6,6 +6,9 @@
 
 ### Added
 
+- **作用域迁移（`cairn rescope`）**：活动记忆可换作用域，不删不重建——id、修订历史、证据链、权威级别全保留，只改 `scope_id`。安全阀：冲突状态拒绝、缺 projectId 拒绝（不静默降级）、`user_explicit` 记忆需 `--force`。迁移与 outbox 重建同事务：作废旧作用域 pending 上行、按新作用域重新入队。批量 `--ids-file` 逐条报告，单条失败不中断；`--pending` 处理控制台「需迁移作用域」批注（先列清单再逐条执行）。退出码合同：用法 2 / 治理拒绝 3 / 冲突 4。
+- **`scope_exit` 迁出通知事件**（schema v6）：记忆迁出可同步作用域时，对端把本地副本标为「不再持有」（archived + meta 标记，**无墓碑、不删数据**），检索与投影不再返回；迁回时强制重发修订快照（`reentry` 标记）自动解除标记；迟到修订按幂等跳过；旧版本收到未知事件类型跳过并审计、不阻断整链。云端既有密文不随迁出删除。
+- **批注类别 `needs_rescope`**：控制台可标记「需迁移作用域」，与 `pending_forget` 同一哲学——批注只表达意图，执行在终端 `cairn rescope --pending`。
 - **稳定的项目身份（UUID + 别名）**：项目主键改为 UUIDv7，路径与 git 地址只作为 `project.aliases` 里的别名。仓库改名（GitHub → Gitee、org 改名）或换设备改路径后，追加一条别名即可让新旧地址解析到同一个项目，既有记忆归属不变。新增 `cairn project resolve|list`、`cairn project alias add <project-id> <path-or-url>`，以及 MCP 工具 `project_resolve` / `project_list`——CLI 与 MCP 共用 `src/store/projects.ts` 同一实现。
 - **别名归一化**：`https://Host/o/r.git`、`git@host:o/r.git`、`ssh://git@host/o/r.git` 视为同一项目（去凭据、host 小写、去 `.git`）；路径统一盘符大小写与分隔符并去尾斜杠，但**保留目录名大小写**（Linux 上 `Proj` 与 `proj` 是两个目录）。不做模糊匹配、不校验路径是否存在（跨设备解析必需）、不自动上溯父目录。
 - **别名冲突拒绝**：把已属于其他项目的别名追加到当前项目时抛 `E_CONFLICT_STATE`（退出码 4）并报告归属，不改任何数据；别名追加写 `project` 类目审计。

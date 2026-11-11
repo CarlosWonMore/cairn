@@ -25,7 +25,7 @@ import { scanText } from '../core/secrets.js';
 import { loadVaultConfig } from '../sync/vault.js';
 import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } from '../sync/cryptoutil.js';
 import { nowIso } from '../core/time.js';
-import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext } from '../sync/orchestrate.js';
+import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext, PERSONAL_SPACE_KEY } from '../sync/orchestrate.js';
 import { findUpstreamGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
 import {
@@ -494,6 +494,117 @@ export class AppService {
       scopeChanged: previousScopeId !== out.scopeId,
     });
     return { memory: out, scope, previousScopeId };
+  }
+
+  /**
+   * 作用域迁移（add-scope-migration）：active 记忆可改归属，与晋升刻意区分——
+   * 不改 status / authority / 正文。同一事务内完成：迁移 scope_id、作废旧 pending
+   * 上行任务、按目标作用域重新入队、迁出且曾同步过时排一条迁出通知任务。
+   *
+   * 安全阀（design D4）：冲突状态拒绝（状态不明确）；墓碑拒绝；缺 projectId 由
+   * resolveScope 抛 E_VALIDATION（不静默降级）；user_explicit 需 force（减速带不是禁止）。
+   */
+  rescopeMemory(
+    id: string,
+    opts: {
+      scopePreset: ScopeSelection['preset'];
+      projectId?: string;
+      projectName?: string;
+      agentId?: string;
+      ttlDays?: number;
+      force?: boolean;
+    },
+  ): { memory: MemoryRecord; scope: ScopeRow; previousScopeId: string; willLoseSync: boolean; scopeExitEnqueued: boolean } {
+    const store = this.store;
+    store.assertWritable();
+    const mem = store.memories.require(id);
+    if (mem.status === 'conflicted') {
+      throw err('E_CONFLICT_STATE', '记忆处于冲突队列中，先解决冲突再迁移');
+    }
+    if (mem.status === 'tombstoned') {
+      throw err('E_CONFLICT_STATE', `墓碑没有作用域可迁移，当前 ${mem.status}`);
+    }
+    const previousScope = store.scopes.requireById(mem.scopeId);
+    const sel: ScopeSelection = { preset: opts.scopePreset };
+    if (opts.projectId !== undefined) sel.projectId = opts.projectId;
+    if (opts.projectName !== undefined) sel.projectName = opts.projectName;
+    if (opts.agentId !== undefined) sel.agentId = opts.agentId;
+    if (opts.ttlDays !== undefined) sel.ttlDays = opts.ttlDays;
+    const target = this.resolveScope(sel);
+    if (target.id === previousScope.id) {
+      // 原地迁移：无操作也不留审计（没有发生任何改变）
+      return { memory: mem, scope: target, previousScopeId: mem.scopeId, willLoseSync: false, scopeExitEnqueued: false };
+    }
+    if (mem.authority === 'user_explicit' && opts.force !== true) {
+      throw err('E_FORBIDDEN', '用户明确陈述（user_explicit）的记忆迁移会改变可见范围，需要 --force 显式确认');
+    }
+    const willLoseSync = scopeAllowsUpstream(previousScope) && !scopeAllowsUpstream(target);
+    // 「曾同步过」= 该记忆在本空间链上推送过修订（sync_pushed 元数据存在）。
+    // 只有这种情况对端才持有副本，迁出才需要通知；从未上行的记忆迁出无人需要知道。
+    const wasPushed = store.db.get(
+      'SELECT value FROM meta WHERE key = ?',
+      `sync_pushed:${PERSONAL_SPACE_KEY}:${id}`,
+    ) != null;
+
+    const scopeExitEnqueued = store.db.transaction(() => {
+      store.memories.migrateScope(id, target.id, this.caller.agentId);
+      // outbox 重建：照抄 promoteCandidate——旧作用域下的待同步任务若照发，
+      // 会把记忆同步到错误的云端空间（design D2）。
+      store.db.run(
+        "DELETE FROM outbox_job WHERE entity_type = 'memory' AND entity_id = ? AND status = 'pending'",
+        id,
+      );
+      if (scopeAllowsUpstream(target)) {
+        // 迁入可同步作用域：重新入队。若此前同步过，修订未变会被 push 的幂等检查
+        // 跳过、对端永远收不到「重新持有」的信号——因此带 force 让 push 无条件重发
+        // 一次修订快照（payload.reentry），对端据此解除「不再持有」标记。
+        store.outbox.enqueue({
+          jobType: 'sync_upstream',
+          scopeId: target.id,
+          entityType: 'memory',
+          entityId: id,
+          payload: { op: 'memory_upsert', memoryId: id, ...(wasPushed ? { force: true } : {}) },
+          idempotencyKey: wasPushed ? `memory:${id}:re-entry:${Date.now()}` : `memory:${id}:rev:${mem.currentRevisionId ?? ''}`,
+        });
+        return false;
+      }
+      if (scopeAllowsUpstream(previousScope) && wasPushed) {
+        // 迁出通知：独立 jobType（不是上行内容任务，spec 要求迁移不产生新的上行任务）。
+        // 幂等键带时间戳：迁出→迁回→再迁出的每一轮都要各发一次通知，
+        // 固定键会被已完成的历史任务挡住（enqueue 按键去重不分状态）。
+        const enq = store.outbox.enqueue({
+          jobType: 'sync_scope_exit',
+          scopeId: target.id,
+          entityType: 'memory',
+          entityId: id,
+          payload: { op: 'scope_exit', memoryId: id },
+          idempotencyKey: `memory:${id}:scope-exit:${Date.now()}`,
+        });
+        return enq.enqueued;
+      }
+      return false;
+    });
+
+    store.audit.record('memory', 'scope_migrated', { type: 'memory', id }, {
+      fromScope: previousScope.id,
+      toScope: target.id,
+      channel: 'cli',
+      willLoseSync,
+      scopeExitEnqueued,
+      forced: opts.force === true,
+    });
+    return {
+      memory: store.memories.require(id),
+      scope: target,
+      previousScopeId: previousScope.id,
+      willLoseSync,
+      scopeExitEnqueued,
+    };
+  }
+
+  /** 待迁移清单：只读查询，永不执行迁移（执行入口是 `cairn rescope --pending`）。 */
+  listPendingRescope(): AnnotationView[] {
+    return storeReadAnnotations(this.store, { disposition: 'needs_rescope', status: 'open' });
   }
 
   /** 拒绝候选：转墓碑（不是物理删除），留审计理由；恢复需显式重做（design D4）。 */

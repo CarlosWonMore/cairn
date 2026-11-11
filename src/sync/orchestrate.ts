@@ -65,7 +65,11 @@ export function syncContext(store: CairnStore): SyncContext | null {
 export function registerSyncWorker(store: CairnStore, remote: RemoteStore, vault: VaultConfig): void {
   registerHandler('sync_upstream', (job) => {
     // worker 已 claim 单个任务；push 以该任务触发批量发布（幂等：已推送修订跳过）
-    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId }] });
+    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId, payload: job.payload }] });
+  });
+  // 迁出通知任务走同一条 push 链（add-scope-migration）：生成 scope_exit 控制事件。
+  registerHandler('sync_scope_exit', (job) => {
+    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId, payload: job.payload }] });
   });
 }
 

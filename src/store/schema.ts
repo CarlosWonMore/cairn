@@ -546,3 +546,59 @@ ALTER TABLE memory ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0;
 -- 投影排序用：重要度优先，同档按最近使用。
 CREATE INDEX IF NOT EXISTS memory_importance_used ON memory(importance DESC, last_used_at DESC);
 `;
+
+/**
+ * 006：迁出通知任务类型（add-scope-migration）。
+ *
+ * `outbox_job.job_type` 受硬编码 CHECK 约束，加 `sync_scope_exit` 只能重建表。
+ * 为什么不改成宽枚举或去掉 CHECK：那是放松约束来省事——001 的枚举是数据库层
+ * 拒绝未知任务类型的安全边界，值得为它付一次重建。
+ *
+ * outbox_job 没有被任何表外键引用（叶子表），但出向 FK（scope_id）与
+ * 2 个索引、1 个触发器必须逐字保留；迁移范式与 004 相同（先关外键 + legacy_alter_table）。
+ */
+export const MIGRATION_006_OUTBOX_SCOPE_EXIT = /* sql */ `
+PRAGMA legacy_alter_table = ON;
+
+ALTER TABLE outbox_job RENAME TO outbox_job_old;
+
+CREATE TABLE outbox_job (
+  id              TEXT PRIMARY KEY,
+  job_type        TEXT NOT NULL CHECK (job_type IN
+                    ('sync_upstream','sync_scope_exit','extract','embed','maintain','projection_rebuild')),
+  scope_id        TEXT REFERENCES scope(id) ON DELETE RESTRICT,
+  entity_type     TEXT NOT NULL CHECK (entity_type IN ('memory','revision','plan','archive','system')),
+  entity_id       TEXT NOT NULL,
+  payload         TEXT NOT NULL DEFAULT '{}',
+  payload_hash    TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  status          TEXT NOT NULL CHECK (status IN
+                    ('pending','running','done','retry','failed','dead','conflict')),
+  attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts    INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts >= 1),
+  next_attempt_at TEXT,
+  last_error      TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  CHECK (status <> 'dead' OR attempts >= 1)
+);
+
+INSERT INTO outbox_job SELECT * FROM outbox_job_old;
+
+DROP TABLE outbox_job_old;
+
+PRAGMA legacy_alter_table = OFF;
+
+-- 索引与触发器随旧表一起被 DROP，必须原样重建。
+CREATE INDEX IF NOT EXISTS outbox_ready  ON outbox_job(status, next_attempt_at) WHERE status IN ('pending','retry');
+CREATE INDEX IF NOT EXISTS outbox_entity ON outbox_job(entity_type, entity_id);
+
+CREATE TRIGGER outbox_reject_local_upstream
+BEFORE INSERT ON outbox_job
+WHEN NEW.job_type = 'sync_upstream' AND NEW.scope_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'scope_not_upstreamable')
+  WHERE (SELECT sync_policy FROM scope WHERE id = NEW.scope_id) <> 'encrypted'
+     OR (SELECT device_id   FROM scope WHERE id = NEW.scope_id) <> 'all';
+END;
+`;

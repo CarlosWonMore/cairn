@@ -27,6 +27,11 @@ export interface SyncUpsertPayload {
   sourceAgent: string | null;
   createdBy: string;
   reason: string | null;
+  /**
+   * 迁回重推标记（add-scope-migration）：这条 upsert 来自「迁出后重新迁回」的强制重发。
+   * 对端据此解除「不再持有」标记；没有该标记的普通 upsert 在标记存在时按迟到修订跳过。
+   */
+  reentry?: boolean;
 }
 
 export interface SyncTombstonePayload {
@@ -36,14 +41,25 @@ export interface SyncTombstonePayload {
   knownHashes: string[];
 }
 
+/**
+ * 迁出通知 payload（add-scope-migration D3）：一条已同步的记忆迁出了可同步作用域。
+ * 对端语义是「本设备不再持有」——不是遗忘（无墓碑），不是删除（数据保留）。
+ */
+export interface SyncScopeExitPayload {
+  /** 推送端最后已知（已推送）的内容哈希。 */
+  lastContentHash: string;
+  /** 推送端已知的全部修订内容哈希——与 tombstone 同一血统对齐机制。 */
+  knownHashes: string[];
+}
+
 export interface SyncEvent {
   deviceId: string;
   seq: number;
-  type: 'memory_upsert' | 'memory_tombstone';
+  type: 'memory_upsert' | 'memory_tombstone' | 'scope_exit';
   /** 推送端本地记忆 id；跨设备对账以内容哈希血统为准（见 SyncTombstonePayload）。 */
   memoryId: string;
   occurredAt: string;
-  payload: SyncUpsertPayload | SyncTombstonePayload | null;
+  payload: SyncUpsertPayload | SyncTombstonePayload | SyncScopeExitPayload | null;
 }
 
 /** 打包前校验：内容哈希必须与正文一致（传输完整性内建于事件）。 */

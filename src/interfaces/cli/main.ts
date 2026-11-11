@@ -12,6 +12,7 @@ import {
   ConfigMode,
 } from '../../agents/config.js';
 import { backupDatabase, restoreFromBackup } from '../../store/backup.js';
+import { scopeAllowsUpstream } from '../../core/scope.js';
 import { openStore } from '../../store/open.js';
 import { addAlias, listProjects, resolveProject } from '../../store/projects.js';
 import { startConsoleServer } from '../console/server.js';
@@ -41,7 +42,7 @@ const VALUE_FLAGS = new Set([
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
   'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
-  'category', 'action', 'since',
+  'category', 'action', 'since', 'ids-file',
   // promote / reject / doctor --archive-stale（add-candidate-promote-command +
   // add-memory-importance-and-usage-signal）。漏登记会让 parseArgs 把它们当布尔
   // true，str() 返回 undefined —— 命令静默不生效，且看起来"成功"。
@@ -252,6 +253,123 @@ async function main(): Promise<void> {
         if (!id || reason === '') throw new CairnError('E_VALIDATION', '用法: cairn reject <id> "<理由>"');
         const r = service.rejectCandidate(id, { reason });
         out({ id: r.memory.id, status: r.memory.status }, flags);
+        break;
+      }
+
+      case 'rescope': {
+        // add-scope-migration D5：批注只表达意图（needs_rescope），执行留在终端——
+        // 与 forget --pending 同一套哲学：先列清单再逐条执行。
+        const preset = str(flags, 'scope-preset');
+        const force = flags['force'] === true;
+        const projectId = str(flags, 'scope-project');
+        if (flags['pending'] === true) {
+          if (!preset) throw new CairnError('E_VALIDATION', '用法: cairn rescope --pending --scope-preset <preset> [--scope-project <id>] [--force] [--dry-run]');
+          const pending = service.listPendingRescope();
+          const dryRun = flags['dry-run'] === true;
+          const items = pending.map((p) => ({
+            annotationId: p.id,
+            memoryId: p.memoryId,
+            summary: p.memoryExcerpt,
+            note: p.note,
+            annotatedAt: p.createdAt,
+            memoryStatus: p.memoryStatus,
+          }));
+          if (!json) {
+            if (items.length === 0) {
+              console.log('待迁移清单为空：没有未处理的「需要迁移作用域」批注。');
+            } else {
+              console.log(`待迁移清单 ${items.length} 条（WebUI 只是标记，作用域尚未改变）：`);
+              for (const it of items) {
+                console.log(`- ${it.memoryId}  ${it.summary ?? '(正文已掩码或不可用)'}  · 标注于 ${it.annotatedAt}`);
+              }
+            }
+          }
+          if (dryRun) {
+            if (json) out({ dryRun: true, pending: items.length, items, results: [] }, flags);
+            diag('--dry-run：只打印清单，未迁移任何记忆。');
+            break;
+          }
+          const results: { memoryId: string; ok: boolean; status?: string; reason?: string }[] = [];
+          for (const p of pending) {
+            try {
+              if (p.memoryStatus == null) {
+                service.resolveAnnotation({ id: p.id, status: 'ignored', by: 'cli:rescope' });
+                results.push({ memoryId: p.memoryId, ok: false, reason: '记忆已不存在（批注已标记为忽略）' });
+                continue;
+              }
+              const r = service.rescopeMemory(p.memoryId, { scopePreset: preset as never, projectId, force });
+              service.resolveAnnotation({ id: p.id, status: 'resolved', by: 'cli:rescope' });
+              results.push({ memoryId: p.memoryId, ok: true, status: r.memory.status, reason: r.willLoseSync ? '已失去同步' : undefined });
+            } catch (e) {
+              results.push({ memoryId: p.memoryId, ok: false, reason: (e as Error).message });
+            }
+          }
+          if (json) {
+            out({ dryRun: false, pending: items.length, items, results }, flags);
+          } else {
+            for (const r of results) {
+              console.log(`- ${r.ok ? '已迁移' : '未处理'} ${r.memoryId}${r.reason ? `（${r.reason}）` : ''}`);
+            }
+            const okCount = results.filter((r) => r.ok).length;
+            diag(`待迁移清单处理完毕：成功 ${okCount} 条，失败 ${results.length - okCount} 条。`);
+          }
+          break;
+        }
+        if (!preset) throw new CairnError('E_VALIDATION', '用法: cairn rescope <id> --scope-preset <preset> [--scope-project <id>] [--force]；或 cairn rescope --pending --scope-preset <preset>');
+        const idsFile = str(flags, 'ids-file');
+        let ids: string[] = [];
+        if (idsFile) {
+          const { readFileSync } = await import('node:fs');
+          ids = readFileSync(idsFile, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith('#'));
+        } else if (args[0]) {
+          ids = [args[0]!];
+        }
+        if (ids.length === 0) throw new CairnError('E_VALIDATION', '用法: cairn rescope <id> --scope-preset <preset>；批量迁移用 --ids-file <file>（每行一个 id）');
+        // 预检汇总（只读探测，不代表执行判定；执行判定在 rescopeMemory 内）：
+        // 将迁移 N 条，其中 M 条将失去同步，K 条预计被拒绝。
+        const target = service.resolveScope({ preset: preset as never, projectId });
+        let loseCount = 0;
+        const refusedPreview: string[] = [];
+        for (const id of ids) {
+          try {
+            const mem = service.store.memories.require(id);
+            const cur = service.store.scopes.requireById(mem.scopeId);
+            if (scopeAllowsUpstream(cur) && !scopeAllowsUpstream(target)) loseCount += 1;
+            if (mem.status === 'conflicted') refusedPreview.push(`${id.slice(0, 8)} 冲突中`);
+            else if (mem.authority === 'user_explicit' && !force) refusedPreview.push(`${id.slice(0, 8)} 需 --force`);
+          } catch {
+            refusedPreview.push(`${id.slice(0, 8)} 不存在`);
+          }
+        }
+        if (!json) {
+          console.log(`将迁移 ${ids.length} 条 → ${target.preset}${projectId ? `(${projectId.slice(0, 8)})` : ''}，其中 ${loseCount} 条将失去跨设备同步${loseCount > 0 ? '（迁移到 local_only 作用域后不再上行；云端旧密文不会自动删除）' : ''}。`);
+          if (refusedPreview.length > 0) diag(`预计被拒绝 ${refusedPreview.length} 条：${refusedPreview.join('；')}`);
+        }
+        const results: { id: string; ok: boolean; toScope?: string; willLoseSync?: boolean; reason?: string }[] = [];
+        for (const id of ids) {
+          // 单条显式指定时失败必须硬退出（退出码合同：用法 2 / 治理拒绝 3 / 冲突 4）；
+          // 只有 --ids-file 批量才逐条软报告（spec：单条失败不中断其余条目）。
+          if (idsFile) {
+            try {
+              const r = service.rescopeMemory(id, { scopePreset: preset as never, projectId, force });
+              results.push({ id, ok: true, toScope: r.scope.id, willLoseSync: r.willLoseSync });
+            } catch (e) {
+              results.push({ id, ok: false, reason: (e as Error).message });
+            }
+          } else {
+            const r = service.rescopeMemory(id, { scopePreset: preset as never, projectId, force });
+            results.push({ id, ok: true, toScope: r.scope.id, willLoseSync: r.willLoseSync });
+          }
+        }
+        if (json) {
+          out({ total: ids.length, willLoseSync: loseCount, targetScope: target.id, results }, flags);
+        } else {
+          for (const r of results) {
+            console.log(`- ${r.ok ? '已迁移' : '拒绝'} ${r.id}${r.ok ? ` → ${r.toScope}${r.willLoseSync ? '（失去同步）' : ''}` : `（${r.reason}）`}`);
+          }
+          const okCount = results.filter((r) => r.ok).length;
+          diag(`迁移完毕：成功 ${okCount} 条，失败 ${results.length - okCount} 条。`);
+        }
         break;
       }
 
@@ -918,6 +1036,9 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   update <id> "新内容"          用户更正（新修订，历史保留）
   forget <id>                   遗忘（可审计 tombstone） [--reason]
          --pending            先列出 WebUI 标记的待删清单，再逐条遗忘 [--dry-run]
+  rescope <id>                  作用域迁移（不改状态/权威/正文） [--scope-preset] [--scope-project]
+         --pending            先列出 WebUI 标记的待迁移清单，再逐条迁移 [--dry-run]
+                                [--force]（user_explicit 记忆需显式确认）[--ids-file FILE]
   archive <id>                  归档
   export                        导出 [--format json|markdown] [--out FILE] [--include-archives]
   plan create|show|list         治理计划（create 需 --items-file，零写入）

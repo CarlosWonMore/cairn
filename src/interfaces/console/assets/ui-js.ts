@@ -104,11 +104,13 @@ export const UI_JS = String.raw`
   var BATCH_CHIP = { awaiting_approval: 'warn', approved: 'pending', applied: 'ok', expired: 'muted', invalidated: 'danger', rejected: 'danger', draft: 'info' };
   var DISPOSITION_LABEL = {
     needs_edit: '需要修改', needs_merge: '需要合并', can_delete: '可以删除',
-    uncertain: '存疑待查', no_action: '无需处理', pending_forget: '标记待删'
+    uncertain: '存疑待查', no_action: '无需处理', pending_forget: '标记待删',
+    needs_rescope: '需迁移作用域'
   };
   var DISPOSITION_CHIP = {
     needs_edit: 'warn', needs_merge: 'pending', can_delete: 'danger',
-    uncertain: 'info', no_action: 'muted', pending_forget: 'danger'
+    uncertain: 'info', no_action: 'muted', pending_forget: 'danger',
+    needs_rescope: 'warn'
   };
   var ANN_STATUS_LABEL = { open: '待处理', resolved: '已处置', ignored: '已忽略' };
 
@@ -561,6 +563,10 @@ export const UI_JS = String.raw`
     if (a.disposition === 'pending_forget' && a.status === 'open') {
       c.appendChild(el('div', { 'class': 'warnbar', style: 'margin-top:8px' },
         '仍为活动状态，尚未删除。真正删除需要终端执行 cairn forget --pending（会先列出清单再逐条确认）。'));
+    }
+    if (a.disposition === 'needs_rescope' && a.status === 'open') {
+      c.appendChild(el('div', { 'class': 'warnbar', style: 'margin-top:8px' },
+        '作用域尚未改变。迁移需要终端执行 cairn rescope --pending（会先列出清单再逐条确认）。'));
     }
     return c;
   }

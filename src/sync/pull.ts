@@ -158,7 +158,7 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
       appliedThrough = ev.seq;
     }
     if (appliedThrough > cursor) setCursor(store, spaceKey, deviceId, appliedThrough);
-    const applied = (outcome?.applied ?? 0) + (outcome?.tombstoned ?? 0) + (outcome?.conflicted ?? 0);
+    const applied = (outcome?.applied ?? 0) + (outcome?.tombstoned ?? 0) + (outcome?.conflicted ?? 0) + (outcome?.scopeExited ?? 0);
     totalApplied += applied;
     results.push({
       deviceId,

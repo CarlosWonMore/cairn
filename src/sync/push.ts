@@ -7,6 +7,7 @@ import {
   ChunkMeta,
   ManifestDoc,
   SyncEvent,
+  SyncScopeExitPayload,
   SyncUpsertPayload,
   emptyManifest,
   nextManifest,
@@ -50,6 +51,8 @@ function chunkObjectKey(spaceKey: string, meta: ChunkMeta): string {
 interface PendingJob {
   id: string;
   entityId: string;
+  /** 完整任务行才带 payload；worker preclaim 路径会传入。op=scope_exit / force 用于控制事件。 */
+  payload?: Record<string, unknown>;
 }
 
 /** 构建事件：只收 encrypted 作用域（personal-global）；payload 为当前修订快照。 */
@@ -61,6 +64,26 @@ function buildEvents(store: CairnStore, device: string, jobs: PendingJob[]): { e
     throw err('E_FORBIDDEN', 'personal-global 作用域不是 encrypted；拒绝上行（物理排除语义）');
   }
   for (const job of jobs) {
+    // 迁出通知任务（add-scope-migration）：独立的 sync_scope_exit jobType，
+    // 生成控制事件而非修订内容。此时记忆多半已迁到 local_only 作用域、
+    // 走不了下面的常规 upsert 分支（那里对非本空间记忆是静默完成）。
+    if (job.payload?.['op'] === 'scope_exit') {
+      const mem = store.memories.get(job.entityId);
+      const pushedRow = store.db.get('SELECT value FROM meta WHERE key = ?', pushedRevisionKey(PERSONAL_SPACE_KEY, job.entityId));
+      let lastHash: string | null = pushedRow ? String(pushedRow.value) : null;
+      let knownHashes: string[] = [];
+      if (mem) {
+        knownHashes = store.memories.revisions(mem.id).map((r) => r.contentHash);
+        lastHash = lastHash ?? mem.contentHash;
+      } else {
+        const t = store.memories.getTombstone(job.entityId);
+        lastHash = lastHash ?? t?.contentHash ?? '';
+      }
+      const payload: SyncScopeExitPayload = { lastContentHash: lastHash ?? '', knownHashes };
+      events.push({ deviceId: device, seq: 0, type: 'scope_exit', memoryId: job.entityId, occurredAt: nowIso(), payload });
+      doneJobIds.push(job.id);
+      continue;
+    }
     const mem = store.memories.get(job.entityId);
     if (!mem) {
       // 记忆已不存在：作为 tombstone 传播；对端按内容哈希血统对齐
@@ -98,7 +121,9 @@ function buildEvents(store: CairnStore, device: string, jobs: PendingJob[]): { e
     const currentRevId = mem.currentRevisionId;
     const pushedRow = store.db.get('SELECT value FROM meta WHERE key = ?', pushedRevisionKey(PERSONAL_SPACE_KEY, mem.id));
     const pushedRevId = pushedRow ? (pushedRow.value as string) : null;
-    if (!currentRevId || pushedRevId === currentRevId) {
+    // force（迁回重推）：修订未变也要重发一次修订快照，对端据此解除「不再持有」。
+    const force = job.payload?.['force'] === true;
+    if (!currentRevId || (pushedRevId === currentRevId && !force)) {
       // 无当前修订或该修订已推送：幂等完成
       doneJobIds.push(job.id);
       continue;
@@ -121,6 +146,7 @@ function buildEvents(store: CairnStore, device: string, jobs: PendingJob[]): { e
       sourceAgent: mem.sourceAgent,
       createdBy: mem.createdBy,
       reason: rev.reason,
+      ...(force ? { reentry: true } : {}),
     };
     events.push({ deviceId: device, seq: 0, type: 'memory_upsert', memoryId: mem.id, occurredAt: nowIso(), payload });
     doneJobIds.push(job.id);
@@ -147,7 +173,9 @@ function assignSeqs(store: CairnStore, spaceKey: string, events: SyncEvent[]): v
 export async function syncPush(store: CairnStore, remote: RemoteStore, vault: VaultConfig, opts: { maxJobs?: number; preclaimedJobs?: PendingJob[] } = {}): Promise<PushResult | null> {
   store.assertWritable();
   const spaceKey = PERSONAL_SPACE_KEY;
-  const jobs = opts.preclaimedJobs ?? store.outbox.claimReady(opts.maxJobs ?? 200).filter((j) => j.jobType === 'sync_upstream');
+  // 迁出通知与上行内容走同一条 push 链（add-scope-migration）；两者都是本空间的同步事件。
+  const jobs = opts.preclaimedJobs
+    ?? store.outbox.claimReady(opts.maxJobs ?? 200).filter((j) => j.jobType === 'sync_upstream' || j.jobType === 'sync_scope_exit');
   if (jobs.length === 0) return null;
   try {
     return await pushClaimed(store, remote, vault, spaceKey, jobs);

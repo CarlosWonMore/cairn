@@ -22,8 +22,11 @@ import { scanText } from '../../core/secrets.js';
 export const ANNOTATIONS_FILE = 'annotations.json';
 export const ANNOTATIONS_VERSION = 1;
 
-/** 处置类别。`pending_forget` 是唯一带后续动作的类别，且动作永远不在 WebUI 执行。 */
-export const DISPOSITIONS = ['needs_edit', 'needs_merge', 'can_delete', 'uncertain', 'no_action', 'pending_forget'] as const;
+/**
+ * 处置类别。`pending_forget` 与 `needs_rescope`（add-scope-migration D5）带后续动作，
+ * 且动作永远不在 WebUI 执行——批注只表达意图，执行留在终端。
+ */
+export const DISPOSITIONS = ['needs_edit', 'needs_merge', 'can_delete', 'uncertain', 'no_action', 'pending_forget', 'needs_rescope'] as const;
 export type Disposition = (typeof DISPOSITIONS)[number];
 
 export const ANNOTATION_STATUSES = ['open', 'resolved', 'ignored'] as const;
@@ -76,6 +79,7 @@ export const DISPOSITION_LABELS: Record<Disposition, string> = {
   uncertain: '存疑待查',
   no_action: '无需处理',
   pending_forget: '标记待删',
+  needs_rescope: '需要迁移作用域',
 };
 
 export function annotationsPath(home: string): string {

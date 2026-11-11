@@ -233,6 +233,30 @@ export class MemoryRepository extends WriteGuardMixin {
     return out;
   }
 
+  /**
+   * 作用域迁移（add-scope-migration D1）：只改 scope_id，不改 status / authority / 正文。
+   * 与 promoteToActive 刻意分开——晋升的语义是「候选 → 活动 + 改权威」，它同时改三样；
+   * 迁移只该改一样。混用会让迁移意外改掉权威级别。
+   * 当前修订的 scope_id 一并更新（与 promoteToActive 同姿势）；历史修订保留原作用域作审计痕迹。
+   */
+  migrateScope(id: string, targetScopeId: string, _by: string): MemoryRecord {
+    this.checkWritable();
+    const mem = this.require(id);
+    if (mem.scopeId === targetScopeId) return mem; // 原地迁移是无操作，不产生修订
+    const exists = this.db.get('SELECT id FROM scope WHERE id = ?', targetScopeId);
+    if (!exists) throw err('E_NOT_FOUND', `作用域不存在: ${targetScopeId}`);
+    const at = nowIso();
+    this.db.transaction(() => {
+      this.db.run('UPDATE memory SET scope_id = ?, updated_at = ? WHERE id = ?', targetScopeId, at, id);
+      this.db.run('UPDATE memory_revision SET scope_id = ? WHERE id = ?', targetScopeId, mem.currentRevisionId ?? '');
+    });
+    const out = this.require(id);
+    // 子表完整性：与 promoteToActive 同姿势，迁移后复查，避免「记忆已迁移但子表指向旧作用域」
+    const fk = this.db.all('PRAGMA foreign_key_check') as unknown[];
+    if (fk.length > 0) throw err('E_CONFLICT_STATE', `作用域迁移后外键不完整（${fk.length} 条）`);
+    return out;
+  }
+
   archive(id: string): MemoryRecord {
     this.require(id);
     this.db.run("UPDATE memory SET status = 'archived', updated_at = ? WHERE id = ?", nowIso(), id);

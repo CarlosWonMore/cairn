@@ -825,6 +825,40 @@ MCP 侧对应 `project_resolve`（参数 `path_or_url`、可选 `name`）与 `pr
 
 ---
 
+## 作用域迁移（add-scope-migration）
+
+活动记忆可以换作用域（归属），**不删不重建**：id、修订历史、证据链、权威级别全部保留，只改 `scope_id`。与「删了重建」「候选晋升」是三件不同的事。
+
+```bash
+# 单条迁移：把私人项目相关记忆从 personal-global 降到 device-local
+cairn rescope <id> --scope-preset device-local
+
+# 迁到项目作用域必须给项目标识，缺了直接拒绝（退出码 2），不会静默落到别的作用域
+cairn rescope <id> --scope-preset project-device --scope-project <projectId>
+
+# 用户亲口说的记忆（user_explicit）迁移会改变可见范围，需要显式确认
+cairn rescope <id> --scope-preset device-local --force
+
+# 批量：每行一个 id，逐条报告成功/失败/跳过，单条失败不中断
+cairn rescope --ids-file ids.txt --scope-preset project-device --scope-project <pid> --force
+
+# WebUI 批注联动：控制台把记忆标为「需迁移作用域」，终端一键处理（先列清单再逐条执行）
+cairn rescope --pending --scope-preset device-local [--dry-run]
+```
+
+**⚠️ 迁移前必读的两条后果**（命令执行前也会打印）：
+
+- **迁到设备类作用域（`device-local` / `project-device`）会失去跨设备同步**。这是定义层的：设备绑定作用域物理不上行，不是实现选择。迁出时其他设备会收到一条「迁出通知」，把它们本地的这条记忆标为「不再持有」（检索不再返回）——**数据不删除、无墓碑记录**，本机仍完整持有。
+- **云端既有密文不会自动删除**。对象存储是追加语义，迁出只发通知不清理旧密文；其他设备在收到通知前仍可能拉到旧副本。要清理云端对象需要显式的 purge 能力（暂未提供）。
+
+迁出不是遗忘：本机与其他设备都没有墓碑，遗忘时间线不变。迁回 `personal-global` 后，对端会收到一次强制重发的修订快照（带迁回标记），自动解除「不再持有」，内容按正常修订链继续同步。
+
+安全阀：冲突中的记忆拒绝迁移（状态不明确）；墓碑无作用域可迁移；`user_explicit` 记忆需要 `--force`（减速带，不是禁止）。每次迁移写审计（前后作用域、是否失去同步）。
+
+退出码：成功 0；用法/校验（缺 preset、缺 projectId）2；治理拒绝（user_explicit 无 force）3；状态冲突 4。单条显式指定时失败直接退出对应码；`--ids-file` 批量则逐条软报告，整体退出码 0。
+
+---
+
 ## 8. 命令与退出码速查
 
 | 命令 | 作用 |

@@ -12,7 +12,11 @@ import { WriteGuardMixin } from './write-guard.js';
  * 默认不安装同步 hook，任务由独立 worker 或显式 CLI 处理。
  */
 
-export type JobType = 'sync_upstream' | 'extract' | 'embed' | 'maintain' | 'projection_rebuild';
+// sync_scope_exit：迁出通知任务（add-scope-migration）。不是上行内容任务——
+// 迁出到 local_only 作用域的记忆被 sync_upstream 的物理排除挡住（enqueue 处），
+// 且 spec 要求「迁移到 local_only 后未产生新的上行任务」，所以独立 jobType 绕开排除、
+// 由 push 生成 scope_exit 控制事件（不是修订内容）。
+export type JobType = 'sync_upstream' | 'sync_scope_exit' | 'extract' | 'embed' | 'maintain' | 'projection_rebuild';
 export type JobStatus = 'pending' | 'running' | 'done' | 'retry' | 'failed' | 'dead' | 'conflict';
 
 export interface JobRow {
