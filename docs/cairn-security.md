@@ -265,3 +265,17 @@ cairn uninstall        # 遍历五个宿主，移除所有本产品配置
 ## 10. 操作审计只存摘要（add-operation-audit）
 
 读取类操作审计（`operation` 类目）由**构造方式**保证零内容泄露：审计写入点只从操作返回值提取白名单计数字段（候选数、命中通道、耗时、对象 id），代码路径上接触不到查询原文与记忆正文。回归测试断言敏感正文与查询原文在审计全表中零出现。保留期清理按类目白名单执行（只清 `operation`），治理审计（计划/审批/写入）永不自动删除；审计入口全部只读，不存在修改/删除审计的命令或工具。
+
+---
+
+## 11. Agent 不持有记忆写入权（add-agent-managed-revision）
+
+「模型只生成候选」在修订环节的落点：Agent 对**已存在的记忆**没有直接修改权。MCP 工具面提供 `revision_propose`（写方案卡）与 `revision_list`（读卡），**刻意不提供任何 apply 工具**——应用提案只能由本地入口（CLI `cairn revision apply`、本地控制台点击）发起，走与人工 `memory_update` 完全相同的修订链、秘密复检与审计。
+
+三条机制保证这条边界不是靠约定：
+
+1. **工具面即权限面**：MCP 进程根本没有应用提案的代码路径可调（`tests/interfaces/revision-mcp.test.ts` 断言工具面不含 apply）。
+2. **版本一致性不可绕过**：方案卡记录提出时的修订 id，应用时两层校验（提案层 + `reviseMemory` 的 `expectedCurrentRevisionId`）；记忆已被改过则拒绝并标陈旧。
+3. **权威语义**：采纳后的新修订记 `user_confirmed`（人批准了 Agent 起草的内容），既不是 `agent_inferred` 也不是 `user_explicit`。
+
+方案卡文件与批注同信任域（本机明文 JSON，含拟改正文）；生成时秘密扫描命中即拒绝落盘，采纳时再扫一次。

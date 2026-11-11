@@ -53,6 +53,7 @@ export const UI_JS = String.raw`
     item: '',
     reveal: {},
     itemsCache: {},
+    revisionStatus: '',
     plans: [],
     model: null,
     policies: [],
@@ -221,6 +222,7 @@ export const UI_JS = String.raw`
     { id: 'overview', label: '概览' },
     { id: 'memories', label: '记忆' },
     { id: 'annotations', label: '批注' },
+    { id: 'revisions', label: '修订提案' },
     { id: 'imports', label: '导入' },
     { id: 'approvals', label: '审批' },
     { id: 'sync', label: '同步' }
@@ -267,6 +269,7 @@ export const UI_JS = String.raw`
     if (state.view === 'overview') return renderOverview(body);
     if (state.view === 'memories') return renderMemories(body);
     if (state.view === 'annotations') return renderAnnotations(body);
+    if (state.view === 'revisions') return renderRevisions(body);
     if (state.view === 'imports') return renderImports(body);
     if (state.view === 'approvals') return renderApprovals(body);
     if (state.view === 'sync') return renderSync(body);
@@ -659,6 +662,93 @@ export const UI_JS = String.raw`
     dp.addEventListener('change', load);
     refresh.addEventListener('click', load);
     load();
+  }
+
+  // 修订提案（add-agent-managed-revision）：Agent 只能提案，这里是人的确认入口。
+  // 改前/改后对照必须同时可见——只给理由不给正文差异的卡不算可审阅（spec）。
+  function renderRevisions(host) {
+    if (STATIC) {
+      empty(host, '静态导出不含修订提案：提案是本机私有数据，不参与导出、也不参与云同步。');
+      return;
+    }
+    var bar = el('div', { 'class': 'toolbar' });
+    var st = el('select', { 'class': 'action', 'data-rev-status': '1' });
+    st.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
+    [['', '待确认（默认）'], ['all', '全部'], ['pending', '待审'], ['applied', '已采纳'], ['rejected', '已拒绝'], ['stale', '已陈旧']].forEach(function (v) {
+      var o = el('option', { value: v[0] }, v[1]);
+      if (v[0] === (state.revisionStatus || '')) o.setAttribute('selected', 'selected');
+      st.appendChild(o);
+    });
+    bar.appendChild(st);
+    var refresh = el('button', { type: 'button', 'class': 'action' }, '刷新');
+    bar.appendChild(refresh);
+    host.appendChild(bar);
+    var listHost = el('div');
+    host.appendChild(listHost);
+
+    function load() {
+      state.revisionStatus = st.value;
+      clear(listHost);
+      loading(listHost);
+      api('/api/revisions?status=' + encodeURIComponent(st.value) + '&limit=500')
+        .then(function (d) {
+          clear(listHost);
+          listHost.appendChild(el('div', { 'class': 'empty', style: 'padding:0 0 10px' },
+            '共 ' + d.total + ' 条 · 提案只是待执行的意图，采纳前记忆不会改变 · 采纳走与 CLI 同一条校验（版本一致性 + 秘密复检）'));
+          if (!d.items.length) { empty(listHost, '没有匹配的提案。Agent 生成提案后出现在这里等待确认。'); return; }
+          d.items.forEach(function (r) { listHost.appendChild(revisionCard(r, load)); });
+        })
+        .catch(function (e) { clear(listHost); fail(listHost, e); });
+    }
+    st.addEventListener('change', load);
+    refresh.addEventListener('click', load);
+    load();
+  }
+
+  function revisionCard(r, reload) {
+    var c = el('div', { 'class': 'card', 'data-revision-id': r.id, style: 'margin-bottom:10px' });
+    var h = el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px' });
+    // 「待确认」强制可见：未采纳的提案绝不能看起来像已生效（spec）。
+    var REV_CHIP = { pending: 'warn', applied: 'ok', rejected: 'muted', stale: 'danger' };
+    var REV_LABEL = { pending: '待确认（记忆未变）', applied: '已采纳', rejected: '已拒绝', stale: '已陈旧（记忆已被改过）' };
+    h.appendChild(chip(REV_LABEL[r.status] || r.status, REV_CHIP[r.status] || 'muted'));
+    if (r.stale) h.appendChild(chip('记忆已变更，需重新生成', 'danger'));
+    h.appendChild(el('span', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11.5px' }, String(r.memoryId).slice(0, 8)));
+    h.appendChild(el('span', { 'class': 'empty', style: 'padding:0;font-size:11.5px' }, (r.proposedBy || '') + ' · ' + fmtTime(r.proposedAt) + (r.annotationId ? ' · 批注 ' + String(r.annotationId).slice(0, 12) : '')));
+    c.appendChild(h);
+    if (r.reason) c.appendChild(el('div', { style: 'white-space:pre-wrap;word-break:break-word;font-size:12.5px;margin-bottom:6px' }, '理由：' + r.reason));
+    function diffBox(label, text, cls) {
+      var box = el('div', { 'class': cls, style: 'white-space:pre-wrap;word-break:break-word;font-size:12px;padding:8px 10px;border-radius:8px;margin-bottom:6px;background:var(--surface-2);' });
+      box.appendChild(el('div', { style: 'font-size:10.5px;color:var(--text-dim);margin-bottom:4px' }, label));
+      box.appendChild(el('span', {}, text || '（空）'));
+      return box;
+    }
+    c.appendChild(diffBox('改前 · 当前正文', r.beforeExcerpt ? r.beforeExcerpt : '（摘要已掩码，点记忆 id 查看）', ''));
+    c.appendChild(diffBox('改后 · 提案正文', r.afterContent, ''));
+    if (r.rejectReason) c.appendChild(el('div', { 'class': 'empty', style: 'padding:2px 0;font-size:11.5px' }, '拒绝理由：' + r.rejectReason));
+    if (r.status === 'pending' && !STATIC) {
+      var act = el('div', { style: 'display:flex;gap:8px;margin-top:4px' });
+      var applyBtn = el('button', { type: 'button', 'class': 'action primary', 'data-rev-apply': r.id }, '采纳（改记忆）');
+      var rejectBtn = el('button', { type: 'button', 'class': 'action', 'data-rev-reject': r.id }, '拒绝');
+      applyBtn.addEventListener('click', function () {
+        applyBtn.disabled = true; rejectBtn.disabled = true;
+        api('/api/revisions/apply', { method: 'POST', body: { id: r.id } })
+          .then(function () { toast('已采纳：记忆已按提案更新（权威记为人已确认）'); reload(); })
+          .catch(function (e) { toast('采纳失败：' + (e && e.message ? e.message : e), true); applyBtn.disabled = false; rejectBtn.disabled = false; });
+      });
+      rejectBtn.addEventListener('click', function () {
+        var reason = prompt('拒绝理由（必填）：');
+        if (reason == null || reason.trim() === '') { toast('需要填写拒绝理由', true); return; }
+        applyBtn.disabled = true; rejectBtn.disabled = true;
+        api('/api/revisions/reject', { method: 'POST', body: { id: r.id, reason: reason.trim() } })
+          .then(function () { toast('已拒绝，提案保留备查'); reload(); })
+          .catch(function (e) { toast('拒绝失败：' + (e && e.message ? e.message : e), true); applyBtn.disabled = false; rejectBtn.disabled = false; });
+      });
+      act.appendChild(applyBtn);
+      act.appendChild(rejectBtn);
+      c.appendChild(act);
+    }
+    return c;
   }
 
   function openDetail(id) {

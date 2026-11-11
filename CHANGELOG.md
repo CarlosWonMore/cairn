@@ -6,6 +6,7 @@
 
 ### Added
 
+- **AI 修订提案（方案卡，`cairn revision`）**：Agent 针对批注出具「改什么、为什么改」的结构化提案（MCP `revision_propose` / `revision_list`），人通过 CLI `revision list|show|apply|reject` 或控制台「修订提案」视图确认后才生效。采纳复用既有 `reviseMemory` 修订链（不可变历史 + 秘密复检 + 上行入队），权威记 `user_confirmed`；版本一致性两层校验，记忆已被改过则拒绝并标陈旧；工具面**刻意不含 apply**——Agent 只有提案权，没有写入权。
 - **作用域迁移（`cairn rescope`）**：活动记忆可换作用域，不删不重建——id、修订历史、证据链、权威级别全保留，只改 `scope_id`。安全阀：冲突状态拒绝、缺 projectId 拒绝（不静默降级）、`user_explicit` 记忆需 `--force`。迁移与 outbox 重建同事务：作废旧作用域 pending 上行、按新作用域重新入队。批量 `--ids-file` 逐条报告，单条失败不中断；`--pending` 处理控制台「需迁移作用域」批注（先列清单再逐条执行）。退出码合同：用法 2 / 治理拒绝 3 / 冲突 4。
 - **`scope_exit` 迁出通知事件**（schema v6）：记忆迁出可同步作用域时，对端把本地副本标为「不再持有」（archived + meta 标记，**无墓碑、不删数据**），检索与投影不再返回；迁回时强制重发修订快照（`reentry` 标记）自动解除标记；迟到修订按幂等跳过；旧版本收到未知事件类型跳过并审计、不阻断整链。云端既有密文不随迁出删除。
 - **批注类别 `needs_rescope`**：控制台可标记「需迁移作用域」，与 `pending_forget` 同一哲学——批注只表达意图，执行在终端 `cairn rescope --pending`。

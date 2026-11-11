@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 /**
  * 控制台浏览器点击级验收。
@@ -107,6 +108,28 @@ async function main() {
       '--max-sensitivity', 'normal', '--allow-create', '--min-confidence', '0.6', '--note', 'UI 验收',
     ]);
     if (sign.code !== 0) throw new Error(`policy sign 失败: ${sign.stderr || sign.stdout}`);
+
+    // ---------------------------------------------------------- 造一张修订提案（Agent 提案 → 人确认链路）
+    // 提案生成没有 CLI 入口（Agent 走 MCP），这里用与 CLI 同一份 dist 构建直接调 service。
+    const seedFile = join(home, 'seed-revision.mjs');
+    const appUrl = pathToFileURL(join(process.cwd(), 'dist', 'src', 'interfaces', 'app-service.js')).href;
+    writeFileSync(
+      seedFile,
+      [
+        `import { AppService } from ${JSON.stringify(appUrl)};`,
+        `const svc = AppService.open(process.env.CAIRN_HOME);`,
+        `const m = svc.addMemory({ content: '部署入口是 deploy.mjs' }).memory;`,
+        `const ann = svc.annotateMemory({ memoryId: m.id, disposition: 'needs_edit', note: '路径不完整' });`,
+        `const p = svc.proposeRevisionProposal({ memoryId: m.id, afterContent: '部署入口是 scripts/deploy.mjs，先跑 doctor', reason: '按批注补全路径', annotationId: ann.id });`,
+        `console.log(JSON.stringify({ memoryId: m.id, proposalId: p.id }));`,
+        `svc.close();`,
+      ].join('\n'),
+      'utf8',
+    );
+    const seeded = await run([seedFile], env);
+    if (seeded.code !== 0) throw new Error(`seed revision 失败: ${seeded.stderr || seeded.stdout}`);
+    const revSeed = JSON.parse(seeded.stdout);
+    report.revisionSeed = revSeed;
 
     // ---------------------------------------------------------- 起服务
     const mod = await import('../dist/src/interfaces/console/server.js');
@@ -377,6 +400,22 @@ async function main() {
     const showAfterDry = JSON.parse((await runCli(['show', memId])).stdout);
     check('dry-run 后记忆仍为活动状态', showAfterDry.memory.status === 'active', showAfterDry.memory.status);
 
+    // ---------------------------------------------------------- G.5 修订提案视图（Agent 提案 → 人确认）
+    await page.click('[data-view="revisions"]');
+    await page.waitForSelector('[data-revision-id]', { timeout: 5000 });
+    const revBody = await page.locator('#view').innerText();
+    check('修订提案视图默认列出待审卡且标「待确认」', /待确认（记忆未变）/.test(revBody), revBody.slice(0, 110).replace(/\n/g, ' | '));
+    check('卡上有改前改后对照（不是只有理由）', /改前/.test(revBody) && /改后/.test(revBody) && /scripts\/deploy\.mjs/.test(revBody), '');
+    check('卡上显示理由与关联批注', /按批注补全路径/.test(revBody) && /批注/.test(revBody), '');
+    check('待审卡有采纳与拒绝按钮', (await page.locator('[data-rev-apply]').count()) === 1 && (await page.locator('[data-rev-reject]').count()) === 1);
+    await page.click('[data-rev-apply]');
+    await page.waitForTimeout(1000);
+    const applied = JSON.parse((await runCli(['show', revSeed.memoryId])).stdout);
+    const appliedDump = JSON.stringify(applied);
+    check('采纳后记忆权威记为人已确认', applied.memory.authority === 'user_confirmed', applied.memory.authority);
+    check('采纳后记忆正文按提案更新', /scripts\/deploy\.mjs/.test(appliedDump), '');
+    check('采纳后待审列表清空', (await page.locator('[data-revision-id]').count()) === 0, '');
+
     // ---------------------------------------------------------- H. 静态导出（只读预览页）
     // 导出会把 scope 后缀插进文件名（安全告知第 1 层），所以读回执里的 written，
     // 不能假定叫 preview.html。
@@ -406,6 +445,8 @@ async function main() {
       check('静态页能看到导入单表', /导入次数|来源/.test(sBody), sBody.slice(0, 60).replace(/\n/g, ' | '));
       check('静态页无"自动整理"按钮', (await sp.locator('button:has-text("自动整理")').count()) === 0);
       check('静态页无"按策略撤销"按钮', (await sp.locator('button:has-text("按策略撤销")').count()) === 0);
+      check('静态页无修订提案采纳/拒绝按钮', (await sp.locator('[data-rev-apply]').count()) === 0 && (await sp.locator('[data-rev-reject]').count()) === 0);
+      check('静态页不含提案拟改正文', !/先跑 doctor/.test(sBody));
       check('静态页明确说明只读边界', /只读快照/.test(sBody), (sBody.match(/静态导出[^\n]*/) || [''])[0]);
       // 静态页仍要能点开抽屉看条目，只是没有写入口
       const sView = sp.locator('table button:has-text("查看")');

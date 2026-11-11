@@ -247,3 +247,26 @@ cairn onboarding auto --policy <id> --batch <batchId> --redo
 ### 历史数据不会自动出队
 
 本机制上线后，历史上被判过 skip 但没有留下事实的条目**不会自动消失**。它们需要通过一次显式重跑产生真实判定；系统不会替它们伪造历史。
+
+---
+
+## 修订提案：Agent 处置批注的正确姿势（add-agent-managed-revision）
+
+批注（「需要修改」等）表达的是**人的意图**，不是 Agent 的写入授权。Agent 拿到批注后正确的动作不是直接改记忆，而是**出具一张方案卡由人确认**：
+
+| 角色 | 能做 | 不能做 |
+|---|---|---|
+| Agent（MCP） | `revision_propose`（写卡）、`revision_list`（读卡） | **没有任何 apply 类工具** |
+| 人（CLI / 控制台） | `cairn revision apply|reject`、控制台点采纳/拒绝 | — |
+
+方案卡包含：目标记忆与提出时的修订标识、改前摘要与**拟改后的完整正文**、改动理由、关联批注、提出者与时间。存 `<home>/console/revision-proposals.json`，不建表、不参与同步。
+
+采纳的语义（设计要点，不要绕过）：
+
+- **版本一致性**：记忆的当前修订必须仍是提出时的那一份；已被改过 → 拒绝并标陈旧（stale），提案保留、记忆不变。`reviseMemory` 的 `expectedCurrentRevisionId` 是第二道保险，两层检查都在。
+- **权威记 `user_confirmed`**：内容是 Agent 起草的，但批准动作来自人——写 `agent_inferred` 会低估，写 `user_explicit` 会高估。
+- **秘密双查**：生成时扫描（落盘即泄露，等不得）；采纳时 `reviseMemory` 再扫一次。
+- **拒绝可留痕**：拒绝记理由与时间、不删提案；陈旧卡也可以拒绝（否则永远清不掉），已采纳/已拒绝的卡不能再处置。
+- `cairn doctor` 的 notes 会提示待确认提案数（不进 problems、不改退出码）。
+
+Agent 会话内的标准流程：`memory_annotations_list` 看批注 → `memory_get` 读全文 → `revision_propose` 出卡 → 告诉用户去 `cairn revision list` / 控制台确认。**不要**用 `memory_update` 直接改有批注的记忆——那绕过了人的确认。

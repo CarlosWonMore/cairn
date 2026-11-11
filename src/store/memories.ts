@@ -32,6 +32,12 @@ export interface ReviseOptions {
   expectedCurrentRevisionId?: string;
   expiresAt?: string | null;
   sensitivity?: Sensitivity;
+  /**
+   * 权威级别覆盖（add-agent-managed-revision D4）：默认保持原权威。
+   * 采纳 AI 修订提案时由本地入口传 user_confirmed——内容是 Agent 起草的，
+   * 但批准动作来自人；写 agent_inferred 会低估，写 user_explicit 会高估。
+   */
+  authority?: Authority;
 }
 
 export interface MemoryFilter {
@@ -148,6 +154,7 @@ export class MemoryRepository extends WriteGuardMixin {
       const seq = Number(seqRow?.s ?? 0) + 1;
       const revId = uuidv7();
       const newStatus: MemoryStatus = mem.status === 'conflicted' ? 'conflicted' : 'active';
+      const revAuthority = opts.authority ?? mem.authority;
       this.db.run(
         `INSERT INTO memory_revision (id, memory_id, seq, parent_revision_ids, content, content_hash, scope_id,
            status, authority, author, device_id, reason, created_at)
@@ -160,7 +167,7 @@ export class MemoryRepository extends WriteGuardMixin {
         hash,
         mem.scopeId,
         newStatus,
-        mem.authority,
+        revAuthority,
         opts.author,
         deviceId,
         opts.reason ?? null,
@@ -168,12 +175,13 @@ export class MemoryRepository extends WriteGuardMixin {
       );
       this.db.run(
         `UPDATE memory SET current_revision_id = ?, content = ?, normalized_content = ?, content_hash = ?,
-           status = ?, expires_at = IFNULL(?, expires_at), sensitivity = IFNULL(?, sensitivity), updated_at = ? WHERE id = ?`,
+           status = ?, authority = IFNULL(?, authority), expires_at = IFNULL(?, expires_at), sensitivity = IFNULL(?, sensitivity), updated_at = ? WHERE id = ?`,
         revId,
         newContent,
         normalizeContent(newContent),
         hash,
         newStatus,
+        opts.authority ?? null,
         opts.expiresAt ?? null,
         opts.sensitivity ?? null,
         at,

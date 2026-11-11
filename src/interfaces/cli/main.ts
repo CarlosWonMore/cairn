@@ -373,6 +373,86 @@ async function main(): Promise<void> {
         break;
       }
 
+      case 'revision': {
+        // add-agent-managed-revision D1：采纳与拒绝是人的动作，只在这里（CLI）与本地控制台。
+        const sub = args[0];
+        const rest = args.slice(1);
+        if (sub === 'list') {
+          const status = str(flags, 'status') ?? 'pending';
+          const items = service.listRevisionProposals({ status, limit: flags['limit'] != null ? Number(flags['limit']) : undefined });
+          if (json) {
+            out({ status, total: items.length, items }, flags);
+          } else {
+            diag(`修订提案（${status}）共 ${items.length} 条`);
+            for (const r of items) {
+              console.log(`- ${r.id}  [${r.status}${r.stale ? '·已陈旧' : ''}]  ${r.memoryId.slice(0, 8)}  ${r.beforeExcerpt ?? '(正文已掩码)'} → ${r.afterContent.split('\n')[0]?.slice(0, 60) ?? ''}  · ${r.proposedBy} ${r.proposedAt}`);
+            }
+            if (items.length === 0) diag('没有匹配的提案。全部状态用 --status all。');
+          }
+          break;
+        }
+        if (sub === 'show') {
+          const id = rest[0];
+          if (!id) throw new CairnError('E_VALIDATION', '用法: cairn revision show <id>');
+          const r = service.listRevisionProposals({ status: 'all' }).find((x) => x.id === id);
+          if (!r) throw new CairnError('E_NOT_FOUND', `提案不存在: ${id}`);
+          const mem = r.memoryExists ? service.store.memories.require(r.memoryId) : null;
+          if (json) {
+            out(r, flags);
+          } else {
+            console.log(`提案   ${r.id}   [${r.status}${r.stale ? '·已陈旧' : ''}]`);
+            console.log(`记忆   ${r.memoryId}${mem ? `（当前状态 ${mem.status}）` : '（已不存在）'}`);
+            console.log(`提出   ${r.proposedBy} · ${r.proposedAt}${r.annotationId ? ` · 关联批注 ${r.annotationId}` : ''}`);
+            console.log(`理由   ${r.reason}`);
+            console.log('--- 改前（当前正文）---');
+            console.log(mem ? mem.content : '(记忆已删除，无法对照)');
+            console.log('--- 改后（提案正文）---');
+            console.log(r.afterContent);
+            if (r.rejectReason) console.log(`拒绝理由：${r.rejectReason}`);
+            if (r.status === 'pending') diag('待确认：采纳执行 cairn revision apply <id>；拒绝执行 cairn revision reject <id> "理由"');
+          }
+          break;
+        }
+        if (sub === 'apply') {
+          const ids = flags['all'] === true
+            ? service.listRevisionProposals({ status: 'pending' }).map((x) => x.id)
+            : [rest[0] ?? ''];
+          if (ids.length === 0 || ids[0] === '') throw new CairnError('E_VALIDATION', '用法: cairn revision apply <id>；或 cairn revision apply --all（逐条应用）');
+          const results: { id: string; ok: boolean; status?: string; reason?: string }[] = [];
+          for (const id of ids) {
+            // 单条显式指定时失败必须硬退出（陈旧退 4）；--all 才逐条软报告（spec：单条失败不影响其余）
+            if (flags['all'] === true) {
+              try {
+                const r = service.applyRevisionProposal(id);
+                results.push({ id, ok: true, status: r.memory.status });
+              } catch (e) {
+                results.push({ id, ok: false, reason: (e as Error).message });
+              }
+            } else {
+              const r = service.applyRevisionProposal(id);
+              results.push({ id, ok: true, status: r.memory.status });
+            }
+          }
+          if (json) {
+            out({ applied: results.filter((r) => r.ok).length, results }, flags);
+          } else {
+            for (const r of results) {
+              console.log(`- ${r.ok ? '已采纳' : '未采纳'} ${r.id}${r.reason ? `（${r.reason}）` : ''}`);
+            }
+          }
+          break;
+        }
+        if (sub === 'reject') {
+          const id = rest[0];
+          const reason = rest.slice(1).join(' ').trim();
+          if (!id || reason === '') throw new CairnError('E_VALIDATION', '用法: cairn revision reject <id> "<理由>"');
+          const r = service.rejectRevisionProposal(id, reason);
+          out({ id: r.id, status: r.status }, flags);
+          break;
+        }
+        throw new CairnError('E_VALIDATION', '用法: cairn revision list [--status pending|applied|rejected|stale|all] | show <id> | apply <id>|--all | reject <id> "<理由>"');
+      }
+
       case 'audit': {
         // 只读审计查询（add-operation-audit）：cairn audit list [--category --action --since --limit] [--json]
         if (args[0] !== 'list') throw new CairnError('E_VALIDATION', '用法: cairn audit list [--category operation] [--action memory_search] [--since <iso>] [--limit 50]');
@@ -1039,6 +1119,8 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   rescope <id>                  作用域迁移（不改状态/权威/正文） [--scope-preset] [--scope-project]
          --pending            先列出 WebUI 标记的待迁移清单，再逐条迁移 [--dry-run]
                                 [--force]（user_explicit 记忆需显式确认）[--ids-file FILE]
+  revision list|show|apply|reject  AI 修订提案（方案卡）：Agent 只能提案，采纳/拒绝是人的动作
+                                list [--status pending|applied|rejected|stale|all]；apply <id>|--all；reject <id> "理由"
   archive <id>                  归档
   export                        导出 [--format json|markdown] [--out FILE] [--include-archives]
   plan create|show|list         治理计划（create 需 --items-file，零写入）

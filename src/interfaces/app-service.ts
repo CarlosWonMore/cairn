@@ -27,6 +27,16 @@ import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } fr
 import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext, PERSONAL_SPACE_KEY } from '../sync/orchestrate.js';
 import { findUpstreamGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
+import {
+  proposeRevision,
+  readRevisionProposals,
+  getRevisionProposal,
+  resolveRevisionProposal,
+  countPendingRevisions,
+  type RevisionProposalRecord,
+  type RevisionProposalView,
+  type RevisionQuery,
+} from '../governance/revision-proposal.js';
 import { importSnapshot, ImportOutcome } from '../onboarding/import.js';
 import {
   addAnnotation as storeAnnotation,
@@ -351,7 +361,7 @@ export class AppService {
     return { action: decision.action, basis: decision.basis, memory, duplicateOf: null };
   }
 
-  reviseMemory(id: string, newContent: string, opts: { reason?: string; expectedCurrentRevisionId?: string } = {}): { memory: MemoryRecord; revision: RevisionRecord } {
+  reviseMemory(id: string, newContent: string, opts: { reason?: string; expectedCurrentRevisionId?: string; authority?: Authority } = {}): { memory: MemoryRecord; revision: RevisionRecord } {
     const store = this.store;
     store.assertWritable();
     const mem = store.memories.require(id);
@@ -366,7 +376,7 @@ export class AppService {
     const out = store.memories.revise(
       id,
       newContent,
-      { reason: opts.reason ?? '用户更正', author: ctx.agentId, expectedCurrentRevisionId: opts.expectedCurrentRevisionId },
+      { reason: opts.reason ?? '用户更正', author: ctx.agentId, expectedCurrentRevisionId: opts.expectedCurrentRevisionId, authority: opts.authority },
       ctx.deviceId,
     );
     if (scopeAllowsUpstream(scope)) {
@@ -607,6 +617,60 @@ export class AppService {
     return storeReadAnnotations(this.store, { disposition: 'needs_rescope', status: 'open' });
   }
 
+  // -------------------------------------------------------------------------
+  // 修订提案（OpenSpec: add-agent-managed-revision）
+  //
+  // Agent 只拿提案权（propose / list 走 MCP），应用与拒绝只由本地入口发起。
+  // 应用复用 reviseMemory（不可变修订链 + 秘密复检 + 上行入队 + 审计），
+  // 不新造写入路径（design D2）；权威记 user_confirmed（D4）。
+  // -------------------------------------------------------------------------
+
+  /** 生成方案卡（Agent 经 MCP 调用；本地 CLI 也可用）。只写卡，不碰记忆。 */
+  proposeRevisionProposal(input: { memoryId: string; afterContent: string; reason: string; annotationId?: string }): RevisionProposalRecord {
+    const ctx = this.caller;
+    // 按通道区分而不是 agentId：MCP 进程没设 CAIRN_AGENT_ID 时 agentId 也是 'cli'，
+    // 但 channel 一定是 agent——提出者要如实记录是哪条通道递上来的卡。
+    const proposedBy = ctx.channel === 'agent' ? `mcp:${ctx.agentId}` : 'cli';
+    return proposeRevision(this.store, { ...input, proposedBy });
+  }
+
+  /** 提案列表（默认只返回待审；status='all' 返回全部）。 */
+  listRevisionProposals(query: RevisionQuery = {}): RevisionProposalView[] {
+    return readRevisionProposals(this.store, query);
+  }
+
+  /**
+   * 采纳提案（人的显式动作：CLI 或本地控制台点击；MCP 不提供此入口）。
+   *
+   * 版本一致性：目标记忆的当前修订必须仍是提出时的那一份；不一致 → 提案标 stale
+   * 并拒绝（spec「记忆已被改过」）。一致 → reviseMemory（expectedCurrentRevisionId
+   * 双保险）→ 权威 user_confirmed → 提案标 applied。
+   */
+  applyRevisionProposal(id: string): { proposal: RevisionProposalRecord; memory: MemoryRecord; revision: RevisionRecord } {
+    const store = this.store;
+    store.assertWritable();
+    const rec = getRevisionProposal(store, id);
+    if (rec == null) throw err('E_NOT_FOUND', `提案不存在: ${id}`);
+    if (rec.status !== 'pending') throw err('E_CONFLICT_STATE', `提案已是终态（${rec.status}），不能应用`);
+    const mem = store.memories.require(rec.memoryId);
+    if (mem.currentRevisionId !== rec.revisionIdAtPropose) {
+      resolveRevisionProposal(store, id, 'stale', this.caller.agentId);
+      throw err('E_CONFLICT_STATE', '记忆在提案提出后已被修改，提案已标记为陈旧；请重新生成方案卡');
+    }
+    const revised = this.reviseMemory(rec.memoryId, rec.afterContent, {
+      reason: `采纳修订提案 ${rec.id.slice(0, 16)}：${rec.reason}`,
+      expectedCurrentRevisionId: rec.revisionIdAtPropose ?? undefined,
+      authority: 'user_confirmed',
+    });
+    const resolved = resolveRevisionProposal(store, id, 'applied', this.caller.agentId);
+    return { proposal: resolved, memory: revised.memory, revision: revised.revision };
+  }
+
+  /** 拒绝提案：记录理由与时间，不删除提案，记忆完全不变。 */
+  rejectRevisionProposal(id: string, reason: string): RevisionProposalRecord {
+    return resolveRevisionProposal(this.store, id, 'rejected', this.caller.agentId, reason);
+  }
+
   /** 拒绝候选：转墓碑（不是物理删除），留审计理由；恢复需显式重做（design D4）。 */
   rejectCandidate(id: string, opts: { reason: string }): { memory: MemoryRecord } {
     const store = this.store;
@@ -797,6 +861,16 @@ export class AppService {
     }
     if (pendingAnnotations > 0) {
       notes.push(`待办批注 ${pendingAnnotations} 条：在 cairn ui 的「批注」里查看；待删项用 cairn forget --pending 处理`);
+    }
+    // 待审修订提案（add-agent-managed-revision）：同一纪律，只进 notes。
+    let pendingRevisions = 0;
+    try {
+      pendingRevisions = countPendingRevisions(store.paths.home);
+    } catch {
+      pendingRevisions = 0; // 提案是派生数据：读不出来不得影响体检结论
+    }
+    if (pendingRevisions > 0) {
+      notes.push(`待确认修订提案 ${pendingRevisions} 条：在 cairn ui 的「修订提案」里查看，或 cairn revision list；采纳用 cairn revision apply`);
     }
     // remote 三态：not_configured / configured_untested / verified（首次成功往返后置 verified）
     let remote: DoctorReport['remote'] = 'not_configured';

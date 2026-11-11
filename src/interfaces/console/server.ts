@@ -9,6 +9,7 @@ import { renderShell } from './assets/page.js';
 import { computeInbox, computeSuggestions } from './suggestions.js';
 import { reviewPackForBatch, reviewSubmit, readReviews } from './review-store.js';
 import { readAnnotations } from './annotations.js';
+import { readRevisionProposals } from '../../governance/revision-proposal.js';
 import { OpHint, ProposedItem } from '../../governance/propose.js';
 import { promotedPredicate } from '../../onboarding/batches.js';
 import { listPolicies } from '../../onboarding/policy.js';
@@ -278,6 +279,20 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
         });
         return { total: items.length, items };
       }
+      if (path === '/api/revisions') {
+        // 修订提案（add-agent-managed-revision）：只读连接直接读文件 + 判陈旧；
+        // 默认只给待审；status=all 返回全部。
+        const opt = (k: string): string | undefined => {
+          const v = q.get(k);
+          return v == null || v.trim().length === 0 ? undefined : v;
+        };
+        const items = readRevisionProposals(store, {
+          status: opt('status'),
+          memoryId: opt('memory'),
+          limit: clampInt(q.get('limit'), 1, 2000, 500),
+        });
+        return { total: items.length, items };
+      }
       if (path === '/api/inbox') {
         return computeInbox(store, {
           redact,
@@ -324,6 +339,23 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
         if (memoryId.length === 0) throw err('E_VALIDATION', '缺少 memoryId 或 memoryIds');
         const annotation = writer.annotateMemory({ memoryId, disposition, note });
         return { succeeded: 1, failed: [], annotations: [annotation] };
+      }
+      if (path === '/api/revisions/apply') {
+        // 采纳是人的显式点击：走与 CLI 完全相同的 applyRevisionProposal
+        // （版本一致性检查 + reviseMemory + 权威 user_confirmed），不绕过任何校验。
+        const w = getWriter();
+        const id = typeof body['id'] === 'string' ? body['id'] : '';
+        if (id.length === 0) throw err('E_VALIDATION', '缺少 id');
+        const r = w.applyRevisionProposal(id);
+        return { applied: true, proposalId: r.proposal.id, revisionId: r.revision.id, memoryId: r.memory.id };
+      }
+      if (path === '/api/revisions/reject') {
+        const w = getWriter();
+        const id = typeof body['id'] === 'string' ? body['id'] : '';
+        const reason = typeof body['reason'] === 'string' ? body['reason'] : '';
+        if (id.length === 0) throw err('E_VALIDATION', '缺少 id');
+        const r = w.rejectRevisionProposal(id, reason);
+        return { rejected: true, proposalId: r.id, status: r.status };
       }
       if (path === '/api/plans') {
         const writer = getWriter();

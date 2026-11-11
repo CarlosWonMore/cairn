@@ -37,6 +37,8 @@ const TOOL_NAMES = [
   'memory_audit',
   'memory_annotations_list',
   'memory_annotation_resolve',
+  'revision_propose',
+  'revision_list',
   'project_resolve',
   'project_list',
 ] as const;
@@ -199,6 +201,27 @@ export function createServer(home?: string): Server {
           status: { type: 'string', enum: [...RESOLVE_STATUSES], description: 'resolved=已处置，ignored=忽略' },
         },
         ['id', 'status'],
+      ),
+      toolDef(
+        'revision_propose',
+        '把「改什么、为什么改」写成一张修订提案（方案卡），落盘等待用户确认后由本地入口执行。你只有提案权：生成后记忆不会改变，你没有应用提案的工具。适用场景：针对用户批注（memory_annotations_list）给出具体修订方案。拟改正文与理由会做秘密/注入扫描，命中拒绝生成。',
+        {
+          memory_id: { type: 'string' },
+          after_content: { type: 'string', description: '拟改后的完整正文（不是 diff）' },
+          reason: { type: 'string', description: '改动理由，引用批注或用户诉求' },
+          annotation_id: { type: 'string', description: '可选：关联的批注 id' },
+        },
+        ['memory_id', 'after_content', 'reason'],
+      ),
+      toolDef(
+        'revision_list',
+        '读取修订提案（方案卡）列表。默认只返回待审（pending）；可按状态与记忆过滤。返回改前摘要与拟改后完整正文。应用与拒绝是人的动作，工具面不提供。',
+        {
+          status: { type: 'string', enum: ['pending', 'applied', 'rejected', 'stale', 'all'], description: '默认 pending（待审）' },
+          memory_id: { type: 'string' },
+          limit: { type: 'number' },
+        },
+        [],
       ),
       toolDef(
         'project_resolve',
@@ -517,6 +540,45 @@ async function handleTool(service: AppService, name: string, args: Record<string
         status: String(args['status'] ?? ''),
         by: `mcp:${service.caller.agentId}`,
       });
+    }
+
+    case 'revision_propose': {
+      const r = service.proposeRevisionProposal({
+        memoryId: String(args['memory_id'] ?? ''),
+        afterContent: String(args['after_content'] ?? ''),
+        reason: String(args['reason'] ?? ''),
+        annotationId: args['annotation_id'] ? String(args['annotation_id']) : undefined,
+      });
+      return {
+        proposalId: r.id,
+        memoryId: r.memoryId,
+        revisionIdAtPropose: r.revisionIdAtPropose,
+        status: r.status,
+        note: '提案已保存为方案卡，等待用户在终端（cairn revision apply）或本地控制台确认。你无法应用提案；记忆在你确认前不会改变。',
+      };
+    }
+
+    case 'revision_list': {
+      const items = service.listRevisionProposals({
+        status: args['status'] ? String(args['status']) : undefined,
+        memoryId: args['memory_id'] ? String(args['memory_id']) : undefined,
+        limit: args['limit'] != null ? Math.min(Number(args['limit']) || 50, 200) : undefined,
+      });
+      return {
+        items: items.map((r) => ({
+          id: r.id,
+          memoryId: r.memoryId,
+          status: r.status,
+          stale: r.stale,
+          beforeExcerpt: r.beforeExcerpt,
+          afterContent: r.afterContent,
+          reason: r.reason,
+          annotationId: r.annotationId,
+          proposedBy: r.proposedBy,
+          proposedAt: r.proposedAt,
+        })),
+        note: '方案卡只是待执行的意图，采纳必须由人完成（CLI / 控制台）。陈旧（stale）卡片应重新生成而不是坚持应用。',
+      };
     }
 
     case 'project_resolve': {
