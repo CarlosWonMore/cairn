@@ -858,3 +858,21 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 - **DSH 面板接入审计史（原任务 5.x）延后**：面板已有独立「落盘」开关（JSONL）且经用户目视确认；审计史已可经 memory_audit/CLI 查询，面板要接审计数据源时再做。
 - **同日插件侧**（此前轮次）：记忆 tab 化、活动环+筛选器、持久化开关、Rules-of-Hooks 崩溃修复、主题对比度自适应（文字：自动/白字/黑字）。dist 已含全部变更，用户重启即生效。
 - ~~**遗留**：migrate-lesson.test.ts 两个 TS 严格索引报错~~ → 2026-11-03 已修（守卫处 `?? 0` 合并空值，断言语义不变），`npx tsc -p tsconfig.json` 全库干净。
+
+---
+
+## 2026-11-11 四提案批量推进：实现 → 验证 → 归档（主会话，无派发）
+
+- **范围**：用户要求把 openspec 全部 4 个未归档提案推进到「完成 → 验证测试 → 归档 → 提交」。当日全部归档，主规格 10/10 严格通过，`openspec list` 无活动变更。
+- **add-stable-project-identity**：已实现（26/26，随 `2bace73` 提交过），本次做独立验证复跑（759/758/0/1 基线吻合）+ 归档。变异抽查复做：去掉 `.git` 剥离 → git 等价用例独自红。
+- **add-scope-migration**（777/776/0/1）：`cairn rescope` + `scope_exit` 迁出通知（schema v6，outbox CHECK 加值重建表）。三条关键设计：
+  - 迁出通知走**独立 jobType `sync_scope_exit`**：sync_upstream 入队有物理排除（local_only 作用域直接拒绝），且 spec 要求「迁移到 local_only 未产生新的上行任务」——固定键会被已完成历史任务挡住，迁出/迁回的幂等键都必须带时间戳。
+  - 对端「不再持有」= `archived` 状态 + meta 标记（`scope_exit:<id>`）：archived 让检索/投影免费排除、无墓碑；meta 标记区分用户主动归档并支持迁回解除。**迁回靠 `reentry` 标记的强制重发修订快照**（普通 upsert 在修订未变时被 push 幂等跳过，对端永远收不到重新持有信号）。
+  - 未知事件类型 = 跳过 + 审计 + **游标照常推进**：旧语义 throw 会被 applyEvents 转成 waited，卡死该设备整条链。
+- **add-agent-managed-revision**（792/791/0/1；e2e-console-ui 46→**66/66**）：方案卡 `console/revision-proposals.json`（照 annotations 模式）；MCP 只有 `revision_propose`/`revision_list`；采纳复用 `reviseMemory`，权威经新增 `ReviseOptions.authority` 记 `user_confirmed`（MCP 不暴露该参数）；版本一致性两层（提案层 revisionIdAtPropose + revise 的 expectedCurrentRevisionId）。拒绝允许从 stale 发起（否则陈旧卡清不掉）。控制台新增「修订提案」视图。
+  - **静态页断言的坑**：静态导出内嵌完整 UI 源码，字符串级断言「页面无 data-rev-apply」必然假红/假绿——源码里必然有这个字符串。守卫是 `data-static="1"` 属性 + `!STATIC` 分支，行为级验证只能真开浏览器（e2e 已覆盖）。
+- **add-cloud-backup**（797/796/0/1）：`deriveBackupKey`（独立 HKDF salt + deviceId）；`backups/<设备>/` 前缀与同步链双向隔离；对象名内嵌明文 sha256（`cairn-backup-<ms>.db-<sha256>.enc`），恢复链 = 解密 → sha 比对 → verifyBackup；`--force` 覆盖前自动 `pre-restore-*.db`。保留策略走 `RemoteStore.deleteObject?`（可选方法）：OBS 已有实现，**syncd 无 DELETE 路由 → 诚实降级只上传不删（pruneWarning 明示）**，不改 syncd 协议（真实 ECS 升级属运维）。含一条真实本地 syncd 的 CLI e2e。任务 6.6（真实环境上云）**未执行，需用户单独授权**。
+- **流程教训（本次新增）**：
+  - **变异还原绝不能用 `git checkout`**——本次用它还原 app-service.ts 的变异，把未提交的 rescopeMemory 实现整体冲掉，靠 Edit 重写恢复。变异/负对照一律 Edit 改、Edit 还原。
+  - **CLI/子进程测试跑 dist 产物**：改 `src/` 后不 `npm run build`，测试打在旧代码上（本次踩两次：rescope 退出码合同、MCP proposedBy 的 channel 判定）。
+- 基线：**797/796/0/1**；CHANGELOG Unreleased 已补三条；真实云端操作（真实库上云首次 push、真实 syncd 备份、macOS CI）仍未做，均需用户拍板。
