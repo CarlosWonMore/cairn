@@ -313,7 +313,6 @@ test('CLI e2e：backup --upload → --list-remote → restore --from-remote（�
       vaultId: keys.vaultId,
       provider: 'syncd',
       syncd: { baseUrl: syncd.baseUrl },
-      createdAt: new Date().toISOString(),
     });
     seed.close();
 
