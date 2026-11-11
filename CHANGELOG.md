@@ -6,6 +6,14 @@
 
 ### Added
 
+- **稳定的项目身份（UUID + 别名）**：项目主键改为 UUIDv7，路径与 git 地址只作为 `project.aliases` 里的别名。仓库改名（GitHub → Gitee、org 改名）或换设备改路径后，追加一条别名即可让新旧地址解析到同一个项目，既有记忆归属不变。新增 `cairn project resolve|list`、`cairn project alias add <project-id> <path-or-url>`，以及 MCP 工具 `project_resolve` / `project_list`——CLI 与 MCP 共用 `src/store/projects.ts` 同一实现。
+- **别名归一化**：`https://Host/o/r.git`、`git@host:o/r.git`、`ssh://git@host/o/r.git` 视为同一项目（去凭据、host 小写、去 `.git`）；路径统一盘符大小写与分隔符并去尾斜杠，但**保留目录名大小写**（Linux 上 `Proj` 与 `proj` 是两个目录）。不做模糊匹配、不校验路径是否存在（跨设备解析必需）、不自动上溯父目录。
+- **别名冲突拒绝**：把已属于其他项目的别名追加到当前项目时抛 `E_CONFLICT_STATE`（退出码 4）并报告归属，不改任何数据；别名追加写 `project` 类目审计。
+
+### Changed
+
+- 新建项目默认显示名取归一化后的别名（原始 URL 可能带凭据，不落 `project.name`）。已有项目行与其 `id` 一律不动。
+
 - **记忆批注与待处置队列（WebUI 标注 → Agent 处置）**：控制台新增「批注」视图；记忆列表支持多选批量标记，记忆详情可对单条写下处置意见（需要修改 / 需要合并 / 可以删除 / 存疑待查 / 无需处理 / 标记待删）。批注落在 `<home>/console/annotations.json`，**不建表、不参与云同步、不进入上行包**；记忆正文、状态与修订链完全不动。记忆修订后批注标「意见可能已过时」并灰显（不删）。
 - **`cairn forget --pending [--dry-run]`**：WebUI 只能把记忆标为待删；真正删除只在这个终端入口执行，且**先打印全部待删清单（id + 摘要 + 标注时间）再逐条遗忘并逐条报告**。删除复用既有 `forgetMemory`，走同一套 tombstone 与 outbox 上行语义。
 - **MCP `memory_annotations_list` / `memory_annotation_resolve`**：Agent 可拉取用户的批注并按 `resolved` / `ignored` 回写；读取不返回记忆正文全文，回写只改批注状态并记录处置者与时间。

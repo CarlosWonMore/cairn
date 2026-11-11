@@ -13,6 +13,7 @@ import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review
 import { ANNOTATION_STATUSES, DISPOSITIONS, RESOLVE_STATUSES } from '../console/annotations.js';
 import { parseJudgement } from '../../onboarding/judgement.js';
 import { runAutoOnboarding } from '../../onboarding/auto.js';
+import { listProjects, resolveProject } from '../../store/projects.js';
 
 /**
  * Cairn MCP stdio 服务器（任务 5.2）：
@@ -36,6 +37,8 @@ const TOOL_NAMES = [
   'memory_audit',
   'memory_annotations_list',
   'memory_annotation_resolve',
+  'project_resolve',
+  'project_list',
 ] as const;
 
 const ONBOARDING_TOOLS = ['onboarding_status', 'onboarding_next_batch', 'onboarding_propose', 'onboarding_apply'] as const;
@@ -197,6 +200,16 @@ export function createServer(home?: string): Server {
         },
         ['id', 'status'],
       ),
+      toolDef(
+        'project_resolve',
+        '把路径或 git 远程地址解析为稳定的项目标识（UUID）。未登记过的会自动登记为新项目；不要求路径在本机存在。git 的 https/ssh 写法与路径的大小写、分隔符差异会被归一。',
+        {
+          path_or_url: { type: 'string', description: '项目根路径或 git 远程地址' },
+          name: { type: 'string', description: '新建时的显示名；命中已有项目时不覆盖原显示名' },
+        },
+        ['path_or_url'],
+      ),
+      toolDef('project_list', '列出已登记的项目及其别名（只读，不会新建项目）。', {}, []),
     ];
     if (onboardingActive()) {
       tools.push(
@@ -504,6 +517,17 @@ async function handleTool(service: AppService, name: string, args: Record<string
         status: String(args['status'] ?? ''),
         by: `mcp:${service.caller.agentId}`,
       });
+    }
+
+    case 'project_resolve': {
+      const raw = String(args['path_or_url'] ?? '').trim();
+      if (raw === '') throw new CairnError('E_VALIDATION', 'path_or_url 不能为空');
+      return resolveProject(service.store.db, raw, { name: args['name'] ? String(args['name']) : undefined });
+    }
+
+    case 'project_list': {
+      const items = listProjects(service.store.db);
+      return { count: items.length, items };
     }
 
     case 'onboarding_status': {

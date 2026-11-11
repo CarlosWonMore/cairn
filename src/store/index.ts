@@ -11,4 +11,6 @@ export * from './plans.js';
 export * from './outbox.js';
 export * from './blocks.js';
 export * from './conflicts.js';
+export * from './project-alias.js';
+export * from './projects.js';
 export * from './open.js';

@@ -13,6 +13,7 @@ import {
 } from '../../agents/config.js';
 import { backupDatabase, restoreFromBackup } from '../../store/backup.js';
 import { openStore } from '../../store/open.js';
+import { addAlias, listProjects, resolveProject } from '../../store/projects.js';
 import { startConsoleServer } from '../console/server.js';
 import { exportConsoleHtml, normalizePersonalName } from '../console/export.js';
 import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
@@ -45,6 +46,8 @@ const VALUE_FLAGS = new Set([
   // add-memory-importance-and-usage-signal）。漏登记会让 parseArgs 把它们当布尔
   // true，str() 返回 undefined —— 命令静默不生效，且看起来"成功"。
   'scope-preset', 'scope-project', 'stale-days',
+  // project resolve --name（add-stable-project-identity）
+  'name',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
@@ -433,6 +436,28 @@ async function main(): Promise<void> {
 
       case 'status': {
         out(service.status(), flags);
+        break;
+      }
+
+      case 'project': {
+        // 稳定项目身份（add-stable-project-identity D6）：与 MCP 共用 store/projects.ts。
+        const sub = args[0] ?? 'list';
+        if (sub === 'resolve') {
+          const target = args[1];
+          if (!target) throw new CairnError('E_VALIDATION', '用法: cairn project resolve <path-or-url> [--name N]');
+          out(resolveProject(service.store.db, target, { name: str(flags, 'name') }), flags);
+        } else if (sub === 'list') {
+          const items = listProjects(service.store.db);
+          out({ count: items.length, items }, flags);
+        } else if (sub === 'alias') {
+          if (args[1] !== 'add') throw new CairnError('E_VALIDATION', '用法: cairn project alias add <project-id> <path-or-url>');
+          const projectId = args[2];
+          const target = args[3];
+          if (!projectId || !target) throw new CairnError('E_VALIDATION', '用法: cairn project alias add <project-id> <path-or-url>');
+          out(addAlias(service.store.db, projectId, target), flags);
+        } else {
+          throw new CairnError('E_VALIDATION', '用法: cairn project resolve <path-or-url> | list | alias add <project-id> <path-or-url>');
+        }
         break;
       }
 
@@ -908,6 +933,8 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   backup / restore              一致性备份与恢复
   doctor                        健康检查 [--host <agent>]（诚实分级，无模型无云端核心可用）
   status                        库状态摘要
+  project resolve|list          项目身份：id 是 UUID，路径/URL 只作别名
+                                resolve <path-or-url> [--name N]；alias add <project-id> <path-or-url>
   worker run-once               处理一轮后台任务 [--max N]（默认不安装任何 hook）
   device status|re-enroll       设备身份与克隆恢复
   agent plan|apply|doctor|uninstall --host <agent>  宿主配置管理（plan 零写入）；--host dsh 用于 DeepSeek Harness（Cordis 插件树，可加 --dsh-profile）

@@ -787,6 +787,44 @@ cairn agent apply --plan-file plan.json
 
 ---
 
+## 项目身份与别名（add-stable-project-identity）
+
+项目主键是 **UUIDv7**，路径与 git 地址只是别名。这样仓库改名、换机器改路径都不会让旧记忆掉到一个"不存在的项目"下。
+
+```bash
+# 首次：未登记过的路径/地址 → 新建项目（UUID）并记下第一条别名
+cairn project resolve D:\Neusoft\HDRS6Project\江南大学附属医院 --name 江南大学附属医院
+
+# 仓库改名 / 换设备：把新地址追加为同一项目的别名（旧别名保留）
+cairn project alias add <project-id> https://gitee.com/owner/new-name.git
+
+# 之后用任一别名解析都会得到同一个 projectId（created=false）
+cairn project resolve git@gitee.com:owner/new-name.git
+
+# 列出全部项目及别名（只读，不会新建）
+cairn project list
+```
+
+MCP 侧对应 `project_resolve`（参数 `path_or_url`、可选 `name`）与 `project_list`，与 CLI 共用同一实现。
+
+归一化只做**明确等价**的变换，不做模糊匹配：
+
+| 输入 | 归一化结果 |
+| --- | --- |
+| `https://Host/o/r.git`、`git@host:o/r.git`、`ssh://git@host/o/r.git` | `https://host/o/r`（去凭据、host 小写、去 `.git`） |
+| `d:\proj\x\` | `D:/proj/x`（盘符大写、分隔符统一、去尾斜杠） |
+| `D:/Proj` vs `D:/proj` | **两个不同项目**（Linux 上就是两个目录，不能合并） |
+
+三条边界：
+
+- **解析不校验路径是否存在**——跨设备解析时对方目录本就不在本机。
+- **不做自动上溯**——传子目录就按子目录算，请传项目根。
+- **别名冲突必须显式处理**：别名已属于别的项目时 `alias add` 会以退出码 4 拒绝并报告归属，不会静默改绑。
+
+> 当前边界：项目表**不同步**（同步链只覆盖 `personal-global` 的记忆事件）。所以在两台设备上用同一路径解析会各建一个新项目；要让它们成为同一个，需要手工在一端 `project alias add` 另一端的路径。等记忆真正按项目作用域使用、且项目表进入同步协议后，这一步才能自动化。
+
+---
+
 ## 8. 命令与退出码速查
 
 | 命令 | 作用 |
@@ -808,6 +846,7 @@ cairn agent apply --plan-file plan.json
 | `backup` / `restore` | 一致性备份与恢复 |
 | `doctor [--host <agent>]` | 健康检查（诚实分级） |
 | `status` | 库状态摘要 |
+| `project resolve\|list\|alias add` | 项目身份：id 为 UUID，路径/URL 只作别名 |
 | `worker run-once [--max N]` | 处理一轮后台任务 |
 | `device status\|re-enroll` | 设备身份与克隆恢复 |
 | `agent plan\|apply\|doctor\|uninstall --host <agent>` | 宿主配置管理（plan 零写入） |
