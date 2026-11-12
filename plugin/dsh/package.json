@@ -1,6 +1,6 @@
 {
   "name": "@carloswon/cairn-dsh-memory",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Cairn memory for DeepSeek Harness: real-time recall, backed by the Cairn MCP server as its core",
   "main": "dist/index.js",
@@ -33,8 +33,21 @@
     "test": "tsx --test tests/*.test.ts"
   },
   "license": "MIT",
-  "publishConfig": { "access": "public" },
-  "keywords": ["dsh", "dsh-plugin", "memory", "cairn", "agent-memory", "local-first"],
-  "repository": { "type": "git", "url": "git+https://github.com/CarlosWonMore/cairn.git", "directory": "plugin/dsh" },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "cairn",
+    "agent-memory",
+    "local-first"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CarlosWonMore/cairn.git",
+    "directory": "plugin/dsh"
+  },
   "homepage": "https://github.com/CarlosWonMore/cairn/tree/main/plugin/dsh"
 }
