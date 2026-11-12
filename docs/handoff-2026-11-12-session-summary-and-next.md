@@ -158,4 +158,66 @@
 - 本地对应快照 `~/.cairn/backups/cairn-backup-1794415952837.db` 校验通过（表内 55 行记忆记录，integrity ok）——是一份合法的一致性快照。
 - **当前库未被改动**（无任何 restore 执行，db mtime 未变）；远端仅此 1 个对象；无泄露面（自有服务器 + 自有密钥）。
 
-**处置状态**：向用户如实披露（已披露）；对象暂无法远程删除（syncd 无 DELETE 路由），清理路径见 §3 任务 B 第 5 步。**教训已进 §5 第 5 条**：真实环境副作用命令绝不出现在内嵌脚本/字符串拼接里，涉及 `CAIRN_*` 环境变量的命令先 `env | grep CAIRN` 确认凭据在场再执行。
+**处置状态**：**已清理（2026-11-12）**。经任务 B 实现后，用 `cairn backup --purge-remote <name>` 删除，实测输出「已删除 …（密文 3260.0 KB）」。清理后远端剩 1 个合法备份（当天验证上传的 `cairn-backup-1794466511713`）。
+
+**教训已进 §5 第 5 条**：真实环境副作用命令绝不出现在内嵌脚本/字符串拼接里，涉及 `CAIRN_*` 环境变量的命令先 `env | grep CAIRN` 确认凭据在场再执行。
+
+---
+
+## 7. 任务 B 的执行记录（2026-11-12 下午补）
+
+§3 的任务 B（syncd 加 DELETE）已**实现 → 审查 → 修复 → 部署 → 生产验证**全流程完成。这一节补充执行结果，以及过程中发现的一个真实漏洞。
+
+### 7.1 实现与部署
+
+| 步骤 | 结果 |
+|---|---|
+| OpenSpec 提案 `add-syncd-purge` | 4/4 制品，`--strict` 通过；规格见 `openspec/changes/add-syncd-purge/` |
+| 服务端 | `syncd/cairn-syncd.mjs` 的 `/chunks/` 分支加 DELETE，白名单 `key.includes('/backups/')`，否则 403 |
+| 客户端 | `SyncdRemoteStore.deleteObject`：403 → `E_FORBIDDEN`（调用方 bug）；404 → `syncd_delete_unsupported`（旧版无路由） |
+| CLI | `cairn backup --purge-remote <name>`，删前打印对象名与大小 |
+| 测试 | 797 → 806（+9） |
+| ECS 部署 | 备份 `cairn-syncd.mjs.bak-20261112`（原版 7041 B）→ scp → restart → healthz 200 |
+
+**生产验证**：删同步链 chunk → 403 且文件仍在；删不存在的备份 → 200；`pruneWarning` 从「一直非 null」变为 **null**（保留策略在 syncd 后端首次真正生效）。
+
+### 7.2 一个被独立审查发现的真实漏洞（已修）
+
+**现象**：对**目录形 key**（如 `chunks/vaults/<v>/backups/<dev>`）发 DELETE，`rmSync` 抛 `ERR_FS_EISDIR`，异常**未被捕获**，逃出 HTTP handler 导致 node 进程退出。
+
+**发现方式**：部署后按用户要求让独立代理做只读审计，7 项核查中 6 项通过，这一项是它找出来的。**当时我自认为 7 项全对。**
+
+**我做过什么验证它确实存在**：本地起 syncd、建目录、发 DELETE，实测 `healthz → SERVICE_DOWN`、`child exit code=1`。
+
+**影响（诚实）**：需要有效 Bearer token；正常客户端只删 `.enc` 不会触发；`systemd Restart=on-failure` 会拉起；**不碰同步链、不丢数据**。是一次可达的服务中断，不是数据事故。
+
+**修复**：`lstatSync().isFile()` 判类型（用 `lstat` 不用 `stat`——`stat` 跟随符号链接，看不出链本身），非普通文件 400；整段 try/catch，ENOENT → 200 保持幂等，其余 fs 错误 → 500。
+
+**规格同步补强**：新增「删除目标必须是普通文件」要求，其中一条场景是**「崩溃不算通过」**——「任何删除请求触发文件系统错误（EISDIR / EACCES / EBUSY 等）时，服务端 MUST 返回错误状态码而非让进程退出」。
+
+**测试**：806 → 808（+2）。变异对照：关掉 `isFile` 判断 → 两条新测试同时变红。
+
+**重新部署与生产验证**：
+```
+1) healthz                    → 200
+2) DELETE 目录形 key          → 400 "delete target is not a regular file"
+3) 删后 healthz               → 200（进程存活）
+4) DELETE 同步链 chunk        → 403（红线仍在）
+5) 同步链 chunk / 备份对象    → 7 + 1，均未受影响
+```
+
+### 7.3 这次的一条流程教训
+
+**「我自检通过」和「独立审查通过」不是同一件事。** 任务 B 的 9 条测试、变异对照、负对照、生产验证我都做了，仍然漏了目录形 key——因为**我没想到这个输入形态**。独立审查者没有我的思维惯性，它逐条对着规格查，就查到了。
+
+推论：**当规格里写「MUST NOT 崩溃」这类全域断言时，验证必须穷举输入形态，而不是只测自己想到的那几种。**
+
+### 7.4 当前 ECS 状态（2026-11-12 15:30）
+
+| 项 | 值 |
+|---|---|
+| 服务 | `cairn-syncd` active，监听 `100.65.135.122:8471` |
+| 程序 | 新版（含 DELETE + EISDIR 修复），md5 `85743f0d…` |
+| 备份文件 | `cairn-syncd.mjs.bak-20261112`（原版 7041 B）、`cairn-syncd.mjs.bak-pre-eisdir-fix`（8180 B 中间版） |
+| 数据 | 7 个同步链 chunk + 1 个合法加密备份（3.4 MB） |
+| 回滚 | `cp -p` 任一备份文件回原位 + `systemctl restart cairn-syncd` + healthz 验证 |
