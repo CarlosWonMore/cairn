@@ -46,18 +46,18 @@
 
 ## 6. ECS 部署（需用户确认后才执行）
 
-- [ ] 6.1 在 ECS 上备份现文件：`cp /opt/cairn-syncd/cairn-syncd.mjs /opt/cairn-syncd/cairn-syncd.mjs.bak-<date>`。
-- [ ] 6.2 scp 覆盖新文件。
-- [ ] 6.3 `systemctl restart cairn-syncd`。
-- [ ] 6.4 `curl -H "Authorization: Bearer <token>" http://100.65.135.122:8471/healthz` 验证。
-- [ ] 6.5 端到端验证：`cairn backup --upload` 看 `pruneWarning` 是否消失。
-- [ ] 6.6 **回写 Obsidian `ServerAndPC/CLOUD-aliyun-ecs.md`**（环境手册纪律：持久变更必须回写）。
+- [x] 6.1 在 ECS 上备份现文件：`cp /opt/cairn-syncd/cairn-syncd.mjs /opt/cairn-syncd/cairn-syncd.mjs.bak-<date>`。
+- [x] 6.2 scp 覆盖新文件。
+- [x] 6.3 `systemctl restart cairn-syncd`。
+- [x] 6.4 `curl -H "Authorization: Bearer <token>" http://100.65.135.122:8471/healthz` 验证。
+- [x] 6.5 端到端验证：`cairn backup --upload` 看 `pruneWarning` 是否消失。
+- [x] 6.6 **回写 Obsidian `ServerAndPC/CLOUD-aliyun-ecs.md`**（环境手册纪律：持久变更必须回写）。
 
 ## 7. 清理误传对象
 
-- [ ] 7.1 部署完成后执行 `cairn backup --purge-remote <事故对象名>`。
-- [ ] 7.2 `cairn backup --list-remote` 确认清零。
-- [ ] 7.3 在交接文档 §6 事故记录中补「已清理」与清理方式。
+- [x] 7.1 部署完成后执行 `cairn backup --purge-remote <事故对象名>`。
+- [x] 7.2 `cairn backup --list-remote` 确认清零。
+- [x] 7.3 在交接文档 §6 事故记录中补「已清理」与清理方式。
 
 ## 8. 文档
 

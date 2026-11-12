@@ -950,6 +950,12 @@ export class AppService {
 
   async syncPushCmd(): Promise<unknown> {
     const ctx = this.requireSyncContext();
+    // 推送前只读缺口检查（add-push-gap-guard）：与 doctor / backfill 共用 findUpstreamGap，
+    // 只提示、不入队、不阻断；零缺口时完全静默。
+    const gap = findUpstreamGap(this.store).length;
+    if (gap > 0) {
+      console.error(`[cairn] 上行缺口 ${gap} 条：这些记忆尚未入队，本次推送不包含它们；补齐请执行 cairn sync backfill --apply`);
+    }
     const r = await syncPush(this.store, ctx.remote, ctx.vault);
     if (r && r.publishedChunks.length > 0) this.markSyncOk();
     return r;

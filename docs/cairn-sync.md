@@ -67,6 +67,8 @@ cairn sync push                # 补完仍需显式上传；backfill 从不联�
 
 `cairn doctor` 的 `counts.upstreamGap` 报告同一口径的缺口数，健康时恒为 0；非零时在 `notes` 里给出一条指向本命令的提示，但**不进 `problems`、不改退出码**——缺口是可自愈状态，不是库损坏。
 
+`cairn sync push` 也会在推送前做一次只读缺口检查（与 `doctor` / `backfill` 同一 `findUpstreamGap` 实现）：发现缺口就向 stderr 打印条数与「这些记忆尚未入队，本次推送不包含它们」，然后**照常推送已有任务**。它不入队、不阻断、不改退出码；缺口为零时完全静默。要补缺口仍需显式 `cairn sync backfill --apply`。
+
 ## scope_exit：迁出通知事件
 
 一条记忆从可同步作用域迁出（例如 `personal-global` → `device-local`）时，同步链上会多一种**控制事件** `scope_exit`（独立任务类型 `sync_scope_exit`，不属于上行内容任务）。它不是修订、不是墓碑，对端语义是「发出端不再在本空间持有这条记忆」：

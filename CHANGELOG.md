@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- **`cairn sync push` 推送前提示上行缺口**：推送前做一次只读缺口检查（与 `doctor` / `backfill` 共用 `findUpstreamGap`），有缺口就向 stderr 报条数并说明「这些记忆尚未入队，本次推送不包含它们」、指向 `cairn sync backfill --apply`；推送照常执行、退出码不变、不入队，零缺口时完全静默。此前缺口只出现在 `doctor` 的 `notes` 里，不主动查就不知道。
 - **受限的备份对象删除（`DELETE /chunks/<key>`）**：syncd 只放行解码后含 `/backups/` 的对象，同步链的 chunk/manifest 一律 403（只追加语义，删了会让对端拉取永久卡在缺口）；删除复用既有 `safeKey()` 防穿越，对象不存在也返回 200（幂等）。`/manifests/` 不开放删除。
 - **`cairn backup --purge-remote <name>`**：显式删除单个远端备份对象，删前打印对象名与大小；远端不支持删除（旧版 syncd）时明确报错，不做假成功。
 - **保留策略在 syncd 后端真正生效**：`SyncdRemoteStore.deleteObject` 接通后，超出保留份数的旧备份会被实际淘汰；旧版 syncd 的 404 被识别为「不支持删除」并降级为 `pruneWarning`（不会静默假装已清理）。
