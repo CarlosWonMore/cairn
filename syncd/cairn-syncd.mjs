@@ -5,6 +5,8 @@
  * 协议（与 RemoteStore 对应）：
  *   PUT  /chunks/<key>       不可变上传（同 key 同体幂等；带 Content-MD5 校验可选）
  *   GET  /chunks/<key>       下载（404 = 不存在）
+ *   DELETE /chunks/<key>     删除【备份对象】：解码后 key 必须含 `/backups/`，否则 403；
+ *                            同步链（chunk / manifest）一律不可删；对象不存在也返回 200
  *   GET  /manifests/<key>    下载 manifest（404 = 不存在）
  *   PUT  /manifests/<key>    发布 manifest；头 X-Cairn-Generation 必须大于服务器当前值，回退 409
  *   GET  /healthz            健康检查
@@ -17,7 +19,7 @@
  */
 
 import { createServer } from 'node:http';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname, normalize, relative } from 'node:path';
 
 const PORT = Number(process.env['CAIRN_SYNCD_PORT'] ?? 8471);
@@ -39,7 +41,8 @@ function safeKey(raw) {
   if (!/^[A-Za-z0-9/_.-]+$/.test(key) || key.includes('..')) return null;
   const full = normalize(join(DATA_DIR, key));
   if (!full.startsWith(normalize(DATA_DIR))) return null;
-  return full;
+  // key 供 DELETE 白名单判别（相对路径，形如 chunks/vaults/<v>/backups/...）
+  return { key, full };
 }
 
 function auth(req) {
@@ -98,11 +101,12 @@ const server = createServer((req, res) => {
   }
 
   if (path.startsWith('/chunks/') || path.startsWith('/manifests/')) {
-    const full = safeKey(path.slice(1));
-    if (!full) {
+    const target = safeKey(path.slice(1));
+    if (!target) {
       send(res, 400, 'bad key');
       return;
     }
+    const { key, full } = target;
     if (req.method === 'GET') {
       if (!existsSync(full)) {
         send(res, 404, 'not found');
@@ -167,6 +171,19 @@ const server = createServer((req, res) => {
         renameSync(tmp, full);
         send(res, 200, JSON.stringify({ ok: true, bytes: body.byteLength }), { 'content-type': 'application/json' });
       });
+      return;
+    }
+    if (req.method === 'DELETE' && path.startsWith('/chunks/')) {
+      // 只允许删备份对象：同步链是只追加的（chunk 内容寻址不可变、manifest 代次 CAS），
+      // 删掉会让对端拉取永久卡在缺口，且没有备份。白名单必须基于解码后的相对 key：
+      // safeKey 拿到的是 chunks/vaults/<v>/backups/<dev>/<name>，备份段在中间。
+      if (!key.includes('/backups/')) {
+        send(res, 403, 'delete only allowed for /backups/ objects');
+        return;
+      }
+      // 幂等：对象不存在也 200（与 OBS deleteObject 语义一致）
+      rmSync(full, { force: true });
+      send(res, 200, JSON.stringify({ ok: true, deleted: true }), { 'content-type': 'application/json' });
       return;
     }
   }

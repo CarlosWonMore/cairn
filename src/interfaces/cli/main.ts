@@ -44,7 +44,7 @@ const VALUE_FLAGS = new Set([
   'home-dir', 'agent-kind', 'source-kind', 'proposed-by', 'items-file', 'batch', 'provider',
   'endpoint', 'bucket', 'prefix', 'base-url', 'recovery-file', 'port', 'input', 'item', 'export',
   'policy', 'file', 'id', 'scopes', 'max-sensitivity', 'min-confidence', 'note', 'items',
-  'category', 'action', 'since', 'ids-file', 'keep', 'from-remote', 'to',
+  'category', 'action', 'since', 'ids-file', 'keep', 'from-remote', 'to', 'purge-remote',
   // promote / reject / doctor --archive-stale（add-candidate-promote-command +
   // add-memory-importance-and-usage-signal）。漏登记会让 parseArgs 把它们当布尔
   // true，str() 返回 undefined —— 命令静默不生效，且看起来"成功"。
@@ -594,6 +594,34 @@ async function main(): Promise<void> {
             for (const it of items) {
               console.log(`- ${it.name}  ${(it.sealedBytes / 1024).toFixed(1)} KB  · ${it.uploadedAt ?? '时间未知'}`);
             }
+          }
+          break;
+        }
+        const purgeName = str(flags, 'purge-remote');
+        if (purgeName) {
+          const ctx = syncContext(service.store);
+          if (!ctx) throw new CairnError('E_VALIDATION', '远端未配置：先 cairn vault init-remote（备份通道与同步共用同一远端配置）');
+          if (typeof ctx.remote.deleteObject !== 'function') {
+            throw new CairnError('E_FORBIDDEN', '远端不支持删除，无法清理备份对象（syncd 需部署带 DELETE 路由的新版）');
+          }
+          const items = await listRemoteBackups(ctx.remote, service.store.identity.deviceId);
+          const victim = items.find((it) => it.name === purgeName);
+          if (!victim) {
+            throw new CairnError('E_NOT_FOUND', `远端没有本设备的备份对象: ${purgeName}（--list-remote 可查看）`);
+          }
+          diag(`将删除远端备份对象：${victim.key}（密文 ${(victim.sealedBytes / 1024).toFixed(1)} KB）`);
+          try {
+            await ctx.remote.deleteObject(victim.key);
+          } catch (e) {
+            if (isCairnError(e) && e.message === 'syncd_delete_unsupported') {
+              throw new CairnError('E_FORBIDDEN', '远端不支持删除（旧版 syncd 无 DELETE 路由）：先部署新版 syncd/cairn-syncd.mjs 再重试');
+            }
+            throw e;
+          }
+          if (json) {
+            out({ deleted: true, name: victim.name, key: victim.key, sealedBytes: victim.sealedBytes }, flags);
+          } else {
+            console.log(`已删除 ${victim.key}（密文 ${(victim.sealedBytes / 1024).toFixed(1)} KB）`);
           }
           break;
         }
@@ -1193,6 +1221,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   backup / restore              一致性备份与恢复
          --upload             加密上传到远端（独立前缀 backups/<设备>/）[--keep N]（默认保留 5 份）
          --list-remote        列出本设备的远端备份（名称/时间/密文字节）
+         --purge-remote <name> 删除单个远端备份对象（删前打印名称与大小；同步链对象服务端一律拒绝）
   restore --from-remote <name>  下载解密校验后还原；默认到新路径，--force 覆盖当前库前自动备份之 [--to <dir>]
   doctor                        健康检查 [--host <agent>]（诚实分级，无模型无云端核心可用）
   status                        库状态摘要

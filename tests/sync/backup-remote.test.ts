@@ -321,7 +321,8 @@ test('CLI e2e：backup --upload → --list-remote → restore --from-remote（�
     assert.equal(up.code, 0, up.stderr);
     const upBody = JSON.parse(up.stdout) as { name: string; key: string; pruneWarning: string | null };
     assert.ok(upBody.key.startsWith('backups/'));
-    assert.ok(upBody.pruneWarning !== null, 'syncd 无 DELETE 路由：保留策略诚实降级为只列不删');
+    // add-syncd-purge 起 syncd 有 DELETE 路由：保留策略真正生效，不再降级
+    assert.equal(upBody.pruneWarning, null, 'syncd 支持删除：保留策略不再降级');
 
     const ls = await runCli(home, ['--json', 'backup', '--list-remote'], env);
     assert.equal(ls.code, 0, ls.stderr);

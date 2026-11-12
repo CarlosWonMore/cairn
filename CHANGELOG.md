@@ -2,6 +2,13 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### Added
+- **受限的备份对象删除（`DELETE /chunks/<key>`）**：syncd 只放行解码后含 `/backups/` 的对象，同步链的 chunk/manifest 一律 403（只追加语义，删了会让对端拉取永久卡在缺口）；删除复用既有 `safeKey()` 防穿越，对象不存在也返回 200（幂等）。`/manifests/` 不开放删除。
+- **`cairn backup --purge-remote <name>`**：显式删除单个远端备份对象，删前打印对象名与大小；远端不支持删除（旧版 syncd）时明确报错，不做假成功。
+- **保留策略在 syncd 后端真正生效**：`SyncdRemoteStore.deleteObject` 接通后，超出保留份数的旧备份会被实际淘汰；旧版 syncd 的 404 被识别为「不支持删除」并降级为 `pruneWarning`（不会静默假装已清理）。
+
 ## [0.5.0] - 2026-11-12
 
 项目身份与作用域治理、AI 提案卡、设备备份上云。四个 OpenSpec 变更归档，主规格 10/10 严格通过。

@@ -66,6 +66,21 @@ export class SyncdRemoteStore implements RemoteStore {
     if (r.status !== 200) throw err('E_IO', 'syncd_remote_error', { status: r.status });
   }
 
+  /**
+   * 删除对象（add-syncd-purge）：仅备份保留清理与显式 purge 使用。
+   * 服务端只放行含 `/backups/` 的 key——403 是调用方 bug（不是备份对象），直接抛。
+   * 404 = 旧版 syncd 没有 DELETE 路由（新版对不存在的备份对象也回 200）：
+   * 抛 syncd_delete_unsupported 供上层降级为 pruneWarning，绝不假装已删。
+   */
+  async deleteObject(key: string): Promise<void> {
+    const r = await this.req('DELETE', `/chunks/${encodeURIComponent(this.k(key))}`);
+    if (r.status === 200) return;
+    if (r.status === 401) throw err('E_FORBIDDEN', 'syncd_auth_failed');
+    if (r.status === 403) throw err('E_FORBIDDEN', 'syncd_delete_not_backup', { status: 403 });
+    if (r.status === 404) throw err('E_IO', 'syncd_delete_unsupported', { status: 404 });
+    throw err('E_IO', 'syncd_remote_error', { status: r.status });
+  }
+
   async list(prefix: string, _cursor?: string): Promise<{ keys: string[]; nextCursor?: string }> {
     const r = await this.req('GET', `/list?prefix=${encodeURIComponent(this.k(prefix))}`);
     if (r.status === 401) throw err('E_FORBIDDEN', 'syncd_auth_failed');

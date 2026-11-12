@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { CairnStore } from '../store/open.js';
 import { backupDatabase, verifyBackup } from '../store/backup.js';
 import { RemoteStore } from '../jobs/remote.js';
-import { err } from '../core/errors.js';
+import { err, isCairnError } from '../core/errors.js';
 import { sha256Hex } from '../core/hash.js';
 import { deriveBackupKey, encryptObject, decryptObject, loadKeys } from './cryptoutil.js';
 import { VaultConfig } from './vault.js';
@@ -133,7 +133,17 @@ export async function uploadRemoteBackup(
     const unknownCount = parsed.length - known.length;
     const victims = known.slice(keep);
     for (const v of victims) {
-      await remote.deleteObject(v.key);
+      try {
+        await remote.deleteObject(v.key);
+      } catch (e) {
+        // 旧版 syncd 的 DELETE 落 404（新版对不存在的备份也回 200）：诚实降级，
+        // 不把「没删掉」记进 pruned——spec 要求如实报告「保留策略未生效」。
+        if (isCairnError(e) && e.message === 'syncd_delete_unsupported') {
+          pruneWarning = '保留策略未生效：远端不支持删除（旧版 syncd 无 DELETE 路由），旧备份仍在，需手动清理';
+          break;
+        }
+        throw e;
+      }
       pruned.push(v.key);
     }
     if (unknownCount > 0) {

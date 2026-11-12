@@ -47,6 +47,7 @@ npm run cli -- vault init-remote --provider syncd --base-url http://<内网IP>:8
 
 - 单用户多 vault：每个 vault 的键空间互相隔离（`vaults/<vaultId>/` 前缀，与 OBS 布局对齐）；外来/不可解密的 manifest 在 pull 时降级为跳过 + 审计，不影响本 vault。
 - chunk 幂等上传；manifest 代次 CAS 经旁路 `.gen` 元数据执行（对真实密文同样生效，回退 409）；Bearer 鉴权；防路径穿越。
+- **删除只有一个受限入口**：`DELETE /chunks/<key>` 且解码后 key 必须含 `/backups/`，其余一律 403（同步链是只追加的，chunk/manifest 永不删除）；对象不存在也返回 200（幂等）。`/manifests/` 不开放 DELETE。旧版 syncd 没有该路由，客户端会诚实降级为「保留策略未生效」提示。
 - 数据目录备份由运维负责；云端（OBS/syncd）损坏可从本地权威库全量重推。
 - 提示：syncd 所在主机上的客户端建议配置独立监听或使用回环地址——自连 Tailscale IP 每次请求有秒级开销（实测）。
 
@@ -114,5 +115,5 @@ doctor 的 remote 状态反映【当前环境】的可用性：远端已配置�
 - **只有生成它的设备能解开**：备份密钥混入 `deviceId`，其他设备拿到密文也没有对应密钥材料——这是特性不是缺陷。
 - **设备身份丢失会导致旧备份解不开**：`~/.cairn/data/device.json` 决定 deviceId；重装系统前备份它，或用 `device re-enroll` 恢复同一身份。密钥材料本身来自 vault（`keys.json` / 恢复材料），不需要额外抄写。
 - **前缀严格隔离**：同步 list 扫不到备份对象、备份清理碰不到 chunk/manifest；一方不可用不影响另一方。
-- **syncd 暂不支持删除**：保留策略（默认保留最近 5 份）在 OBS 后端可自动淘汰；syncd 后端诚实降级为只上传不删除（输出里有提示），旧备份需手动清理。恢复链路（下载 → 解密 → sha256 比对 → 快照校验）两个后端一致。
+- **删除边界**：保留策略（默认保留最近 5 份）在 OBS 与新版 syncd 后端都会真正淘汰最旧的备份对象；旧版 syncd（无 DELETE 路由）诚实降级为只上传不删除（输出里有提示），旧备份需手动清理。显式清理单个对象用 `cairn backup --purge-remote <name>`（删前打印对象名与大小；服务端只放行备份段，同步链对象一律拒绝）。恢复链路（下载 → 解密 → sha256 比对 → 快照校验）两个后端一致。
 - 上传不改本地库状态；恢复默认还原到新路径，覆盖当前库必须 `--force` 且会先自动备份当前库。
