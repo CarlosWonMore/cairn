@@ -438,3 +438,22 @@ test('检索：timeoutMs 预算下 LIKE 通道有界返回', () => {
     assert.ok(out.elapsedMs < 5000, '有界通道必须快速返回');
   });
 });
+
+// ---------------------------------------------------------------------------
+// add-memory-scope-visibility：检索结果携带作用域边界属性
+// ---------------------------------------------------------------------------
+
+test('检索：结果携带人读作用域 preset 与同步策略（add-memory-scope-visibility）', () => {
+  withCtx((ctx) => {
+    const out = searchMemories(ctx.store, { text: '备份', query: ctx.qp, limit: 10 });
+    const personal = out.results.find((r) => r.memory.id === ctx.ids.backupP);
+    assert.ok(personal, 'personal-global 记忆命中');
+    assert.equal(personal!.scopePreset, 'personal-global');
+    assert.equal(personal!.syncPolicy, 'encrypted');
+
+    const projOut = searchMemories(ctx.store, { text: '结构化检索', query: ctx.qa, limit: 10 });
+    const proj = projOut.results.find((r) => r.memory.id === ctx.ids.zhou);
+    assert.ok(proj, 'project-global 记忆命中（项目 A 身份）');
+    assert.equal(proj!.scopePreset, 'project-global');
+  });
+});

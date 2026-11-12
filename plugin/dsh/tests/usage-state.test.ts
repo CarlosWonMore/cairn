@@ -148,3 +148,31 @@ describe('frontmatter 摘要（2026-11-02 实测缺陷）', () => {
     assert.equal(toSummary('---\n---\n真正的正文'), '真正的正文');
   });
 });
+
+describe('作用域透传（add-memory-scope-visibility）', () => {
+  it('injectable 的 scope 随注入条目进入状态', () => {
+    const u = buildUsage({
+      candidates: 1,
+      injectable: [{ id: 'a', kind: 'fact', content: '投影预算是 2KB', scope: 'personal-global' }],
+      injectedIds: ['a'],
+      matchedBy: 'fts',
+      bytesUsed: 40,
+      bytesBudget: 1536,
+      filteredCount: 0,
+    });
+    assert.equal(u.injected[0]!.scope, 'personal-global');
+  });
+
+  it('无 scope 字段时条目保持缺省（老宿主兼容）', () => {
+    const u = buildUsage({
+      candidates: 1,
+      injectable: [{ id: 'a', kind: 'fact', content: '投影预算是 2KB' }],
+      injectedIds: ['a'],
+      matchedBy: 'fts',
+      bytesUsed: 40,
+      bytesBudget: 1536,
+      filteredCount: 0,
+    });
+    assert.equal(u.injected[0]!.scope, undefined);
+  });
+});

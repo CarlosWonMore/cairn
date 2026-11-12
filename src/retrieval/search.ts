@@ -216,7 +216,11 @@ function assembleResult(store: CairnStore, memory: MemoryRecord, matchedBy: 'fts
   if (memory.status === 'conflicted') {
     conflictId = store.conflicts.listOpen(memory.id)[0]?.id;
   }
-  return { memory, matchedBy, score, conflictId, unverifiableImport, expired };
+  // 作用域边界属性随命中带出（add-memory-scope-visibility）：调用方与面板不需要
+  // 另发一次详情调用才知道这条记忆是 personal-global 还是 device-local。
+  // FK 保证 scopeId 必有行；getById 返回 null 只可能是库被手工改坏——缺省让上层如实缺失。
+  const scope = store.scopes.getById(memory.scopeId);
+  return { memory, matchedBy, score, conflictId, unverifiableImport, expired, scopePreset: scope?.preset, syncPolicy: scope?.syncPolicy };
 }
 
 function mergedByChannelSort(a: SearchResultRecord, b: SearchResultRecord): number {

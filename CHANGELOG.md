@@ -5,6 +5,10 @@
 ## [Unreleased]
 
 ### Added
+- **MCP 工具面进程内冻结**：ListTools 结果在单个 server 进程生命周期内字节稳定——onboarding 条件工具在启动时判定一次，运行中库状态翻转（另一进程 import、会话内治理动作）不再增减工具，消除「不升级不重启」前提下唯一的工具 schema 变化向量（该向量曾造成 prompt 前缀缓存整包重算）。判定失败 fail-closed 降级不拒启。
+- **检索条目携带作用域边界属性**：`memory_search` / `memory_context` 每条命中带 `scope_preset`（人读作用域名）+ `sensitivity` + `sync_policy`，无需另发详情调用。DSH 插件注入闸由空转变为真实生效（fail-closed：标签缺失＝不可注入，计入面板「已过滤」），面板左右栏为注入条目渲染作用域徽章。
+- **两段式检索：列表给预览，全文按需取**：`memory_search` / `memory_context` 条目返回有界预览（300 字符、frontmatter 感知、确定性单行）+ `truncated` + `content_length`，不再返回全文；`memory_get` 支持唯一 id 前缀（≥8 字符，歧义报候选绝不猜测）与批量 `ids`（上限 10，逐条作用域检查，不可读条目只返回标记不带正文）；DSH 注入行携带 16 字符记忆标识，模型可据此下钻。诚实口径：省的是单次检索 token 与长尾，不是端到端倍数。
+- **检索可按项目身份过滤**：`memory_search` 增可选 `project` 参数（UUID 或已登记别名），项目作用域记忆可被召回；别名解析**只查不建**，未登记报错并指引 `project_resolve`；携带项目身份不放宽设备/Agent/读允许名单检查。DSH 插件新增 `projectPath` 配置：懒解析一次并缓存，解析失败降级为不带项目召回并在面板如实提示；未配置时行为与从前逐字节一致。
 - **`cairn sync push` 推送前提示上行缺口**：推送前做一次只读缺口检查（与 `doctor` / `backfill` 共用 `findUpstreamGap`），有缺口就向 stderr 报条数并说明「这些记忆尚未入队，本次推送不包含它们」、指向 `cairn sync backfill --apply`；推送照常执行、退出码不变、不入队，零缺口时完全静默。此前缺口只出现在 `doctor` 的 `notes` 里，不主动查就不知道。
 - **受限的备份对象删除（`DELETE /chunks/<key>`）**：syncd 只放行解码后含 `/backups/` 的对象，同步链的 chunk/manifest 一律 403（只追加语义，删了会让对端拉取永久卡在缺口）；删除复用既有 `safeKey()` 防穿越，对象不存在也返回 200（幂等）。`/manifests/` 不开放删除。
 - **`cairn backup --purge-remote <name>`**：显式删除单个远端备份对象，删前打印对象名与大小；远端不支持删除（旧版 syncd）时明确报错，不做假成功。

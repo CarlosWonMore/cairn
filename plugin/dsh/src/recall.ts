@@ -5,7 +5,6 @@
  * 插件只负责三件事：该不该注入、注入什么、注入多少。
  */
 
-import { firstLine } from './usage-state.js';
 
 /** 一条召回命中（来自 Cairn MCP 的返回）。 */
 export interface RecallHit {
@@ -13,6 +12,8 @@ export interface RecallHit {
   kind: string;
   content: string;
   scopeId?: string;
+  /** 人读作用域名（scope 表 preset，如 personal-global）；面板徽章用。 */
+  scopePreset?: string;
   sensitivity?: string;
   syncPolicy?: string;
   /** 重要度 1-5（MCP 带出）；NULL = 未判断。 */
@@ -51,14 +52,50 @@ export function shouldInject(input: InjectionInput): InjectionDecision {
 }
 
 /**
+ * MCP 线协议条目 → RecallHit：显式字段映射。
+ *
+ * 线协议形状由 MCP summarize() 决定，snake/camel 混合（scopeId 是 camel，
+ * scope_preset / sync_policy / usage_count 是 snake）——直接把解析结果当
+ * RecallHit 用会让闸读错键、恒拿 undefined。映射集中在这一处，别处不要再抄。
+ *
+ * add-two-stage-memory-recall 起线协议条目带 `preview`（有界预览）而非 `content`
+ * 全文；`preview` 落到 RecallHit.content（插件内的「内容」从今起就是预览，
+ * 全文经模型显式 memory_get 获取）。保留 content 键兜底旧内核（半更新窗口）。
+ */
+export function toRecallHit(raw: unknown): RecallHit | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r['id'] !== 'string' || r['id'].length === 0) return null;
+  const content = typeof r['preview'] === 'string'
+    ? r['preview']
+    : typeof r['content'] === 'string' ? r['content'] : '';
+  return {
+    id: r['id'],
+    kind: typeof r['kind'] === 'string' ? r['kind'] : 'memory',
+    content,
+    scopeId: typeof r['scopeId'] === 'string' ? r['scopeId'] : undefined,
+    scopePreset: typeof r['scope_preset'] === 'string' ? r['scope_preset'] : undefined,
+    sensitivity: typeof r['sensitivity'] === 'string' ? r['sensitivity'] : undefined,
+    syncPolicy: typeof r['sync_policy'] === 'string' ? r['sync_policy'] : undefined,
+    importance: typeof r['importance'] === 'number' ? r['importance'] : null,
+    usageCount: typeof r['usage_count'] === 'number' ? r['usage_count'] : 0,
+  };
+}
+
+/**
  * 二次断言：把不该外泄的命中剔除。
  *
  * **这不是复制检索逻辑**——检索与作用域判定仍由 MCP 完成。这里只做一道防线：
  * 万一上游过滤有漏，插件的注入是最后一道闸（spec: 注入内容同样受作用域约束）。
+ *
+ * add-memory-scope-visibility 起这道闸基于 MCP 返回的真实元数据判定，并 **fail-closed**：
+ * 任一标签缺失（旧内核半更新、异常返回）＝「拿不准」，按不可注入处理——宁可漏注不错注。
+ * 被拦条数计入面板「已过滤」，不静默。被拦内容不进注入、不进面板条目，只留计数。
  */
 export function filterInjectable(hits: readonly RecallHit[]): RecallHit[] {
   return hits.filter((h) => {
-    if (h.sensitivity && h.sensitivity !== 'normal') return false;
+    if (typeof h.sensitivity !== 'string' || typeof h.syncPolicy !== 'string') return false;
+    if (h.sensitivity !== 'normal') return false;
     if (h.syncPolicy === 'local_only') return false;
     return true;
   });
@@ -127,7 +164,13 @@ function renderRows(
 
   for (let i = 0; i < fresh.length; i++) {
     const h = fresh[i]!;
-    const line = `- [${h.kind}] ${truncate(firstLine(h.content), LINE_MAX)}`;
+    // add-two-stage-memory-recall：注入行携带 16 字符记忆标识——模型可据此调
+    // memory_get 下钻全文。为什么不是 8：uuidv7 前 12 hex 是毫秒时间戳，同一毫秒
+    // 写入的记忆共享前 ≥13 字符，8 字符前缀在新建库上几乎必然歧义；16 字符
+    // （时间戳 + 版本 + rand_a 首位）才具备实用唯一性。includedIds 仍记录完整 id。
+    // h.content 在 toRecallHit 之后就是服务端 preview（frontmatter 感知单行），
+    // 这里不再过 firstLine——「摘要怎么算」只有服务端 preview 一处出处。
+    const line = `- [${h.id.slice(0, 16)}|${h.kind}] ${truncate(h.content, LINE_MAX)}`;
     const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
     if (used + lineBytes + maxNotice > opts.budgetBytes) {
       truncated = fresh.length - i;

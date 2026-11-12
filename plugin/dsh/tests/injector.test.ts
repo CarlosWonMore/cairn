@@ -35,7 +35,7 @@ function makeSpyCtx() {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }),
+                text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', preview: '投影预算是 2KB' }] }),
               },
             ],
           };
@@ -304,7 +304,7 @@ describe('插件形状（踩过三次的坑）', () => {
                     type: 'text',
                     text:
                       args.query === '记忆'
-                        ? JSON.stringify({ items: [{ id: 'm9', kind: 'fact', content: '跨设备共享记忆统一走 Cairn' }] })
+                        ? JSON.stringify({ items: [{ id: 'm9', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', preview: '跨设备共享记忆统一走 Cairn' }] })
                         : '{"items":[]}',
                   },
                 ],
@@ -342,7 +342,7 @@ describe('插件形状（踩过三次的坑）', () => {
                   type: 'text',
                   text:
                     input.arguments.query === '记忆'
-                      ? JSON.stringify({ items: [{ id: 'm10', kind: 'fact', content: '记忆跨设备统一走 Cairn' }] })
+                      ? JSON.stringify({ items: [{ id: 'm10', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', preview: '记忆跨设备统一走 Cairn' }] })
                       : '{"items":[]}',
                 },
               ],
@@ -372,7 +372,7 @@ describe('插件形状（踩过三次的坑）', () => {
               if (failing) throw new Error('boom');
               return {
                 content: [
-                  { type: 'text', text: JSON.stringify({ items: [{ id: 'm11', kind: 'fact', content: '投影预算是 2KB' }] }) },
+                  { type: 'text', text: JSON.stringify({ items: [{ id: 'm11', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', preview: '投影预算是 2KB' }] }) },
                 ],
               };
             },
@@ -591,7 +591,7 @@ describe('状态判定：有候选且已渲染时不能是 miss（2026-11-02 实
 });
 
 describe('召回结果三态：候选/去重/未命中必须分得开（fix-memory-panel-drift D1）', () => {
-  const hit = { id: 'm1', kind: 'fact', content: '投影预算是 2KB' };
+  const hit = { id: 'm1', kind: 'fact', sensitivity: 'normal', syncPolicy: 'encrypted', scopePreset: 'personal-global', content: '投影预算是 2KB' };
 
   it('1.1 同一记忆第二次被召回：reason=all_seen、deduped>=1、injectedIds 为空', async () => {
     const inj = createInjector({ recall: async () => [hit] });
@@ -656,7 +656,7 @@ describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/
     const { ctx, read, setItems } = makeMutableCtx();
     apply(ctx, {});
     const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
-    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
     await preStep(step(), () => {});
     await preStep(step(), () => {});
     const recent = read()['recent'] as { summary: string }[];
@@ -678,7 +678,7 @@ describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/
     const { ctx, read, setItems } = makeMutableCtx();
     apply(ctx, {});
     const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
-    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
     await preStep(step(), () => {});
     for (let i = 0; i < 20; i++) await preStep(step(), () => {});
 
@@ -689,7 +689,7 @@ describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/
     assert.match(recent[1]!.summary, /已去重/);
 
     // 夹一次真实注入：新记忆进来，前一段折叠必须断开。
-    setItems([{ id: 'm2', kind: 'fact', content: '库入口在 docs' }]);
+    setItems([{ id: 'm2', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '库入口在 docs' }]);
     await preStep(step(), () => {});
     for (let i = 0; i < 5; i++) await preStep(step(), () => {});
 
@@ -704,9 +704,9 @@ describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/
     const { ctx, read, setItems } = makeMutableCtx();
     apply(ctx, {});
     const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
-    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
     await preStep(step(), () => {});
-    setItems([{ id: 'm2', kind: 'fact', content: '库入口在 docs' }]);
+    setItems([{ id: 'm2', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '库入口在 docs' }]);
     await preStep(step(), () => {});
 
     const recent = read()['recent'] as { items?: { id: string }[]; count?: number }[];
@@ -719,7 +719,7 @@ describe('活动记录：语义措辞与空步折叠（fix-memory-panel-drift 3/
     const { ctx, read, setItems } = makeMutableCtx();
     apply(ctx, {});
     const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
-    setItems([{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }]);
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
     await preStep(step(), () => {});
     await preStep(step(), () => {});
     await new Promise((r) => setTimeout(r, 5));
@@ -861,7 +861,7 @@ describe('去重早退不得覆盖 lastUsage（2026-11-02 面板误报 miss 的�
         get: () => ({
           execute: async () => {
             call += 1;
-            return { content: [{ text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] }) }] };
+            return { content: [{ text: JSON.stringify({ items: [{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', preview: '投影预算是 2KB' }] }) }] };
           },
         }),
       },
@@ -933,7 +933,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
   const textOf = (m: unknown): string => (m as { content?: { text?: string }[] }).content?.[0]?.text ?? '';
 
   it('4.1 压缩成功后重注入涉及过的记忆，表头区别于常规召回', async () => {
-    const { ctx } = makeCtx({ 'sess-A': [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] });
+    const { ctx } = makeCtx({ 'sess-A': [{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }] });
     apply(ctx, {});
     const first: unknown[] = [];
     await pre(ctx)(step('sess-A', (m) => first.push(m)), () => {});
@@ -951,7 +951,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
   });
 
   it('4.2 压缩失败（带 error）不重注入、不清去重', async () => {
-    const { ctx } = makeCtx({ 'sess-F': [{ id: 'm1', kind: 'fact', content: '投影预算是 2KB' }] });
+    const { ctx } = makeCtx({ 'sess-F': [{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }] });
     apply(ctx, {});
     await pre(ctx)(step('sess-F', () => {}), () => {});
     onEvent(ctx)({ id: 'sess-F' }, { type: 'compaction/end', data: { compactionId: 'c9', turn: 2, error: 'boom' } });
@@ -961,7 +961,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
   });
 
   it('4.2b 压缩失败时即使有可重注入内容也不会泄漏', async () => {
-    const { ctx } = makeCtx({ 'sess-G': [{ id: 'g1', kind: 'fact', content: '压缩失败不该重注入的正文' }] });
+    const { ctx } = makeCtx({ 'sess-G': [{ id: 'g1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '压缩失败不该重注入的正文' }] });
     apply(ctx, {});
     const first: unknown[] = [];
     await pre(ctx)(step('sess-G', (m) => first.push(m)), () => {});
@@ -976,7 +976,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
     const { ctx, items } = makeCtx();
     apply(ctx, { budgetBytes: 600 });
     for (let i = 1; i <= 8; i++) {
-      items.set('sess-T', [{ id: `m${i}`, kind: 'fact', content: `第 ${i} 条记忆的内容` }]);
+      items.set('sess-T', [{ id: `m${i}`, kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: `第 ${i} 条记忆的内容` }]);
       await pre(ctx)(step('sess-T', () => {}), () => {});
     }
     onEvent(ctx)({ id: 'sess-T' }, { type: 'compaction/end', data: { compactionId: 'c3', turn: 3 } });
@@ -990,7 +990,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
   });
 
   it('4.4 重注入后常规召回不重复注入同一批', async () => {
-    const { ctx } = makeCtx({ 'sess-R': [{ id: 'r1', kind: 'fact', content: '投影预算是 2KB' }] });
+    const { ctx } = makeCtx({ 'sess-R': [{ id: 'r1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }] });
     apply(ctx, {});
     await pre(ctx)(step('sess-R', () => {}), () => {});
     onEvent(ctx)({ id: 'sess-R' }, { type: 'compaction/end', data: { compactionId: 'c4', turn: 1 } });
@@ -1004,8 +1004,8 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
 
   it('4.5 会话隔离：A 压缩不影响 B', async () => {
     const { ctx } = makeCtx({
-      'sess-AD': [{ id: 'a1', kind: 'fact', content: 'A 会话专属记忆正文' }],
-      'sess-BD': [{ id: 'b1', kind: 'fact', content: 'B 会话专属记忆正文' }],
+      'sess-AD': [{ id: 'a1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: 'A 会话专属记忆正文' }],
+      'sess-BD': [{ id: 'b1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: 'B 会话专属记忆正文' }],
     });
     apply(ctx, {});
     await pre(ctx)(step('sess-AD', () => {}), () => {});
@@ -1026,7 +1026,7 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
     apply(ctx, { trackMax: 3 });
     for (let i = 0; i <= 4; i++) {
       const id = 'e' + String(i).padStart(3, '0');
-      items.set('sess-L', [{ id, kind: 'fact', content: '追踪上限第 ' + id + ' 条正文' }]);
+      items.set('sess-L', [{ id, kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '追踪上限第 ' + id + ' 条正文' }]);
       await pre(ctx)(step('sess-L', () => {}), () => {});
     }
     const dbg = read('sess-L', true);
@@ -1040,5 +1040,88 @@ describe('压缩后重注入（add-compaction-reinject）', () => {
     const text = after.map(textOf).join('\n');
     assert.doesNotMatch(text, /追踪上限第 e000 条正文/, '最旧的已被淘汰');
     assert.doesNotMatch(text, /追踪上限第 e001 条正文/, '前两条都该被淘汰');
+  });
+});
+
+describe('项目身份召回（add-project-scope-recall）', () => {
+  /** 名称感知的假 tools：memory_search 服务 items，project_resolve 可配置成败。 */
+  function makeProjectCtx(opts: { resolveOk: boolean; items?: { id: string; kind: string; content: string }[] } = { resolveOk: true }) {
+    let items = opts.items ?? [];
+    const calls: { tool: string; args: Record<string, unknown> }[] = [];
+    const routes: { path?: string; handler?: (req: unknown, res: unknown) => void }[] = [];
+    const ctx: Record<string, unknown> = {
+      tools: {
+        get: (name: string) => ({
+          execute: async (args: Record<string, unknown>) => {
+            calls.push({ tool: name, args });
+            if (name.endsWith('project_resolve')) {
+              if (!opts.resolveOk) throw new Error('resolve boom');
+              return { content: [{ type: 'text', text: JSON.stringify({ projectId: 'proj-uuid-1234', created: true, name: 'x' }) }] };
+            }
+            return { content: [{ type: 'text', text: JSON.stringify({ items }) }] };
+          },
+        }),
+      },
+      webServer: { register: (o: unknown) => routes.push(o as never) },
+      on: (e: string, fn: unknown) => { ctx[e] = fn; },
+    };
+    const read = (): Record<string, unknown> => {
+      let body = '';
+      const handler = routes.find((r) => String(r.path).endsWith('/usage'))!.handler!;
+      handler({ method: 'GET', url: '/plugins/cairn-dsh-memory/usage?session=sess-A&history=1' }, { writeHead: () => {}, end: (s: string) => { body = s; } });
+      return JSON.parse(body) as Record<string, unknown>;
+    };
+    return { ctx, read, calls, setItems: (next: typeof items) => { items = next; } };
+  }
+
+  const step = () => ({
+    agent: { id: 'sess-A', inject: () => {} },
+    messages: [{ role: 'user', content: [{ type: 'text', text: '投影预算是多少' }] }],
+  });
+
+  it('配置 projectPath：首次召回先 project_resolve，检索携带项目标识', async () => {
+    const { ctx, read, calls, setItems } = makeProjectCtx({ resolveOk: true, items: [] });
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
+    apply(ctx, { projectPath: 'D:/proj/x' });
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep(step(), () => {});
+    const resolveCalls = calls.filter((c) => c.tool.endsWith('project_resolve'));
+    assert.equal(resolveCalls.length, 1, 'project_resolve 只调一次（缓存）');
+    const searchCalls = calls.filter((c) => c.tool.endsWith('memory_search'));
+    assert.ok(searchCalls.length >= 1);
+    for (const c of searchCalls) assert.equal(c.args['project'], 'proj-uuid-1234', '检索携带已解析项目标识');
+    await preStep(step(), () => {});
+    assert.equal(calls.filter((c) => c.tool.endsWith('project_resolve')).length, 1, '第二轮不再重复解析');
+    const payload = read();
+    const proj = payload['project'] as { status?: string; id?: string };
+    assert.equal(proj?.status, 'ok');
+    assert.equal(proj?.id, 'proj-uuid-1234');
+  });
+
+  it('解析失败：降级为不带项目召回（personal 照常），面板如实提示', async () => {
+    const { ctx, read, calls, setItems } = makeProjectCtx({ resolveOk: false });
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
+    apply(ctx, { projectPath: 'D:/proj/broken' });
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep(step(), () => {});
+    assert.ok(calls.filter((c) => c.tool.endsWith('memory_search')).length >= 1, '降级后召回照常');
+    const searchCalls = calls.filter((c) => c.tool.endsWith('memory_search'));
+    for (const c of searchCalls) assert.ok(!('project' in c.args), '降级检索不携带 project');
+    const payload = read();
+    const proj = payload['project'] as { status?: string; reason?: string };
+    assert.equal(proj?.status, 'degraded', '面板如实呈现降级');
+    assert.ok((proj?.reason ?? '').length > 0, '降级带原因');
+    assert.equal(payload['status'], 'injected', 'personal 记忆照常注入');
+  });
+
+  it('未配置 projectPath：行为与现状一致（不带 project 字段，面板 project.status=off）', async () => {
+    const { ctx, read, calls, setItems } = makeProjectCtx({ resolveOk: true });
+    setItems([{ id: 'm1', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted', scope_preset: 'personal-global', content: '投影预算是 2KB' }]);
+    apply(ctx, {});
+    const preStep = ctx['agent/pre-step'] as (p: unknown, n?: () => unknown) => Promise<unknown>;
+    await preStep(step(), () => {});
+    for (const c of calls) assert.ok(!('project' in c.args), '未配置时不携带 project');
+    const payload = read();
+    assert.equal((payload['project'] as { status?: string })?.status, 'off');
   });
 });

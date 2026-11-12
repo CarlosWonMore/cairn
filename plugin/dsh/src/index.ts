@@ -27,6 +27,7 @@ import {
   renderInjection,
   renderReinjection,
   shouldInject,
+  toRecallHit,
   type RecallHit,
 } from './recall.js';
 import { buildUsage, EMPTY_USAGE, toSummary, type RecallUsage } from './usage-state.js';
@@ -41,6 +42,13 @@ export interface PluginConfig {
   reinjectBudgetRatio?: number;
   /** 每会话追踪的记忆上限，超出按最近使用淘汰（默认 200）。 */
   trackMax?: number;
+  /**
+   * 可选项目身份（路径或 git URL 别名，add-project-scope-recall）：配置后启动时经
+   * project_resolve 解析（find-or-create，登记语义在此），自动召回检索携带项目标识，
+   * 项目作用域记忆可被召回。未配置时行为与现状逐字节一致；解析失败降级为不带项目
+   * 并在面板如实提示（fail-open：配置错误的代价＝回到现状，比召回瘫痪好）。
+   */
+  projectPath?: string;
   /**
    * 留痕配置（活动记录写哪些动作）。
    * 审计完整性原则：记录默认全开；展示层的筛选/程度/时长由面板自己配。
@@ -125,7 +133,7 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     if (rendered.includedIds.length > 0) {
       lastUsage = buildUsage({
         candidates: hits.length,
-        injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content })),
+        injectable: safe.map((h) => ({ id: h.id, kind: h.kind, content: h.content, scope: h.scopePreset })),
         injectedIds,
         matchedBy: 'fts',
         bytesUsed: rendered.bytes,
@@ -164,13 +172,13 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
    * 成功后把这些 id 加回去重集合：压缩后第一步的常规召回会命中同一批，
    * 不先占位就会在相邻两步里各注入一遍（spec: 重注入后不重复）。
    */
-  function reinject(entries: readonly Pick<RecallHit, 'id' | 'kind' | 'content'>[]): {
+  function reinject(entries: readonly (Pick<RecallHit, 'id' | 'kind' | 'content'> & { scope?: string })[]): {
     text: string;
     ids: string[];
     bytes: number;
     truncated: number;
     /** 实际进文本的条目（摘要形状），供面板的「本会话累计注入」重新累计。 */
-    items: { id: string; kind: string; summary: string }[];
+    items: { id: string; kind: string; summary: string; scope?: string }[];
   } | null {
     if (!cfg.reinjectOnCompaction || entries.length === 0) return null;
     // 比例来自配置，是外部输入：夹到 [0,1]，否则能突破总预算。
@@ -179,7 +187,7 @@ export function createInjector(deps: { recall: RecallFn; config?: PluginConfig }
     if (rendered.includedIds.length === 0) return null;
     dedupe.add(rendered.includedIds);
     const allow = new Set(rendered.includedIds);
-    const items = entries.filter((e) => allow.has(e.id)).map((e) => ({ id: e.id, kind: e.kind, summary: toSummary(e.content) }));
+    const items = entries.filter((e) => allow.has(e.id)).map((e) => ({ id: e.id, kind: e.kind, summary: toSummary(e.content), scope: e.scope }));
     return { text: rendered.text, ids: rendered.includedIds, bytes: rendered.bytes, truncated: rendered.truncated, items };
   }
 
@@ -240,6 +248,9 @@ export function deriveQueries(message: string, max = 6): string[] {
 
 /** 召回链路诊断：记录 tools.get / tools.execute / definition.execute 每一步的失败原因。 */
 export const renderProbe: Record<string, unknown> = {};
+
+/** 项目身份状态（add-project-scope-recall）：面板经 usage 端点如实呈现。 */
+export const projectInfo: { status: 'off' | 'ok' | 'degraded'; path?: string; id?: string; reason?: string } = { status: 'off' };
 
 export const recallDiag: {
   hasTools: boolean;
@@ -326,7 +337,7 @@ function errorText(res: unknown): string {
  * `get(name, scope)` 先判过，per-agent restrict 依然生效）。
  * 仅当定义上没有 execute 时退回 `tools.execute`。
  */
-function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
+function makeToolRecall(ctx: unknown, onOwnCall?: () => void, projectPath?: string): RecallFn | null {
   const tools = (ctx as {
     tools?: {
       get?: (name: string, scope?: unknown) => ToolDefinitionLike | undefined;
@@ -345,6 +356,38 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
   if (!tools || typeof tools.get !== 'function') return null;
 
   let seq = 0;
+
+  /**
+   * 项目身份懒解析（add-project-scope-recall D2）：首次召回时经 project_resolve
+   * （find-or-create，登记语义在此）取得项目 uuid 并缓存；失败降级为不带项目并在
+   * 面板如实提示。resolve 只调一次——检索不重复解析。
+   */
+  let project: { status: 'off' | 'ok' | 'degraded'; path?: string; id?: string; reason?: string } =
+    { status: projectPath ? 'degraded' : 'off', ...(projectPath ? { path: projectPath, reason: '尚未解析' } : {}) };
+  // 无条件同步：projectInfo 是模块级对象，重置上一次 apply 的残留（HMR/多会话）。
+  Object.assign(projectInfo, project);
+
+  async function ensureProject(scope: unknown): Promise<void> {
+    if (!projectPath || project.status === 'ok') return;
+    try {
+      const def = tools?.get?.('mcp__cairn__project_resolve', scope);
+      if (!def || typeof def.execute !== 'function') {
+        project = { status: 'degraded', path: projectPath, reason: 'project_resolve 工具不可用' };
+        Object.assign(projectInfo, project);
+        return;
+      }
+      const res = await def.execute({ path_or_url: projectPath }, { signal: AbortSignal.timeout(RECALL_TIMEOUT_MS) });
+      const parsed = JSON.parse(resultText(res)) as { projectId?: unknown };
+      if (typeof parsed.projectId === 'string' && parsed.projectId.length > 0) {
+        project = { status: 'ok', path: projectPath, id: parsed.projectId };
+      } else {
+        project = { status: 'degraded', path: projectPath, reason: 'project_resolve 未返回 projectId' };
+      }
+    } catch (e) {
+      project = { status: 'degraded', path: projectPath, reason: (e as Error).message };
+    }
+    Object.assign(projectInfo, project);
+  }
 
   /**
    * 一次检索调用 → 文本。顺序是**实测定的**，不是偏好：
@@ -395,6 +438,7 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
   };
 
   return async (message: string, topK: number, scope?: unknown) => {
+    await ensureProject(scope);
     // 每条命中带上「它被哪些查询词带回来」，用来算相关性下限（见 recall.ts）。
     const merged = new Map<string, { hit: RecallHit; terms: string[] }>();
     for (const query of deriveQueries(message)) {
@@ -409,12 +453,17 @@ function makeToolRecall(ctx: unknown, onOwnCall?: () => void): RecallFn | null {
       // 插件每轮都注入（实测一个会话 202 次注入 / 6 种内容 / 97% 重复），
       // 计入次数会让「注入频率」取代「真实需求」决定排序，形成正反馈死锁。
       // 见 add-memory-importance-and-usage-signal D5。
-      const text = await searchOnce(def, { query, limit: topK, increment_usage: false }, scope, onOwnCall);
+      const args = { query, limit: topK, increment_usage: false, ...(project.status === 'ok' && project.id ? { project: project.id } : {}) };
+      const text = await searchOnce(def, args, scope, onOwnCall);
       if (text.length > 0) recallDiag.lastTextLen = text.length;
       let items: RecallHit[] = [];
       try {
-        const parsed = text ? (JSON.parse(text) as { items?: RecallHit[] }) : {};
-        items = Array.isArray(parsed.items) ? parsed.items : [];
+        const parsed = text ? (JSON.parse(text) as { items?: unknown[] }) : {};
+        // 线协议 → RecallHit 显式映射（snake/camel 混合，见 toRecallHit 注释）：
+        // 旧代码直接把解析结果当命中用，sync_policy/scope_preset 恒读不到。
+        items = Array.isArray(parsed.items)
+          ? parsed.items.map(toRecallHit).filter((h): h is RecallHit => h !== null)
+          : [];
       } catch {
         /* 非 JSON 响应：本路 0 条 */
       }
@@ -509,7 +558,7 @@ export type ActivityEntry = {
    * 这次操作涉及的记忆（仅「自动召回」有）——面板点选时用来高亮左侧条目，
    * 重启回放时也靠它重建「本会话累计注入」。只放摘要，不放正文。
    */
-  items?: { id: string; kind: string; summary: string }[];
+  items?: { id: string; kind: string; summary: string; scope?: string }[];
   /** 连续同类空步折叠后的发生次数；老行没有该字段，读取时按 1 处理。 */
   count?: number;
   /** 折叠段的首次发生时间（t 是最近一次）。面板用它算时间跨度与稳定键。 */
@@ -636,7 +685,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   // 自己发起的 memory_search 会在 tools/post-execute 里也出现——用时间窗压住防重复留痕。
   let suppressToolLogUntil = 0;
   const nullRecall: RecallFn = async () => [];
-  const recall = makeToolRecall(ctx, () => { suppressToolLogUntil = Date.now() + 3000; }) ?? nullRecall;
+  const recall = makeToolRecall(ctx, () => { suppressToolLogUntil = Date.now() + 3000; }, config.projectPath) ?? nullRecall;
 
   // ———— 会话隔离（2026-11-02 用户实测：面板把多个会话的记录叠在一起）————
   // 旧实现里 injector（含去重集合与 lastUsage）与 activity 都是插件级单例：
@@ -646,16 +695,16 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     injector: ReturnType<typeof createInjector>;
     activity: ActivityEntry[];
     /** 本会话累计注入过的记忆，按首次注入顺序去重（会话内同一 id 只会注入一次）。 */
-    injected: Map<string, { id: string; kind: string; summary: string }>;
+    injected: Map<string, { id: string; kind: string; summary: string; scope?: string }>;
     /**
      * 本会话涉及过的记忆（注入过 + 经 MCP 读过/写过），供压缩后重注入。
      *
      * 只在内存：Map 的插入顺序就是最近使用顺序（touch 时先删后插），
      * 超出 `trackMax` 从头部淘汰。**不写盘、不参与同步**（spec: 追踪有界）。
      */
-    touchedMemories: Map<string, { id: string; kind: string; summary: string; content: string; at: number }>;
+    touchedMemories: Map<string, { id: string; kind: string; summary: string; content: string; scope?: string; at: number }>;
     /** 已渲染、等下一步 pre-step 投递的重注入文本（session/event 里拿不到 agent）。 */
-    pendingReinject: { text: string; items: { id: string; kind: string; summary: string }[]; count: number; bytes: number } | null;
+    pendingReinject: { text: string; items: { id: string; kind: string; summary: string; scope?: string }[]; count: number; bytes: number } | null;
     /** 上次重注入的摘要，仅 `usage?debug=1` 暴露。 */
     lastReinject: { count: number; bytes: number; at: string } | null;
     touched: number;
@@ -689,7 +738,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
   }
   const trackMax = Math.max(0, config.trackMax ?? DEFAULTS.trackMax);
   /** 记一条「本会话涉及过」的记忆；同一 id 再次涉及只刷新内容与顺序（LRU）。 */
-  function touchMemory(st: SessionState, m: { id: string; kind: string; content: string }): void {
+  function touchMemory(st: SessionState, m: { id: string; kind: string; content: string; scope?: string }): void {
     if (!m.id || !m.content) return;
     st.touchedMemories.delete(m.id);
     st.touchedMemories.set(m.id, {
@@ -697,6 +746,7 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       kind: m.kind || 'memory',
       summary: toSummary(m.content),
       content: m.content,
+      scope: m.scope,
       at: Date.now(),
     });
     while (st.touchedMemories.size > trackMax) {
@@ -717,8 +767,9 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
     let id = typeof args.id === 'string' ? args.id : '';
     let kind = typeof args.kind === 'string' ? args.kind : 'memory';
     let content = typeof args.content === 'string' ? args.content : '';
+    let scope: string | undefined;
     if (!id || !content) {
-      type ToolResult = { id?: unknown; memory?: { content?: unknown; kind?: unknown } };
+      type ToolResult = { id?: unknown; memory?: { content?: unknown; kind?: unknown }; scope?: { preset?: unknown } };
       let parsed: ToolResult | null;
       try {
         parsed = JSON.parse(resultText(result)) as ToolResult;
@@ -731,8 +782,10 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
         content = mem.content;
         if (typeof mem.kind === 'string') kind = mem.kind;
       }
+      // memory_get 的 MemoryDetail 顶层带完整 scope 行：顺手取出人读 preset 名。
+      if (parsed?.scope && typeof parsed.scope.preset === 'string') scope = parsed.scope.preset;
     }
-    if (id) touchMemory(st, { id, kind, content });
+    if (id) touchMemory(st, { id, kind, content, scope });
   }
   /**
    * 记下「本会话注入过这条记忆」。
@@ -740,15 +793,16 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
    * 会话内同一 id 只会被注入一次（renderInjection 用去重集合挡掉重复），所以这里
    * 不需要计数；重复命中时只刷新摘要/类型（记忆可能被修订过）。
    */
-  function rememberInjected(st: SessionState, m: { id: string; kind: string; summary: string }): void {
+  function rememberInjected(st: SessionState, m: { id: string; kind: string; summary: string; scope?: string }): void {
     if (!m || typeof m.id !== 'string' || m.id.length === 0) return;
     const cur = st.injected.get(m.id);
     if (cur) {
       cur.kind = m.kind;
       cur.summary = m.summary;
+      if (m.scope) cur.scope = m.scope;
       return;
     }
-    st.injected.set(m.id, { id: m.id, kind: m.kind, summary: m.summary });
+    st.injected.set(m.id, { id: m.id, kind: m.kind, summary: m.summary, scope: m.scope });
   }
   /** 没带 session 参数时（curl 自检）挑最近活跃的那个，别让端点变成空壳。 */
   function mostRecentKey(): string {
@@ -863,6 +917,9 @@ export function apply(ctx: unknown, runtimeConfig?: PluginConfig): void {
       ...(usage ?? EMPTY_USAGE),
       persist: persistOn,
       session: key,
+      // 项目身份状态（add-project-scope-recall）：配置了 projectPath 时面板如实呈现
+      // ok / degraded（带原因）；未配置 status='off'。
+      project: { ...projectInfo },
       // 本会话累计注入（去重）。用户问的就是这个：这个会话一共注入过哪些记忆。
       sessionInjected: st ? [...st.injected.values()] : [],
     };

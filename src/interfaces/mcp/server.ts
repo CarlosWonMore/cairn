@@ -7,13 +7,14 @@ import {
   type CallToolRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import { AppService } from '../app-service.js';
-import { CairnError, isCairnError, ExitCode } from '../../core/errors.js';
+import { CairnError, isCairnError, err, ExitCode } from '../../core/errors.js';
+import { memoryPreview } from '../../retrieval/preview.js';
 import { MemoryKind, MEMORY_KINDS } from '../../core/types.js';
 import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
 import { ANNOTATION_STATUSES, DISPOSITIONS, RESOLVE_STATUSES } from '../console/annotations.js';
 import { parseJudgement } from '../../onboarding/judgement.js';
 import { runAutoOnboarding } from '../../onboarding/auto.js';
-import { listProjects, resolveProject } from '../../store/projects.js';
+import { findProjectByAlias, listProjects, resolveProject } from '../../store/projects.js';
 
 /**
  * Cairn MCP stdio 服务器（任务 5.2）：
@@ -57,6 +58,21 @@ function toolDef(
   return { name, description, inputSchema: { type: 'object', properties, required } };
 }
 
+/**
+ * onboarding 工具面判定（fix-onboarding-tool-surface-flip）：
+ * 存在已导入未晋升条目时才暴露 onboarding 工具（按需工具面）。
+ * 判定失败按无待整理条目降级（fail-closed）并写 stderr 日志——server 不因判定失败拒启。
+ */
+export function resolveOnboardingActive(service: { doctor(): unknown }): boolean {
+  try {
+    const d = service.doctor() as { counts?: { importItems?: { clean?: number } } };
+    return (d.counts?.importItems?.clean ?? 0) > 0;
+  } catch (err) {
+    process.stderr.write(`[cairn-mcp] onboarding 工具面判定失败，按无待整理条目降级：${String(err)}\n`);
+    return false;
+  }
+}
+
 export function createServer(home?: string): Server {
   // MCP 调用方是 Agent 通道：受作用域约束（CLI 是 user 通道，数据主权者）
   process.env['CAIRN_CHANNEL'] = 'agent';
@@ -66,21 +82,15 @@ export function createServer(home?: string): Server {
     { capabilities: { tools: {} } },
   );
 
-  function onboardingActive(): boolean {
-    // 存在已导入未晋升条目时才暴露 onboarding 工具（按需工具面）
-    try {
-      const d = service.doctor();
-      return d.counts.importItems.clean > 0;
-    } catch {
-      return false;
-    }
-  }
+  // 工具面在进程生命周期内冻结：判定只在启动时执行一次，ListTools 结果必须字节稳定。
+  // 运行中库状态翻转（另一进程 import、会话内治理动作）不得增减工具——重启（stdio 即新会话）才重估。
+  const onboardingToolsActive = resolveOnboardingActive(service);
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = [
       toolDef(
         'memory_context',
-        '返回当前上下文可用的启动/任务记忆（按作用域过滤的 active 记忆，含来源与权威级别）。仅在任务确实需要历史偏好、决策和项目事实时调用。',
+        '返回当前上下文可用的启动/任务记忆（按作用域过滤的 active 记忆，条目为有界预览）。仅在任务确实需要历史偏好、决策和项目事实时调用；需要全文时用 memory_get 取详情。',
         {
           query: { type: 'string', description: '可选的主题关键词' },
           limit: { type: 'number', description: '默认 10，上限 50' },
@@ -90,11 +100,12 @@ export function createServer(home?: string): Server {
       ),
       toolDef(
         'memory_search',
-        '按关键词检索记忆预览（不返回全文上下文注入）。',
+        '按关键词检索记忆预览（有界摘要 + 截断标记 + 原文长度，不返回全文）。两段式纪律：先看预览判断相关性，确需全文再调 memory_get 取详情（支持唯一 id 前缀与 ids 批量）。',
         {
           query: { type: 'string' },
           status: { type: 'string', description: '默认 active；candidate/conflicted 需显式' },
           limit: { type: 'number' },
+          project: { type: 'string', description: '可选项目身份（UUID 或已登记路径/git URL）；携带后项目作用域记忆可被召回。未登记的别名会报错——登记走 project_resolve。' },
           increment_usage: {
             type: 'boolean',
             description: '默认 true。宿主插件自动召回必须传 false——注入不计「被主动请求」。',
@@ -102,7 +113,12 @@ export function createServer(home?: string): Server {
         },
         ['query'],
       ),
-      toolDef('memory_get', '读取一条记忆的完整内容、修订历史与证据。', { id: { type: 'string' } }, ['id']),
+      toolDef(
+        'memory_get',
+        '读取记忆的完整内容、修订历史与证据。id 接受完整标识或唯一前缀（≥8 字符，歧义时报候选）；传 ids 数组可批量获取（上限 10，逐条作用域检查）。',
+        { id: { type: 'string' }, ids: { type: 'array', items: { type: 'string' }, description: '批量获取（上限 10）；与 id 二选一' } },
+        ['id'],
+      ),
       toolDef(
         'memory_add',
         '显式新增记忆。只在用户明确要求"记住/更正"时调用；写入内容成为 user_explicit 活动记忆。建议随写入一并给出 judgement：你已在上下文里，判断比事后复查更准，也不额外多一轮会话。',
@@ -234,7 +250,7 @@ export function createServer(home?: string): Server {
       ),
       toolDef('project_list', '列出已登记的项目及其别名（只读，不会新建项目）。', {}, []),
     ];
-    if (onboardingActive()) {
+    if (onboardingToolsActive) {
       tools.push(
         toolDef(
           'onboarding_status',
@@ -371,6 +387,24 @@ export function createServer(home?: string): Server {
   return server;
 }
 
+const PROJECT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 项目身份参数解析（add-project-scope-recall D1）：UUID 直接使用（不存在时沿用既有
+ * 静默空结果语义）；路径/URL 归一化后**只查不建**，未登记报错并指引 project_resolve。
+ * 检索保持读语义纯度：登记只发生在 project_resolve（显式动作）。
+ */
+function resolveProjectArg(service: AppService, raw: unknown): string | null {
+  if (raw == null || raw === '') return null;
+  const value = String(raw);
+  if (PROJECT_UUID_RE.test(value)) return value;
+  const found = findProjectByAlias(service.store.db, value);
+  if (!found) {
+    throw err('E_NOT_FOUND', `项目别名未登记，请先经 project_resolve 登记: ${value}`, { project: value, hint: 'project_resolve' });
+  }
+  return found;
+}
+
 async function handleTool(service: AppService, name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'memory_context': {
@@ -379,21 +413,21 @@ async function handleTool(service: AppService, name: string, args: Record<string
       if (query) {
         const r = service.search({
           text: query,
-          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId: (args['project_id'] as string) ?? null },
+          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId: resolveProjectArg(service, args['project_id']) },
           limit,
         });
         return {
           why_recalled: 'query_match',
-          items: r.results.map((h) => summarize(h.memory, { matchedBy: h.matchedBy })),
+          items: r.results.map((h) => summarize(h.memory, { matchedBy: h.matchedBy, scopePreset: h.scopePreset, syncPolicy: h.syncPolicy })),
         };
       }
-      // 无查询：返回最近更新的 active 记忆作为启动层
+      // 无查询：返回最近更新的 active 记忆作为启动层（同一 scope 行，取一次带全量条目）
       const store = service.store;
       const scope = service.resolveScope(undefined);
       const recent = store.memories.list({ scopeId: scope.id, status: 'active', limit });
       return {
         why_recalled: 'recent_active',
-        items: recent.map((m) => summarize(m, {})),
+        items: recent.map((m) => summarize(m, { scopePreset: scope.preset, syncPolicy: scope.syncPolicy })),
       };
     }
 
@@ -401,7 +435,7 @@ async function handleTool(service: AppService, name: string, args: Record<string
       const r = service.search(
         {
           text: String(args['query'] ?? ''),
-          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId },
+          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId: resolveProjectArg(service, args['project']) },
           statuses: args['status'] ? [String(args['status']) as never] : undefined,
           limit: args['limit'] != null ? Number(args['limit']) : undefined,
         },
@@ -409,10 +443,13 @@ async function handleTool(service: AppService, name: string, args: Record<string
         // （add-memory-importance-and-usage-signal D5）。
         { incrementUsage: args['increment_usage'] !== false },
       );
-      return { matchedBy: r.matchedBy, degraded: r.degraded, items: r.results.map((h) => summarize(h.memory, { matchedBy: h.matchedBy, conflictId: h.conflictId, unverifiableImport: h.unverifiableImport })) };
+      return { matchedBy: r.matchedBy, degraded: r.degraded, items: r.results.map((h) => summarize(h.memory, { matchedBy: h.matchedBy, conflictId: h.conflictId, unverifiableImport: h.unverifiableImport, scopePreset: h.scopePreset, syncPolicy: h.syncPolicy })) };
     }
 
     case 'memory_get': {
+      // 批量：ids（≤10，逐条作用域检查）；单条：id（完整或唯一前缀）。
+      const ids = Array.isArray(args['ids']) ? (args['ids'] as unknown[]).map((x) => String(x)) : null;
+      if (ids) return service.showMemories(ids);
       return service.showMemory(String(args['id']));
     }
 
@@ -720,10 +757,11 @@ function summarize(
     content: string;
     scopeId: string;
     updatedAt: string;
+    sensitivity?: string;
     importance?: number | null;
     usageCount?: number;
   },
-  extra: { matchedBy?: string; conflictId?: string; unverifiableImport?: boolean },
+  extra: { matchedBy?: string; conflictId?: string; unverifiableImport?: boolean; scopePreset?: string; syncPolicy?: string },
 ): unknown {
   return {
     id: m.id,
@@ -736,7 +774,18 @@ function summarize(
     // 不带出来就只能显示内容（add-memory-importance-and-usage-signal tasks 8.2.3）。
     importance: m.importance ?? null,
     usage_count: m.usageCount ?? 0,
-    content: m.content,
+    // 作用域边界属性随条目带出（add-memory-scope-visibility）：人读 preset 名 +
+    // 敏感度 + 同步策略，让插件注入闸与面板徽章不靠猜。scope 行缺失时字段缺省
+    // （JSON 序列化丢 undefined 键）——插件闸对缺失字段按不可注入处理（fail-closed）。
+    sensitivity: m.sensitivity ?? 'normal',
+    scope_preset: extra.scopePreset,
+    sync_policy: extra.syncPolicy,
+    // add-two-stage-memory-recall：列表条目返回有界预览而非全文（spec scoped-retrieval
+    // 「检索列表返回有界预览而非全文」）；全文只经 memory_get。
+    ...(() => {
+      const pv = memoryPreview(m.content);
+      return { preview: pv.preview, truncated: pv.truncated, content_length: pv.contentLength };
+    })(),
     ...(extra.matchedBy ? { matched_by: extra.matchedBy } : {}),
     ...(extra.conflictId ? { conflict_id: extra.conflictId } : {}),
     ...(extra.unverifiableImport ? { unverifiable_import: true } : {}),

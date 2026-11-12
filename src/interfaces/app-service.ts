@@ -13,7 +13,7 @@ import {
   EvidenceInput,
   MEMORY_KINDS,
 } from '../core/types.js';
-import { err, ExitCode } from '../core/errors.js';
+import { err, isCairnError, CairnError, ExitCode } from '../core/errors.js';
 import { readAuditConfig, AuditConfig, AuditDetail } from '../store/audit.js';
 import { contentHash } from '../core/hash.js';
 import { scopeAllowsUpstream, scopeAllowsRead } from '../core/scope.js';
@@ -697,7 +697,49 @@ export class AppService {
     return { memory: out };
   }
 
-  showMemory(id: string): MemoryDetail {
+  /**
+   * 记忆 id 解析：完整 id 直接使用；前缀必须唯一且 ≥8 字符，歧义时报候选完整标识
+   * （add-two-stage-memory-recall D3）——绝不猜测取其一。
+   */
+  private resolveMemoryId(idOrPrefix: string): string {
+    if (idOrPrefix.length >= 36) return idOrPrefix;
+    if (idOrPrefix.length < 8) {
+      throw err('E_VALIDATION', '记忆标识前缀至少 8 个字符', { id: idOrPrefix });
+    }
+    const rows = this.store.db.all("SELECT id FROM memory WHERE id LIKE ? || '%'", idOrPrefix) as { id: string }[];
+    if (rows.length === 1) return rows[0]!.id;
+    if (rows.length === 0) {
+      throw err('E_NOT_FOUND', `记忆不存在: ${idOrPrefix}`);
+    }
+    throw err('E_VALIDATION', '记忆标识前缀命中多条，请用更长的前缀', { id: idOrPrefix, candidates: rows.map((r) => r.id) });
+  }
+
+  /**
+   * MCP memory_get 批量：逐条解析与作用域检查。不可读 / 不存在 / 前缀歧义的条目
+   * 显式标记（readable:false 或 error），MUST NOT 返回其正文或任何可推断内容
+   * （spec scoped-retrieval「详情读取支持唯一前缀与批量」）。
+   */
+  showMemories(ids: string[]): { results: unknown[] } {
+    if (ids.length > 10) {
+      throw err('E_VALIDATION', '批量获取上限 10 条', { count: ids.length });
+    }
+    const startedAt = Date.now();
+    const results = ids.map((raw) => {
+      try {
+        const id = this.resolveMemoryId(raw);
+        return { id, ...(this.showMemory(id) as unknown as Record<string, unknown>) };
+      } catch (e) {
+        if (!isCairnError(e)) throw e;
+        const ce = e as CairnError;
+        return { id: raw, readable: false, error: ce.code, message: ce.message, ...(ce.details ?? {}) };
+      }
+    });
+    this.recordOperation('memory_get', { type: 'memory_batch' }, { count: ids.length, ms: Date.now() - startedAt });
+    return { results };
+  }
+
+  showMemory(idOrPrefix: string): MemoryDetail {
+    const id = this.resolveMemoryId(idOrPrefix);
     const startedAt = Date.now();
     const store = this.store;
     const memory = store.memories.require(id);

@@ -98,6 +98,16 @@ function findOwner(db: CairnDb, value: string): ProjectSummary | null {
   return listProjects(db).find((p) => p.aliases.includes(value)) ?? null;
 }
 
+/**
+ * 只查不建：归一化别名（路径/URL）→ 项目 id；未登记返回 null，绝不创建项目行
+ * （add-project-scope-recall D1）。登记只走 resolveProject / addAlias（显式动作），
+ * 保证检索路径保持读语义纯度。
+ */
+export function findProjectByAlias(db: CairnDb, raw: string): string | null {
+  const alias = normalizeAlias(raw);
+  return findOwner(db, alias.value)?.projectId ?? null;
+}
+
 function mapProject(r: Record<string, unknown>): ProjectSummary {
   return {
     projectId: r.id as string,

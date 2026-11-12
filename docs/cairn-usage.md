@@ -1016,3 +1016,31 @@ MCP 侧等价只读工具：`memory_audit`（支持 `category`/`action`/`since`/
 | 保留天数 | `CAIRN_AUDIT_RETENTION_DAYS` | `{"audit":{"retentionDays":90}}` | 30 |
 
 治理类目（计划/审批/写入审计）**永不**被保留期自动清理；非法配置值回落默认并在 stderr 告警。
+
+## 两段式检索：列表给预览，全文按需取（add-two-stage-memory-recall）
+
+面向 Agent 的检索工具（`memory_search` / `memory_context`）返回的条目是**有界预览**（默认 300 字符，frontmatter 感知、确定性生成），不是全文：
+
+- `preview`：单行摘要；超上限时以 `…` 结尾；
+- `truncated`：预览未覆盖全部正文时为 true；
+- `content_length`：原始正文总长（字符）。
+
+全文只经 `memory_get` 获取：
+
+- `id` 接受完整标识或**唯一前缀**（≥8 字符；歧义时报候选完整标识，绝不猜测）；
+- 传 `ids` 数组可批量（上限 10，逐条作用域检查，不可读条目只返回 `readable:false` 与错误码，不带正文）。
+
+DSH 插件的注入行格式为 `[<id 前 16 字符>|<kind>] <预览>`——模型看到「有这条记忆」后可直接用短标识调 `memory_get` 下钻。为什么是 16 字符：uuidv7 的前 12 hex 是毫秒时间戳，同一毫秒写入的记忆共享前 ≥13 字符，8 字符前缀在新建库上几乎必然歧义。
+
+诚实口径：这一改造省的是「单次检索结果的 token 与长尾全文」，不是端到端节省倍数——多数查询看预览即止时才真正省钱；若每条都跟着取全文，反而多一轮调用。
+
+## 检索携带项目身份（add-project-scope-recall）
+
+`memory_search` / `memory_context` 支持可选项目参数，使 project-global / project-device 作用域的记忆可被召回：
+
+- `project`（memory_search）/ `project_id`（memory_context）：接受项目 **UUID** 或**已登记的路径 / git URL 别名**；
+- 携带后，同项目记忆 + 无项目绑定记忆（personal-global 等）照常返回；其他项目的记忆不可见；
+- **只查不建**：未登记的别名报错并指引先走 `project_resolve`（检索路径绝不创建项目行）；
+- 携带项目身份**不放宽**其他维度：设备 / Agent / 读允许名单检查照旧，device-local 与 agent-private 的隔离不变。
+
+DSH 插件配置（cordis.patch.yml 插件条目 config）：`projectPath: '<路径或 git URL>'`——配置后插件启动时经 `project_resolve` 解析并缓存（登记语义在此），此后自动召回携带项目身份；解析失败**降级**为不带项目召回并在面板状态卡如实提示（「降级：<原因>」），personal-global 记忆不受影响。未配置时行为与从前完全一致。

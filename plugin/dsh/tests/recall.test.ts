@@ -13,6 +13,7 @@ import {
   filterInjectable,
   renderInjection,
   shouldInject,
+  toRecallHit,
   type RecallHit,
 } from '../src/recall.js';
 
@@ -76,12 +77,12 @@ describe('shouldInject：开关与语义门槛', () => {
 });
 
 describe('filterInjectable：注入前的最后一道闸', () => {
-  it('剔除 sensitive 与 local_only，保留普通记忆', () => {
+  it('剔除 sensitive 与 local_only，保留普通记忆（闸要求标签齐全：fail-closed）', () => {
     const hits = [
-      hit('a', '普通内容'),
-      hit('b', '敏感内容', { sensitivity: 'sensitive' }),
-      hit('c', '本机内容', { syncPolicy: 'local_only' }),
-      hit('d', 'blocked 内容', { sensitivity: 'blocked' }),
+      hit('a', '普通内容', { sensitivity: 'normal', syncPolicy: 'encrypted' }),
+      hit('b', '敏感内容', { sensitivity: 'sensitive', syncPolicy: 'encrypted' }),
+      hit('c', '本机内容', { sensitivity: 'normal', syncPolicy: 'local_only' }),
+      hit('d', 'blocked 内容', { sensitivity: 'blocked', syncPolicy: 'encrypted' }),
     ];
     const out = filterInjectable(hits);
     assert.deepEqual(out.map((h) => h.id), ['a']);
@@ -179,5 +180,108 @@ describe('includedIds：不靠文本反推（2026-11-02 两次踩坑）', () => 
 
   it('空命中时 includedIds 为空数组', () => {
     assert.deepEqual(renderInjection([], { budgetBytes: 1024 }).includedIds, []);
+  });
+});
+
+describe('注入闸：基于真实元数据过滤 + fail-closed（add-memory-scope-visibility）', () => {
+  const full = (extra: Partial<RecallHit> = {}): RecallHit => ({
+    id: 'm1', kind: 'fact', content: '内容', sensitivity: 'normal', syncPolicy: 'encrypted', ...extra,
+  });
+
+  it('normal + encrypted 放行', () => {
+    assert.equal(filterInjectable([full()]).length, 1);
+  });
+
+  it('敏感（sensitive/blocked）拦截', () => {
+    assert.equal(filterInjectable([full({ sensitivity: 'sensitive' })]).length, 0);
+    assert.equal(filterInjectable([full({ sensitivity: 'blocked' })]).length, 0);
+  });
+
+  it('local_only 拦截', () => {
+    assert.equal(filterInjectable([full({ syncPolicy: 'local_only' })]).length, 0);
+  });
+
+  it('字段缺失宁可漏注不错注（fail-closed）：缺 sensitivity 拦截', () => {
+    assert.equal(filterInjectable([full({ sensitivity: undefined })]).length, 0);
+  });
+
+  it('字段缺失宁可漏注不错注（fail-closed）：缺 syncPolicy 拦截', () => {
+    assert.equal(filterInjectable([full({ syncPolicy: undefined })]).length, 0);
+  });
+});
+
+describe('toRecallHit：线协议 → RecallHit 显式映射（add-memory-scope-visibility）', () => {
+  it('snake_case 字段映射到 camelCase（sync_policy/scope_preset）', () => {
+    const h = toRecallHit({
+      id: 'm1', kind: 'fact', content: '内容', scopeId: 'uuid-1',
+      scope_preset: 'personal-global', sensitivity: 'normal', sync_policy: 'encrypted',
+      importance: 3, usage_count: 2,
+    });
+    assert.ok(h);
+    assert.equal(h!.scopePreset, 'personal-global');
+    assert.equal(h!.syncPolicy, 'encrypted');
+    assert.equal(h!.sensitivity, 'normal');
+    assert.equal(h!.scopeId, 'uuid-1');
+    assert.equal(h!.importance, 3);
+    assert.equal(h!.usageCount, 2);
+  });
+
+  it('字段缺失按缺省（undefined/0/null），闸随后 fail-closed', () => {
+    const h = toRecallHit({ id: 'm2', kind: 'fact', content: '旧内核返回' });
+    assert.ok(h);
+    assert.equal(h!.syncPolicy, undefined);
+    assert.equal(h!.scopePreset, undefined);
+    assert.equal(h!.usageCount, 0);
+    assert.equal(h!.importance, null);
+    assert.equal(filterInjectable([h!]).length, 0, '缺标签 → 不可注入');
+  });
+
+  it('无 id 或非对象返回 null', () => {
+    assert.equal(toRecallHit({ kind: 'fact' }), null);
+    assert.equal(toRecallHit(null), null);
+    assert.equal(toRecallHit('字符串'), null);
+  });
+});
+
+describe('注入行携带记忆标识（add-two-stage-memory-recall）', () => {
+  it('注入行以 [id16|kind] 开头，includedIds 仍是完整 id', () => {
+    const fullId = '018f1a2b-3c4d-7e8f-9a0b-1c2d3e4f5a6b';
+    const rendered = renderInjection(
+      [hit(fullId, '投影预算是 2KB', { sensitivity: 'normal', syncPolicy: 'encrypted' })],
+      { budgetBytes: 1536 },
+    );
+    // 16 字符：uuidv7 同毫秒写入共享前 ≥13 字符，8 字符前缀在新建库上必然歧义
+    assert.match(rendered.text, /\[018f1a2b-3c4d-7e\|fact\]/, `注入行应含 16 字符标识，实际：${rendered.text}`);
+    assert.equal(rendered.includedIds[0], fullId, '去重键仍是完整 id');
+  });
+
+  it('预算裁剪把标识开销算进去', () => {
+    const fullId = '018f1a2b-3c4d-7e8f-9a0b-1c2d3e4f5a6b';
+    // 内容很长：行 = 表头 + [id8|fact] + 160 字内容，总字节 > 预算时裁剪
+    const rendered = renderInjection(
+      [hit(fullId, '长'.repeat(400), { sensitivity: 'normal', syncPolicy: 'encrypted' })],
+      { budgetBytes: 100 },
+    );
+    assert.equal(rendered.includedIds.length, 0, '预算装不下一行就不注入');
+  });
+});
+
+describe('toRecallHit：预览线协议（add-two-stage-memory-recall）', () => {
+  it('preview 映射为 content，content_length/truncated 不进命中形状', () => {
+    const h = toRecallHit({
+      id: 'm1', kind: 'fact', preview: '这是预览文本', truncated: true, content_length: 1234,
+      scope_preset: 'personal-global', sensitivity: 'normal', sync_policy: 'encrypted',
+    });
+    assert.ok(h);
+    assert.equal(h!.content, '这是预览文本');
+    assert.equal(h!.syncPolicy, 'encrypted');
+    assert.equal(h!.scopePreset, 'personal-global');
+    assert.ok(!('truncated' in h) && !('content_length' in h), '命中形状不携带截断元数据');
+  });
+
+  it('preview 缺失时 content 为空串（不炸）', () => {
+    const h = toRecallHit({ id: 'm2', kind: 'fact', sensitivity: 'normal', sync_policy: 'encrypted' });
+    assert.ok(h);
+    assert.equal(h!.content, '');
   });
 });

@@ -35,6 +35,8 @@ window.__ModuleLoader__.load({
         // 本会话累计注入（去重）。老宿主没有这个字段 → 退回本轮列表，面板不至于空掉。
         sessionInjected: Array.isArray(d.sessionInjected) ? d.sessionInjected : null,
         session: typeof d.session === 'string' ? d.session : '',
+        // 项目身份状态（add-project-scope-recall）：老宿主没有这个字段 → null（不渲染）。
+        project: d.project && typeof d.project === 'object' ? d.project : null,
       };
     }
 
@@ -172,6 +174,40 @@ window.__ModuleLoader__.load({
     }
 
     var KIND_LABEL = { recall: '自动召回', tool: '工具调用' };
+
+    // 作用域徽章（add-memory-scope-visibility）：每条注入记忆显示它属于哪个作用域。
+    // device 类用警示色（内容不出本机），project 类另一色调——一眼分清「这条会跨设备」。
+    // 老宿主不带 scope 字段 → 不渲染徽章，布局不受影响。
+    var SCOPE_TONE = {
+      'personal-global': 'rgba(127,190,255,.26)',
+      'device-local': 'rgba(255,122,110,.30)',
+      'project-global': 'rgba(140,220,160,.26)',
+      'project-device': 'rgba(140,220,160,.20)',
+      'agent-private': 'rgba(200,170,255,.26)',
+      'session-ephemeral': 'rgba(180,180,180,.22)',
+    };
+    function scopeBadge(scope, key) {
+      if (!scope || typeof scope !== 'string') return null;
+      return h('code', {
+        key: key || scope,
+        title: '作用域：' + scope + (scope.indexOf('device') >= 0 ? '（不出本机）' : scope === 'personal-global' ? '（跨设备同步）' : ''),
+        style: {
+          flex: 'none', fontSize: 10, lineHeight: 1.4, padding: '1px 5px', borderRadius: 999,
+          background: SCOPE_TONE[scope] || 'rgba(150,150,150,.22)',
+        },
+      }, scope);
+    }
+    /** 一次注入条目涉及的作用域集合（去重、保序），供活动记录行内联展示。 */
+    function entryScopes(e) {
+      if (!Array.isArray(e.items)) return [];
+      var seen = {};
+      var out = [];
+      for (var i = 0; i < e.items.length; i++) {
+        var s = e.items[i] && typeof e.items[i].scope === 'string' ? e.items[i].scope : '';
+        if (s && !seen[s]) { seen[s] = 1; out.push(s); }
+      }
+      return out;
+    }
     /**
      * 活动条目的稳定键：折叠会刷新 t，所以有 firstT 时用它——否则用户点选高亮后，
      * 下一次轮询的折叠会把键改掉，选中项跳走。
@@ -309,6 +345,13 @@ window.__ModuleLoader__.load({
         ['预算占用', data.bytesUsed + ' / ' + data.bytesBudget + ' B'],
         ['被过滤', String(data.filteredCount)],
       ];
+      // 项目身份（add-project-scope-recall）：配置了 projectPath 才渲染。
+      // ok → 已解析；degraded → 降级原因如实展示（MUST NOT 静默假装带了项目）。
+      if (data.project && data.project.status === 'ok') {
+        rows.push(['项目', '已解析 ' + String(data.project.id || '').slice(0, 8)]);
+      } else if (data.project && data.project.status === 'degraded') {
+        rows.push(['项目', '降级：' + (data.project.reason || '解析失败')]);
+      }
 
       function chip(labelText, active, onClick) {
         return h('button', {
@@ -408,6 +451,7 @@ window.__ModuleLoader__.load({
                       },
                     },
                       h('code', { style: { flex: 'none', opacity: .65, fontSize: 11 } }, m.kind || '?'),
+                      scopeBadge(m.scope, 'scope-' + (m.id || i)),
                       h('span', { title: m.id, style: { minWidth: 0, overflowWrap: 'anywhere' } }, m.summary || ''));
                   })),
             // 口径行：左栏是累计去重集合，右栏是每一步（含折叠后的多次）——两个数字不是一回事。
@@ -513,6 +557,10 @@ window.__ModuleLoader__.load({
                         : null,
                       filters.detail === 'full'
                         ? h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, displaySummary(e))
+                        : null,
+                      selectable && entryScopes(e).length > 0
+                        ? h('span', { style: { flex: 'none', display: 'flex', gap: 4, alignItems: 'baseline' } },
+                            entryScopes(e).map(function (s, j) { return scopeBadge(s, 'es-' + j); }))
                         : null,
                       selectable
                         ? h('span', { 'aria-hidden': true, style: { flex: 'none', opacity: on ? .9 : .35, fontSize: 11 } }, on ? '◉' : '○')

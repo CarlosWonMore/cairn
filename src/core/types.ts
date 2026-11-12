@@ -147,6 +147,10 @@ export interface SearchResultRecord {
   /** 未验证导入不得显示为用户确认事实（spec agent-onboarding） */
   unverifiableImport: boolean;
   expired: boolean;
+  /** 命中记忆的人读作用域名（scope 表 preset）；作用域行缺失时缺省（add-memory-scope-visibility）。 */
+  scopePreset?: string;
+  /** 命中记忆作用域的同步策略（决定能否出本机）。 */
+  syncPolicy?: string;
 }
 
 // ---------------------------------------------------------------------------

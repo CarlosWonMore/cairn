@@ -14,6 +14,8 @@ export interface InjectedMemory {
   kind: string;
   /** 摘要，不超过 60 字符，单行。 */
   summary: string;
+  /** 人读作用域名（如 personal-global）；老版本宿主可能不带，徽章按缺省渲染。 */
+  scope?: string;
 }
 
 export interface RecallUsage {
@@ -72,8 +74,8 @@ export function toSummary(content: string, max = SUMMARY_MAX): string {
 export interface BuildUsageInput {
   /** 过滤前的候选数。 */
   candidates: number;
-  /** 过滤后的安全条目。 */
-  injectable: { id: string; kind: string; content: string }[];
+  /** 过滤后的安全条目（scope = 人读作用域名，可选）。 */
+  injectable: { id: string; kind: string; content: string; scope?: string }[];
   /** 实际进入文本的 id。 */
   injectedIds: string[];
   matchedBy: string;
@@ -133,11 +135,11 @@ export function buildUsage(input: BuildUsageInput): RecallUsage {
 }
 
 function injectableToInjected(
-  items: { id: string; kind: string; content: string }[],
+  items: { id: string; kind: string; content: string; scope?: string }[],
   injectedIds: string[],
 ): InjectedMemory[] {
   const allow = new Set(injectedIds);
   return items
     .filter((i) => allow.has(i.id))
-    .map((i) => ({ id: i.id, kind: i.kind, summary: toSummary(i.content) }));
+    .map((i) => ({ id: i.id, kind: i.kind, summary: toSummary(i.content), scope: i.scope }));
 }

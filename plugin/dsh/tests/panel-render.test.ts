@@ -220,3 +220,58 @@ describe('记忆面板渲染结构（左右两栏，2026-11-02）', () => {
     assert.ok(texts.join('\n').includes('本会话还没有注入过记忆'), '空态必须有文案');
   });
 });
+
+describe('作用域徽章（add-memory-scope-visibility）', () => {
+  const WITH_SCOPE = {
+    ...BASE,
+    injected: [{ id: 'm1', kind: 'fact', summary: '投影预算是 2KB', scope: 'personal-global' }],
+    sessionInjected: [{ id: 'm1', kind: 'fact', summary: '投影预算是 2KB', scope: 'personal-global' }],
+    recent: [{
+      t: '2026-11-02T04:36:09.916Z',
+      kind: 'recall',
+      summary: '自动召回 候选5 注入1',
+      items: [{ id: 'm1', kind: 'fact', summary: '投影预算是 2KB', scope: 'personal-global' }],
+    }],
+  };
+
+  it('左栏注入条目显示作用域徽章', () => {
+    const { texts } = collect(renderPanel(WITH_SCOPE).tree);
+    assert.ok(texts.includes('personal-global'), '左栏条目应渲染作用域徽章');
+  });
+
+  it('右栏活动记录行内联展示该次注入涉及的作用域（左栏 + 右栏各一次）', () => {
+    const { texts } = collect(renderPanel(WITH_SCOPE).tree);
+    assert.ok(texts.filter((t) => t === 'personal-global').length >= 2, '左栏条目 + 右栏记录都要出现');
+  });
+
+  it('device-local 徽章渲染不炸（警示分支）', () => {
+    const d = { ...WITH_SCOPE, sessionInjected: [{ id: 'm2', kind: 'fact', summary: '本机缓存配置', scope: 'device-local' }] };
+    const { texts } = collect(renderPanel(d).tree);
+    assert.ok(texts.includes('device-local'));
+  });
+
+  it('老宿主无 scope 字段时不渲染徽章', () => {
+    const { texts } = collect(renderPanel(BASE).tree);
+    assert.equal(texts.filter((t) => t === 'personal-global' || t === 'device-local').length, 0);
+  });
+});
+
+describe('项目身份状态（add-project-scope-recall）', () => {
+  it('project.status=ok 渲染「已解析 + 短标识」', () => {
+    const d = { ...BASE, project: { status: 'ok', id: 'proj-uuid-1234-5678', path: 'D:/proj/x' } };
+    const { texts } = collect(renderPanel(d).tree);
+    assert.ok(texts.includes('项目'), '状态卡出现项目行');
+    assert.ok(texts.some((t) => t.startsWith('已解析')), 'ok → 已解析（短标识同行）');
+  });
+
+  it('project.status=degraded 如实展示降级原因，MUST NOT 假装正常', () => {
+    const d = { ...BASE, project: { status: 'degraded', reason: 'resolve boom', path: 'D:/proj/broken' } };
+    const { texts } = collect(renderPanel(d).tree);
+    assert.ok(texts.some((t) => t.indexOf('降级：resolve boom') >= 0), `应有降级原因，实际 ${texts.join('|')}`);
+  });
+
+  it('project.status=off（老宿主/未配置）不渲染项目行', () => {
+    const { texts } = collect(renderPanel(BASE).tree);
+    assert.equal(texts.includes('项目'), false);
+  });
+});

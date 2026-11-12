@@ -888,3 +888,162 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 - **为什么 400 而不是 403**：403 已被「不是备份对象」占据，客户端把它映射为 `syncd_delete_not_backup`；目录形 key 是 API 使用错误而非授权拒绝，400 不会把两类拒绝混成一条。
 - **证据**：`tests/sync/syncd-purge.test.ts` 追加 2 条（目录形 key 被拒 + 目录内容不动 + `/healthz` 200；同进程随后仍能正常删备份文件），既有 9 条断言未动。`npm test` = **808 / 807 / 0 / 1**（基线 806/805/0/1）；`npm run typecheck` 0 错；`openspec validate add-syncd-purge --strict` 通过。符号链接另用临时探针验证：400，链接与目标均存活，healthz 200。
 - **未做**：ECS 未重新部署（任务明令禁止）。生产仍是旧版，部署前该路径仍可被持有 token 者触发一次重启。
+
+---
+
+## 2026-11-12 追加：41.47 积分溯源 → 缓存失效机制 → 两条修复线
+
+### 一笔账的精确复现（不再依赖云端明细）
+
+41.47 积分不是估算，是逐 token 复算到小数点后两位：
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 未缓存输入 | 690,601 | session-e74e3ab7 seq 7764 的 usage |
+| 命中缓存 | 0（整个 surface 全冷） | 同上，无 cacheReadTokens 键 |
+| 输出 | 146 | 同上 |
+| 单价（工作日 09:00–12:00 高峰原价） | 0.06005 积分/K | 目录 creditMultiplier 0.11 + 夜间折扣规则 |
+| 算式 | 690601 × 0.06005 ÷ 1000 = **41.471** | — |
+
+同会话另两笔同样对得上：19.78（656,191 × 0.0000301，周三晚非高峰半价）、17.89（606,550 × 0.0000295）。明细导出 request-usage-2026-11-12 (1).xlsx 的六列里没有 token 字段，所以这条链只能从本机会话日志算——已算通。
+
+### 根因：前置缓存按「前缀逐字节」匹配，system 段是第 0 号节点
+
+DSH 的 request/header 只覆盖 call config + 工具 schema；系统提示词是 surface 节点 0，不进 header。服务端缓存命中要求前缀逐字节一致，因此「工具说明 / MCP 声明 / skills 一变 → 节点 0 重写 → 从第一个变化 token 起全部 miss」，整包按原价重算。
+
+决定性对照（同一会话、同一材料包量级，只差 system 变没变）：
+
+| 间隔 | surface | 缓存命中 |
+|---|---|---|
+| 6.55 h | 622,067 | **99.8%** |
+| 4.40 h | 635,093 | **99.7%** |
+| 2.74 h | 638,091 | **99.9%** |
+| **12.02 h** | 690,747 | **0.0%**（system/message seq 7758 刚换过版本） |
+
+全库 4,048 次大请求分组：提示词变过 13 次，中位命中 1.9%；没变 4,035 次，中位命中 99.8%。「隔夜必冷」被推翻——09:20 那次冷了，是因为 11-12 00:23:18 的 session/end-seed + 00:24 的 dsh-ops 升级把工具说明换掉了，不是时间。「缓存 TTL 过期」（上游文档：不再使用后数小时到数天清理）是另一条独立成因，本库只占 157.9 / 393 积分。
+
+### 全量账（scripts/session_cache_audit.py，可复跑）
+
+11 个会话 / 8,600+ 次请求，命中率 97–99%；28 条「整包 re-bill」合计约 529 积分，按 fork 去重后 **23 条 / 393.2 积分**：prompt-changed 235.4 + cache-expired 157.9。11-02 15:22 的 45.49 是全库最大一次，机制与 41.47 完全相同。
+
+### 上游是否已知
+
+- deepseek-ai/deepseek-harness：Issues 关闭（has_issues: false），只有 Discussions（68 条），搜 cache / 积分 / token / compaction 零命中——没有报障入口，不等于没问题。
+- 行为在 DSH 自带文档里写死，且有官方开关：声明 systemPromptUpdate 为 in-history 时，agent loop 把变化后的提示词追加到已缓存历史之后，前缀仍可复用。官方 llm-deepseek 对 deepseek-flash 默认声明了该模式。
+- dsh-llm-pi-ai 的判定链：conversationUpdates(model) → compat.supportsMidConvoSystemMessages → systemPromptUpdate: in-history。**WorkBuddy 适配器从未声明这个 compat 位**（全目录 0 命中），所以走的是「原地重写节点 0」。
+- 社区同源证据：dingminhua/dsh-connect-workbuddy#231（缓存命中率极低）作者回复里给出同样的机制表，第 2 条正是「工具注册表中途增删改写 system 段，整段前缀失效」，实测「7 个 system 版本，相邻 turn 直接归零」；#184 的 14,543 次取证里也有同一条。姊妹适配器（jojoman / sixzjd / chengshenyangtai）同样都没声明。
+
+### 方向 1（治本）：让 WorkBuddy 路由声明 in-history —— 已落地并在真实上游验证
+
+1. **上游语义验证**（scripts/probe-workbuddy-inhistory.mjs，真实账号、约 3.4k token 前缀）：S1 说 ALPHA、S2 说 ZULU；请求 system(S1) + 对话 + system(S2) + 提问，模型答 **ZULU**（三次全中），而只用 S1 的对照组答 ALPHA ⇒ 上游确实把任意位置的最新 system 当生效提示词。
+2. **缓存收益验证**：同一形状连发，prompt_cache_hit_tokens 从 49% → 93% → 93%（第一章必然冷，之后整段复用）；把 S2 换成真正重写头节点则退化。⇒ 声明 in-history 只赚不亏。
+3. **补丁**：scripts/patch-workbuddy-inhistory.mjs（幂等，锚点唯一性校验，--enable / --revert / --status，先备份 .bak-inhistory）。改动只有一行：compat 增加 supportsMidConvoSystemMessages: true。node --check 通过；enable → status → revert → status → enable 往返验证通过，当前**已启用**。
+
+**生效条件（重要）**：适配器是 ESM，进程启动时已加载；touch cordis.patch.yml 让 HMR 重组合，日志可见 pluginId: include:dsh-connect-workbuddy 的状态迁移。**下次新会话的第一个请求**才会在 request/context 里出现 systemPromptUpdate: in-history——那一条就是生效凭据（现有会话的 request/context 只有 provider / model / contextWindow）。适配器升级会覆盖 lib/index.js，需重跑补丁。
+
+**回滚**：node scripts/patch-workbuddy-inhistory.mjs --revert。风险面只有一个——若上游某天改回「只读头节点」，模型会继续按旧提示词运行（比多花钱更糟），所以已把语义探针留成脚本，随时可复验。
+
+### 方向 2（零成本，已执行）：把「改工具声明」挪到会话边界
+
+不升级任何会改 system 段的东西（dsh-ops / cairn 插件 / MCP server）之后再接着旧长会话说话——升级完开新会话。41.47 的直接推手就是「夜里升级 + 第二天接着 690k 的旧会话」。这条不需要改任何代码，收益在 235.4 积分那一档。
+
+配套三条使用纪律：
+
+1. 长会话不要跨天摊着；要接续用交接文档开新会话（本项目 docs/handoff-*.md 就是对的用法）。
+2. /compact 本身是一次几十万 token 的请求，不是免费午餐——别拿它当省钱的默认动作。
+3. 无法避免的大请求放到非高峰（工作日 09:00–12:00 / 14:00–18:00 之外 5 折），41.47 同样体量在晚上约 20.7。
+
+
+### 上游 PR（2026-11-12 提）
+
+- **https://github.com/dingminhua/dsh-connect-workbuddy/pull/244** —— 在 `toPiModel` 的 `compat` 增加 `supportsMidConvoSystemMessages: true`，附回归测试（每个模型描述符必须带该标志，变异验证会红）、CHANGELOG 与两处随之更新的旧注释。5 文件 +61/−4，`mergeable: true`，仓库无 CI workflow 所以没有 check-run。
+- 分支：`CarlosWonMore:work/prompt-cache-inhistory`；提交 `42f3b82`。本地验证：`typecheck` 0、`build` 通过（6 artifacts）、`check-pii` clean、`vitest run tests/adapter.spec.ts` 27/27。全量 suite 在**未改动主干上同样失败** 3 条（`pool-e2e` / `issue12-region-hiding` 等不稳定用例，单独跑都过），已在 PR 正文里如实说明。
+- **本机仍用本地补丁而不是等上游**：`scripts/patch-workbuddy-inhistory.mjs` 已启用（`patched: true`）。上游合入并发布后，跑一次 `--revert` 去掉本地补丁即可，避免两处重复。
+
+- **https://github.com/dingminhua/dsh-connect-workbuddy/pull/245** —— 第二版：把测量工具正式化。`scripts/audit-prompt-cache.mjs`（离线扫全会话日志，按 `prompt-changed` / `cache-expired` 归因，未给单价只报 token）、`scripts/probe-mid-convo-system.mjs`（实测网关是否读历史之后的 system，打印 ZULU/ALPHA 判据）、`tests/audit-prompt-cache.spec.ts`（10 例，含「首轮不算」与多帧 zstd 解码的静默错误）、`docs/PROMPT-CACHE.md`。分支 `work/prompt-cache-tooling`，提交 `5099896`。
+- 本机实跑数据（13 个日志 / 5,619 次请求）：23 次重算、9,874,221 未缓存 token = `prompt-changed` 6,081,160 + `cache-expired` 3,793,061；按 0.06005/1k 与非高峰 ×0.5 折合 393.2 积分。
+- 网关 in-history 实测（CN 区，deepseek-v4.1-flash）：`A head S1` 92% 答 ALPHA；`C mid system` 答 ZULU、warm 96% —— 语义与缓存两侧同时成立。
+### 责任划分（对上一轮结论的修正）
+
+| 组件 | 结论 |
+|---|---|
+| **工作区工具/插件声明变更** | **直接触发**——改时机即可，不用改代码 |
+| **dsh-connect-workbuddy** | **主责（机会成本）**：缺一个 compat 声明，让本可避免的整包重算发生；一行可补 |
+| DSH 本体 | 无责：行为在文档里写死，官方适配器已声明该能力 |
+| cairn 记忆插件 | **间接**：注入本身是追加式（agent/inbox/spliced 往 next-step 尾部插，不动前缀，已核日志），不破坏缓存；11-11 两次插件改动各触发一次 17.89 / 19.78，那是「改工具声明」的代价，不是「读记忆」的代价 |
+| cairn MCP | 无关：本地 stdio，不产生请求 |
+| WorkBuddy 计费 | 不是 bug：按未缓存输入计费 |
+
+---
+
+## 2026-11-12 追加：三问调研——缓存×召回注入、作用域可见性、claude-mem 式两级检索
+
+背景：用户三问（① 召回是否影响缓存命中 ② DSH 面板加作用域标签 ③ 参考 claude-mem 做两级检索）。全量代码逐行考古 + claude-mem 文档站/issues 调研 + 三家供应商缓存官方文档。**提案未启动，等用户确认 P1–P4。**
+
+### 问题一结论：召回/注入不影响缓存命中，追加式双重坐实
+
+- **代码级**（本次逐行核实，修正上节「agent/inbox/spliced」的机制描述）：DSH 插件注入走宿主 `agent.inject()` **追加一条 user 消息**（`plugin/dsh/src/index.ts:1113-1119`，形 `{role:'user', source:{kind:'cairn-memory-injection'}}`，带随机 id 满足宿主重放校验）。全插件仅两处 inject 调用点，均追加，无任何改写/删除历史路径；注入文本无时间戳（recall.ts:104-106「同输入同字节」）；会话去重保证同 id 只注一次、每轮只注新命中；唯一「重组」是压缩后重注入一次，仍是追加。
+- **供应商机制**（官方文档）：DeepSeek 自动前缀缓存，命中价≈未命中 1/30–1/50，TTL 数小时到数天（api-docs.deepseek.com/guides/kv_cache）；GLM/ZAI 隐式缓存自动触发，官方明文「对话历史采用追加而非改写」（docs.z.ai/guides/capabilities/cache；GLM-5.3-Flash 无专门文档，按同页口径，命中价约 50% 标注不确定）；Anthropic 层级失效明文（tools→system→messages，某层变更该层及其后全失效）。判据：**每轮往对话末尾追加此后不变的块=中性偏正面；改写 system/历史中部=改写点之后全 miss**。
+- 上节实测不变：4,048 次大请求，prompt 未变 4,035 次中位命中 99.8%。
+
+### 本次代码考古的四个新发现（提案的事实基础，均已抽查核实）
+
+1. **`memory_search` 名为预览实为全文直出**：工具描述写「不返回全文上下文注入」，实际 `summarize()` 返回 `content: m.content` 未截断（`src/interfaces/mcp/server.ts:714-744`）。ZCode/WorkBuddy 里模型显式检索一次拉回 N 条全文进对话。截断只在消费端（注入行 160 字 recall.ts:68、面板 60 字 usage-state.ts:35、brief 120 字）。
+2. **插件 `filterInjectable` 是空转的最后一道闸**：它检查 `sensitivity !== 'normal'` 与 `syncPolicy === 'local_only'`（recall.ts:59-65），但 MCP 返回 item 根本不含这两个字段 → 恒通过。敏感/local_only 过滤完全依赖服务端 `scopeAllowsRead` 单层。
+3. **注入行不带 id**：渲染只有 `[kind] + firstLine≤160字`（recall.ts:130），模型看到「有这条记忆」却无法按 id 调 `memory_get` 下钻——claude-mem 式 progressive disclosure 的关键缺口。
+4. **项目作用域对检索不可见**：`memory_search` 不传 projectId（server.ts:403-404），`scopeAllowsRead` 对 `scope.projectId != null` 直接判 false（core/scope.ts:243）→ project-global/project-device 记忆永远不会出现在 memory_search 与 DSH 自动召回里（只有 memory_context 带 project_id 可查）。面板加徽章也救不了这条。
+
+另有：**`onboardingActive()` 使 ListTools 工具集合随 import 条目数 0↔>0 翻转**（server.ts:237-307, 69-77）——不升级不重启的唯一 schema 变化向量；若宿主会话中途重拉 ListTools 且翻转发生，即 prompt-changed 整包重算。受管投影块（cairn:begin）改写只影响之后新开的会话，不跨轮。scopeId 是 uuidv7（scopes.ts:121），preset 人读名只能从 scope 表 JOIN 得来（memory_get 的完整 scope 行才带，app-service.ts:728）。
+
+### 问题三对比 claude-mem（thedotmack/claude-mem，Apache-2.0，116k stars，极度活跃）
+
+- 已达标不必抄：FTS5 trigram + BM25 + LIKE 回退（claude-mem 主通道同款；其 Chroma 向量实测 5–7 CPU 秒/条且违反本项目「不下载模型」边界）；DSH 自动注入已有 1536B 预算 + 会话去重 + 追加式。
+- 值得抄：索引行带 id+类型+每条全文 token 估算（让模型自己权衡是否下钻）；「先索引后全文」纪律写进工具 description（其 `important_workflow` 常驻工具模式，零成本）；`get_observations(ids)` 批量取全文 → 对应 `memory_get` 支持批量。
+- **教训**：其 README "~10x token savings" 被 issue #4138 打掉，改口为 "per-record size ratio, not a measured saving"——没测 recall 基线。本项目口径只能是「单次检索结果 token 下降 + 下钻能力补全」，端到端节省需实测（可复用 audit 思路测 before/after）。
+- 不抄：云 LLM 压缩管线（cairn 语义判断已定给宿主 AI 层）、常驻 HTTP worker、file-read-gate 劫持宿主工具。
+
+### 待决提案（用户确认后才 /opsx:propose）
+
+- **P1 作用域可见性**（小）：`summarize()` 加 `scope_preset`（JOIN scope 表）+ `sensitivity` + `sync_policy` → usage 链路透传（index.ts `buildUsage` / usage-state.ts `InjectedMemory`）→ `client.js` 左右栏徽章。顺带修复发现 2（空转闸）。
+- **P2 两级检索**（中）：`memory_search` 返回真预览（截断 ≈200–300 字符）+ 注入行带 id + description 内嵌「先 search 后 get」纪律 + `memory_get` 批量（可选）。与 P1 同改 `summarize()`，可合并一次验证。
+- **P3 工具面冻结**（很小）：`onboardingActive()` 改为 server 进程启动时判定一次，消除运行中 schema 翻转向量。取舍：import 后需新会话才见到 onboarding 工具。
+- **P4 项目作用域检索**（中-大）：`memory_search` 加 `project_id` 参数（易）+ DSH 插件自动召回的 project 解析配置链路（需插件配置机制，大）。建议独立提案。
+- digest/summary 存储列：暂不做——无本地模型、存量 533 条多为残片、收益低；等下次 schema 重建再议。
+
+---
+
+## 2026-11-13 追加：四提案 TDD 实施（P3/P1/P2/P4，未归档等审阅）
+
+用户确认四提案全做，按 `P3→P1→P2→P4` 顺序在 ZCode 内 TDD 实施（openspec + ponytail + superpowers 流程；每变更先写红测试再实现）。**四个变更全部实现完成、validate --strict 通过，未归档**（等用户审阅后 `openspec archive`）。
+
+### 各变更落点
+
+- **P3 fix-onboarding-tool-surface-flip**：`onboardingActive()` 移出 ListTools 实时路径 → `resolveOnboardingActive(service)`（导出可测）在 createServer 启动时执行一次冻结为常量；doctor 抛错 fail-closed 降级 + stderr 日志。测试：mcp.test.ts 启动冻结/运行中翻转不变/重启重估/有条目稳定（2 例 spawn）+ 判定单测 3 例。
+- **P1 add-memory-scope-visibility**：`summarize()` 增加 `scope_preset`（JOIN scope）/`sensitivity`/`sync_policy`；检索装配（assembleResult）按命中带出；插件 `filterInjectable` 真实判定 + **fail-closed**（标签缺失→过滤，计入已过滤）；面板左右栏作用域徽章（device 类警示色调）。
+- **P2 add-two-stage-memory-recall**：`src/retrieval/preview.ts` 单点预览（300 字符、frontmatter 感知、确定性单行）替代列表全文；`memory_get` 支持唯一前缀（≥8，歧义报候选）+ 批量 ids（≤10，逐条 scopeAllowsRead，不可读 `{id,readable:false,error}`）；注入行 `[id16|kind] 预览`；工具描述内嵌两段式纪律。
+- **P4 add-project-scope-recall**：`findProjectByAlias`（只查不建）；`memory_search` 增 `project` 参数（UUID 直用/别名 find-only/未登记报错指引 project_resolve）；`memory_context.project_id` 统一同语义；插件 `projectPath` 配置懒解析（首次召回时 project_resolve 一次并缓存）+ 降级面板提示；面板状态卡项目行。
+
+### 实施期发现（已修，值得记住）
+
+1. **插件 recall 曾把 MCP 线协议条目直接当 RecallHit 用**：线协议 snake/camel 混合（`scopeId` camel、`scope_preset`/`sync_policy`/`usage_count` snake），旧代码恒读 undefined——P1 的闸即使有字段也读不到。修法：`toRecallHit()` 显式映射（recall.ts），这是「同一判断一处出处」的第三例。
+2. **uuidv7 前缀长度**：前 12 hex 是毫秒时间戳，同毫秒写入共享前 ≥13 字符——注入行标识 8 字符在新建库上必然歧义，改 16 字符（时间戳+版本+rand_a 首位）；`memory_get` 前缀仍 ≥8 但歧义报候选。教训：**id 形状决定前缀长度，不能照抄自增 id 经验**（P2 design D3 已记）。
+3. CairnError 经 MCP 走 `isError` 工具结果（不是 JSON-RPC error）——测试断言要解析 `result.content[0].text`。
+4. P1 的 fail-closed 让旧形状夹具全被正确拦截（injector 测试 22 红）——这是新契约生效的证据，夹具升级为带标签形状。
+5. 模块级 `projectInfo` 跨 apply 存活——apply 时无条件重置，防 HMR/多会话残留。
+
+### 测试基线（本轮后）
+
+- 主仓 `npm test`：**833 / 832 / 0 / 1**（上轮 818 → +15：P3 +5、P1 +2、P2 +13、P4 +8 含删改调整——以 833 为新基线）。
+- 插件 `plugin/dsh` `npm test`：**125 / 125 / 0**（上轮 115 → +10）。
+- `npm run test:e2e` PASS（人工队列两位数口径不变）；`npm run mcp:smoke` 7/7；`npm run test:ui` 66/66；`npm run typecheck` 0 错。
+- **dist 已重建**（主仓 `npm run build` + 插件 `tsc`）——下次新会话生效；工具 schema 变了（memory_get.ids、memory_search.project、描述更新），按纪律在会话边界生效即可。
+
+### 下一步
+
+1. 用户审阅四变更 → `openspec archive <name> --yes` ×4（归档顺序任意，delta 无重叠）。
+2. 归档后 `openspec validate --specs --strict` 应 10/10。
+3. P2/P4 的注入预算内 id16 开销与预览收益实测：可复用 §41 audit 思路在新会话日志上做 before/after。
+
+### 归档补记（2026-11-13）
+
+四变更归档为 `2026-11-13-fix-onboarding-tool-surface-flip` / `-add-memory-scope-visibility` / `-add-two-stage-memory-recall` / `-add-project-scope-recall`。归档后 `openspec validate --specs --strict` 一度 9/10：P1 改写后的 `记忆调用对用户可见` 正文 549 字符超 strict 上限（500）——按校验器建议**拆分**为「记忆调用对用户可见」（显示内容/三态/点选/作用域标签）与新增「面板布局与两栏交互」（两栏滚动/自适应/拖拽/记住布局），场景随语义归位，语义零增减；复验 **10/10**。这是第一条因长度上限触发的规格拆分，后续往这条需求再加段落时会再次触发——届时优先拆不要压缩措辞。
