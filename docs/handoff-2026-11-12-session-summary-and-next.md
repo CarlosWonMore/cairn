@@ -29,7 +29,7 @@
 | `npm run test:ui` | **66/66**（原 46，新增修订提案视图点击链路 + 静态页无控件断言） |
 | `npm run typecheck` | 0 错误 |
 | `openspec validate --specs --strict` | 10/10 |
-| 变异对照（每个变更各一次） | 正靶用例独自变红，还原复绿 |
+| 变异对照（每个变更各一次） | 正靶用例变红（`add-scope-migration` 2 条——迁出/迁入两条都直接断言被删语句的效果；其余各 1 条），还原复绿 |
 | 负对照（每个变更各一次） | 零红 |
 | 真实本地 syncd CLI e2e | backup upload → list → restore 全链路（`tests/sync/backup-remote.test.ts`） |
 
@@ -61,7 +61,7 @@
 | 测试基线 | 797/796/0/1；e2e-ui 66/66 |
 | schema | v6 |
 | npm 版本 | 主包 `@carloswon/cairn-memory@0.4.0`、插件 `@carloswon/cairn-dsh-memory@0.4.1`（今日全部新能力在 Unreleased，**未发包**） |
-| 真实库 | `~/.cairn/data/cairn.db`（55 条 active）；`doctor` ok、`upstreamGap 0`、remote=verified |
+| 真实库 | `~/.cairn/data/cairn.db`（表内 56 条：55 active + 1 tombstoned，2026-11-12 只读核对）；`doctor` ok、`upstreamGap 0`、remote=verified；`sync_upstream` 待上行 **1** 条、`sync_scope_exit` 0 条、已推送修订 43 条 |
 | 真实 vault | provider=syncd，`http://100.65.135.122:8471`（ECS，tailnet-only）；`CAIRN_SYNCD_TOKEN` 在用户级环境变量（已实测会话可继承） |
 | 远端备份对象 | 恰 1 份（见 §6 事故），syncd 无 DELETE 暂无法远程删除 |
 
@@ -69,29 +69,30 @@
 
 ## 3. 接下来如何推进（四个待办，均需用户拍板后才动手）
 
-> 排序建议：B → C → A → D。B 是 A 的前置加固（syncd 有了 DELETE 才有完整保留策略）；C 独立且零风险；A 动真实云端、放最后并在动手前再向用户确认一次。
+> 排序建议：B → C → A → D。B 让备份保留策略真正生效并清掉误传对象（A 不依赖 B）；C 独立且零风险；A 动真实云端，放最后并在动手前再向用户确认一次。
 
 ### 任务 B：syncd 加 DELETE/purge 路由（含误传对象清理）
 
 **为什么**：备份保留策略在 syncd 后端当前只能「只上传不删」；§6 事故对象也清不掉。
 
 **步骤**：
-1. **走 OpenSpec 立项**（协议变更必须过流程）：`openspec new change add-syncd-purge`——提案要点：`cairn-syncd.mjs` 加 `DELETE /obj/<key>` 路由（Bearer 鉴权 + 与现有 GET/PUT 相同的路径穿越防护 + 只允许删 `backups/` 前缀或全量?——**建议限定 `backups/` 前缀**，同步链保持永不删除的追加语义）；`SyncdRemoteStore.deleteObject` 实现调用它；`RemoteStore.deleteObject` 已是可选方法无需动。
+1. **走 OpenSpec 立项**（协议变更必须过流程）：`openspec new change add-syncd-purge`——提案要点（**以文件头协议注释为准**）：现有路由是 `PUT/GET /chunks/<key>`、`GET/PUT /manifests/<key>`、`GET /list?prefix=`、`GET /healthz`；**备份对象走的是 `/chunks/` 分支**（`SyncdRemoteStore.putImmutable` → `PUT /chunks/<encodeURIComponent(prefix+key)>`，key 形如 `vaults/<vaultId>/backups/<device>/<name>`）。因此加 `DELETE` 应挂在现有 `/chunks/` 分支内（复用 `safeKey()` 的路径穿越防护），并**只允许删解码后 key 含 `/backups/` 的对象**——同步链保持永不删除的追加语义。`SyncdRemoteStore.deleteObject` 实现调用它；`RemoteStore.deleteObject` 已是可选方法无需动。
+   - 注意 `safeKey(path.slice(1))` 拿到的相对键还带 `chunks/` 前缀，判断备份前缀时用 `key.includes('/backups/')`，不要用 `startsWith('backups/')`。
 2. 实现 + 测试（本地 spawn syncd 的 e2e 已有姿势，见 `tests/sync/syncd.test.ts`；backup 侧 `tests/sync/backup-remote.test.ts`）。
 3. `npm run build`；全套验收（test / typecheck / validate --strict / 变异+负对照）。
 4. **重部署 ECS syncd**：`syncd/cairn-syncd.mjs` 是零依赖单文件，systemd 服务在用户 ECS（`ssh root@100.65.135.122`，服务名 `cairn-syncd`，数据目录 `/var/lib/cairn-syncd`，仅绑 `100.65.135.122:8471`）。**部署前先在 ECS 上备份现文件**；`systemctl restart cairn-syncd` 后 `curl healthz` 验证。**此步是环境持久变更，动手前向用户确认并回写 Obsidian `ServerAndPC/CLOUD-aliyun-ecs.md`**（环境手册纪律）。
 5. 清理 §6 事故对象（二选一）：
    - a. 加一条 `cairn backup --purge-remote <name>`（显式单对象删除，建议顺带进任务 B 的提案）；
-   - b. 不加命令，靠保留策略自然淘汰：连续上传 5 份新备份（keep=5），最旧的即事故对象会被淘汰——浪费但零新代码。
+   - b. 不加命令，靠保留策略自然淘汰（**前提是任务 B 已让 syncd 支持 DELETE**）：连续上传 5 份新备份（keep=5），最旧的即事故对象会被淘汰——浪费但零新代码。
 6. 清理后 `cairn backup --list-remote` 确认清零（或只剩有意保留的）。
 
 ### 任务 C：npm 发新版本（0.5.0）
 
 **步骤**：
-1. `CHANGELOG.md`：把 Unreleased 的四块（项目身份已在 0.4.0 之后追加、rescope/方案卡/备份）整理为 `## [0.5.0] - 2026-11-12`。**注意**：`add-stable-project-identity` 的内容在 Unreleased 里属于 0.4.0 之后，一并进 0.5.0。
+1. `CHANGELOG.md`：把**整个 `## [Unreleased]` 节**整理为新版本标题 `## [0.5.0] - <发布日>`。注意 Unreleased 不只有本次四提案——它还包括更早未发布的「记忆批注与待处置队列」「`cairn forget --pending`」「MCP 批注工具」「DSH 插件压缩后重注入」等条目（查 `git log` 确认哪些提交晚于 0.4.0 且未发包），不要只搬四提案而漏掉它们。
 2. `package.json` 版本 0.4.0 → 0.5.0；`npm pack --dry-run` 核对 `files`（应为 `dist/src`，不含 dist/tests——0.4.0 打包修复后的既定口径）；插件包不动（无变更则不重发）。
 3. 发布：`npm publish --access public`。**发布是外发动作，先向用户确认版本号与内容。**
-4. 发布后从 registry 真实安装验证：`npm i -g @carloswon/cairn-memory@0.5.0`（临时 HOME）→ `cairn doctor` → `cairn rescope --help` / `cairn revision --help` / `cairn backup --upload`（无 vault 时应诚实报错）→ `cairn backup --list-remote`。
+4. 发布后从 registry 真实安装验证：**用临时 npm prefix，不要污染全局**——`npm i --prefix <tmp> @carloswon/cairn-memory@0.5.0`，从 `<tmp>/node_modules/.bin` 运行 `cairn`，并设 `CAIRN_HOME=<tmp-home>`（全局安装不认 HOME，认 npm prefix 与 CAIRN_HOME）。依次验证 `cairn doctor` → `cairn rescope --help` / `cairn revision --help` / `cairn backup --upload`（无 vault 时应诚实报错）→ `cairn backup --list-remote`（未配置远端时应明确拒绝）。
 5. 发包后回写 Obsidian `MyOpenSourceProject.md`（版本表 + 变更记录）。
 
 ### 任务 A：真实库首次 `sync push` 上云（上云方案 P0 收尾）
@@ -99,8 +100,8 @@
 **前置**：`cairn backup` 快照已存在（2026-11-12 00:52 那份就是，`verifyBackup` ok）；`upstreamGap=0`（无入队缺口）；vault 已 init（syncd）。
 
 **步骤**（每步动真实云端，**执行前向用户逐项确认**）：
-1. `cairn sync push`——期望 1 个左右 chunk、eventCount ≈ 55、headSeq 有值。失败只留可重试状态。
-2. `cairn sync pull`——本机拉自身链应为空（无其他设备）；`doctor` 的 remote 应保持 verified。
+1. `cairn sync push`——`eventCount` 等于本次领取的待上行任务数，**不是记忆总数**（2026-11-12 只读实测：`sync_upstream` 待上行仅 **1** 条，已推送修订 43 条；期间有新写入会相应增加，可能是 0）。判定成功看：命令退出 0、`headSeq` 有值、`jobs` 计数与领取数一致；失败只留可重试状态。
+2. `cairn sync pull`——本机拉的应是**其他设备**的链，当前只有本机推送，所以 `totalApplied` 应为 0（2026-10-25 验证残留若属旧 vaultId，会被 `vaults/<vaultId>/` 前缀过滤掉，属正常）；`doctor` 的 remote 应保持 verified。
 3. `cairn sync backfill`（只读）→ 确认缺口仍为 0。
 4. **第二台设备验证**（用户侧操作，Agent 可准备命令清单）：`vault import-key` + `sync pull`，比对 active 条数与正文抽样。
 5. 全程留审计证据；完成后回写 `Cairn-上云同步方案.md` §7（实施记录）。
@@ -108,7 +109,7 @@
 
 ### 任务 D：macOS CI（用户此前暂缓，重启前先问）
 
-用户 2026-10-28 明确暂缓。若用户重启此项：GitHub Actions `macos-latest` 跑 `npm ci && npm test`，注意 `node:sqlite` 需 Node ≥22.5（macOS runner 的 Node 版本要 pin）；不用真实云端（`test:real` 有 env 门控，CI 里天然 skip——确认 skip 语义是显式的，不静默）。
+用户 2026-10-28 明确暂缓。若用户重启此项：GitHub Actions `macos-latest` 跑 `npm ci && npm test`，注意 `node:sqlite` 需 Node ≥22.5（macOS runner 的 Node 版本要 pin）。真实云端的口径要分清：`test:real` 是独立脚本（`scripts/test-real-obs.mjs`，**不在** `npm test` 里）；`npm test` 里的真实 OBS 用例是 `tests/sync/obs-store.test.ts` 的门控用例（需 `CAIRN_TEST_REAL_OBS=1` + `OBS_*` 齐全），CI 里会**显式 skip**（基线那 1 个 skip 就是它）——确认它保持「显式 skip 并注明原因」，不要退化成静默跳过。
 
 ### 其他候选（未被要求，仅登记）
 
@@ -154,7 +155,7 @@
 
 **后果（已全部核实）**：
 - 上传了 1 个对象到用户自己的 ECS syncd：`backups/dev_01a18002-defd-7ba9-acd0-ae3fb1606b4e/cairn-backup-1794415952837.db-ac844002dd3a3c2450e9ea8966d27a81bfbd23b22535013eb8be0b3f9ec4ece9.enc`（3260 KB，端到端加密）。
-- 本地对应快照 `~/.cairn/backups/cairn-backup-1794415952837.db` 校验通过（55 条记忆，integrity ok）——是一份合法的一致性快照。
+- 本地对应快照 `~/.cairn/backups/cairn-backup-1794415952837.db` 校验通过（表内 55 行记忆记录，integrity ok）——是一份合法的一致性快照。
 - **当前库未被改动**（无任何 restore 执行，db mtime 未变）；远端仅此 1 个对象；无泄露面（自有服务器 + 自有密钥）。
 
-**处置状态**：向用户如实披露（已披露）；对象暂无法远程删除（syncd 无 DELETE 路由），清理路径见 §3 任务 B 第 5 步。**教训已进 §5.5**：真实环境副作用命令绝不出现在内嵌脚本/字符串拼接里，涉及 `CAIRN_*` 环境变量的命令先 `env | grep CAIRN` 确认凭据在场再执行。
+**处置状态**：向用户如实披露（已披露）；对象暂无法远程删除（syncd 无 DELETE 路由），清理路径见 §3 任务 B 第 5 步。**教训已进 §5 第 5 条**：真实环境副作用命令绝不出现在内嵌脚本/字符串拼接里，涉及 `CAIRN_*` 环境变量的命令先 `env | grep CAIRN` 确认凭据在场再执行。
