@@ -876,3 +876,5 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
   - **变异还原绝不能用 `git checkout`**——本次用它还原 app-service.ts 的变异，把未提交的 rescopeMemory 实现整体冲掉，靠 Edit 重写恢复。变异/负对照一律 Edit 改、Edit 还原。
   - **CLI/子进程测试跑 dist 产物**：改 `src/` 后不 `npm run build`，测试打在旧代码上（本次踩两次：rescope 退出码合同、MCP proposedBy 的 channel 判定）。
 - 基线：**797/796/0/1**；CHANGELOG Unreleased 已补三条；真实云端操作（真实库上云首次 push、真实 syncd 备份、macOS CI）仍未做，均需用户拍板。
+
+> 本节的完整版（含验证证据表、API 地图、四个待办任务的逐步推进路线、接手纪律与事故记录）见 `docs/handoff-2026-11-12-session-summary-and-next.md`。

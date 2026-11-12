@@ -2,7 +2,8 @@
 
 ## 当前入口
 
-- 先读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录，以及此后三次追加：第 6 节自动整理的实施方案与实测、第 7 节浏览器点击级验收、第 8 节 2026-10-31 归档记录）。
+- **接手先读 `docs/handoff-2026-11-12-session-summary-and-next.md`**：2026-11-11～12 四提案归档的完整交接（做了什么、验证证据、关键设计陷阱、四个待办任务的逐步推进路线、事故记录、接手纪律）。它自足，不需要上一段会话的上下文。
+- 再读 `docs/M0-session-handoff.md`（含 2026-10-25 五节会话记录，以及此后三次追加：第 6 节自动整理的实施方案与实测、第 7 节浏览器点击级验收、第 8 节 2026-10-31 归档记录）。
 - 四个变更均已归档：`add-local-first-memory-mvp`（本地 MVP）、`add-real-cloud-sync`（OBS/ECS 云同步；经三轮外部独立验证 + 第四轮归档门禁，见 `docs/verify-cloud-sync-round4-2026-10-25.md`）、`add-memory-workbench`（本地控制台：预览页 + 工作台 + 双层建议 + 静态导出；28/28 tasks，2026-10-29 归档，主规格新增 `local-console` 与 `memory-review`）、`add-auto-onboarding`（策略预授权的自动整理 + 写入时判断与查重 + 导入工作台抽屉化；43 tasks + 追加 8.1–8.5，2026-10-31 归档，主规格新增 `auto-onboarding`，改写 `local-console` 与 `memory-governance`）。**仓库当前没有活动变更。**
 
 - **2026-11-11 四个提案批量归档**：`add-stable-project-identity`（项目身份 UUID + 别名，主键不再用路径）、`add-scope-migration`（cairn rescope 作用域迁移 + scope_exit 迁出通知 + needs_rescope 批注；schema v6 重建 outbox CHECK）、`add-agent-managed-revision`（AI 修订提案方案卡：MCP 只能 propose/list，采纳复用 reviseMemory 记 user_confirmed，控制台新增「修订提案」视图）、`add-cloud-backup`（设备快照加密上云：backups/<设备>/ 前缀 + deriveBackupKey 设备维度，syncd 无 DELETE 诚实降级）。关键设计陷阱见 `docs/M0-session-handoff.md` 2026-11-11 节：迁回靠 reentry 强制重发、未知事件必须跳过不卡链、静态页断言必须行为级。
