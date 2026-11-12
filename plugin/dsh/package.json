@@ -1,6 +1,6 @@
 {
   "name": "@carloswon/cairn-dsh-memory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "description": "Cairn memory for DeepSeek Harness: real-time recall, backed by the Cairn MCP server as its core",
   "main": "dist/index.js",

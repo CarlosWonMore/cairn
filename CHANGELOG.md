@@ -2,10 +2,11 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [0.5.0] - 2026-11-12
+
+项目身份与作用域治理、AI 提案卡、设备备份上云。四个 OpenSpec 变更归档，主规格 10/10 严格通过。
 
 ### Added
-
 - **设备备份的云端加密容灾（`cairn backup --upload`）**：本地一致性快照用设备专属密钥加密后上传到远端（独立前缀 `backups/<设备>/`，与同步事件链互不干扰）。只有生成它的设备能解开（密钥派生混入 deviceId，其他设备拿到密文也无密钥材料）；保留策略默认保留最近 5 份、只淘汰本设备前缀且删除前列出（syncd 暂无 DELETE 路由，诚实降级为只上传不删除）。`backup --list-remote` 列出本设备备份；`restore --from-remote` 下载 → 解密 → sha256 比对 → 快照校验后还原，**默认到新路径**，覆盖当前库必须 `--force` 且自动先备份当前库。
 - **AI 修订提案（方案卡，`cairn revision`）**：Agent 针对批注出具「改什么、为什么改」的结构化提案（MCP `revision_propose` / `revision_list`），人通过 CLI `revision list|show|apply|reject` 或控制台「修订提案」视图确认后才生效。采纳复用既有 `reviseMemory` 修订链（不可变历史 + 秘密复检 + 上行入队），权威记 `user_confirmed`；版本一致性两层校验，记忆已被改过则拒绝并标陈旧；工具面**刻意不含 apply**——Agent 只有提案权，没有写入权。
 - **作用域迁移（`cairn rescope`）**：活动记忆可换作用域，不删不重建——id、修订历史、证据链、权威级别全保留，只改 `scope_id`。安全阀：冲突状态拒绝、缺 projectId 拒绝（不静默降级）、`user_explicit` 记忆需 `--force`。迁移与 outbox 重建同事务：作废旧作用域 pending 上行、按新作用域重新入队。批量 `--ids-file` 逐条报告，单条失败不中断；`--pending` 处理控制台「需迁移作用域」批注（先列清单再逐条执行）。退出码合同：用法 2 / 治理拒绝 3 / 冲突 4。
@@ -15,16 +16,27 @@
 - **别名归一化**：`https://Host/o/r.git`、`git@host:o/r.git`、`ssh://git@host/o/r.git` 视为同一项目（去凭据、host 小写、去 `.git`）；路径统一盘符大小写与分隔符并去尾斜杠，但**保留目录名大小写**（Linux 上 `Proj` 与 `proj` 是两个目录）。不做模糊匹配、不校验路径是否存在（跨设备解析必需）、不自动上溯父目录。
 - **别名冲突拒绝**：把已属于其他项目的别名追加到当前项目时抛 `E_CONFLICT_STATE`（退出码 4）并报告归属，不改任何数据；别名追加写 `project` 类目审计。
 
-### Changed
-
-- 新建项目默认显示名取归一化后的别名（原始 URL 可能带凭据，不落 `project.name`）。已有项目行与其 `id` 一律不动。
-
 - **记忆批注与待处置队列（WebUI 标注 → Agent 处置）**：控制台新增「批注」视图；记忆列表支持多选批量标记，记忆详情可对单条写下处置意见（需要修改 / 需要合并 / 可以删除 / 存疑待查 / 无需处理 / 标记待删）。批注落在 `<home>/console/annotations.json`，**不建表、不参与云同步、不进入上行包**；记忆正文、状态与修订链完全不动。记忆修订后批注标「意见可能已过时」并灰显（不删）。
 - **`cairn forget --pending [--dry-run]`**：WebUI 只能把记忆标为待删；真正删除只在这个终端入口执行，且**先打印全部待删清单（id + 摘要 + 标注时间）再逐条遗忘并逐条报告**。删除复用既有 `forgetMemory`，走同一套 tombstone 与 outbox 上行语义。
 - **MCP `memory_annotations_list` / `memory_annotation_resolve`**：Agent 可拉取用户的批注并按 `resolved` / `ignored` 回写；读取不返回记忆正文全文，回写只改批注状态并记录处置者与时间。
 - **`cairn doctor` 的待办批注提示**：只进 `notes` 一行，不进 `problems`、不改退出码。
 - 批注写入前复用 `scanText`：命中秘密或注入规则即拒绝，不回显原文、不脱敏保存。
+
+### Changed
+
+- 新建项目默认显示名取归一化后的别名（原始 URL 可能带凭据，不落 `project.name`）。已有项目行与其 `id` 一律不动。
+
+## [Plugin 0.4.2] - 2026-11-12
+
+DSH 插件：上下文压缩后重注入。
+
+### Added
+
 - **DSH 插件压缩后重注入**（`@carloswon/cairn-dsh-memory`）：插件在本会话内追踪「涉及过的记忆」——注入过的，以及经 MCP `memory_get` / `memory_add` / `memory_update` 读过写过的；`compaction/end`（无 `error`）时按独立预算（`budgetBytes × reinjectBudgetRatio`，默认一半）重渲染并在下一步 `pre-step` 投递，不依赖下一句是否命中关键词。表头与常规召回措辞不同；重注入的 id 立刻回填去重集合，避免下一步重复注入；追踪集合纯内存、上限 `trackMax`（默认 200，超出按最近使用淘汰）。压缩失败不重注入、不清去重。回滚：`reinjectOnCompaction: false`。
+
+### Changed
+
+- 插件版本与内核不再强绑：内核 0.5.0 与插件 0.4.2 各自独立发版，部署时按各自版本对齐。
 
 ## [Plugin 0.4.1] - 2026-11-10
 
