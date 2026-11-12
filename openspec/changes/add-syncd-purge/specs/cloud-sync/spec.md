@@ -49,3 +49,18 @@ syncd SHALL 支持删除**备份对象**，且 MUST 只允许删除解码后 key
 - **GIVEN** 远端不支持删除（旧版 syncd）
 - **WHEN** 上传并尝试淘汰
 - **THEN** 上传成功，输出明确提示「保留策略未生效：远端不支持删除」，MUST NOT 声称已清理
+### Requirement: 删除目标必须是普通文件
+
+删除请求指向的目标若**不是普通文件**（目录、符号链接等），服务端 MUST 拒绝该请求且 MUST NOT 崩溃或终止进程。
+
+拒绝后服务端 MUST 继续正常响应后续请求（进程存活、健康检查仍通过）。
+
+#### Scenario: 目录形 key 被拒绝且服务不崩
+- **GIVEN** 数据目录中存在一个目录 `chunks/vaults/<v>/backups/<dev>`（无文件名部分）
+- **WHEN** 对该路径发送删除请求
+- **THEN** 请求被拒绝，目录仍在，且紧接着的 `/healthz` 仍返回成功
+
+#### Scenario: 崩溃不算通过
+- **WHEN** 任何形式的删除请求触发文件系统错误（EISDIR / EACCES / EBUSY 等）
+- **THEN** 服务端 MUST 返回错误状态码而非让进程退出
+

@@ -878,3 +878,13 @@ design 写的是「历史不回填」，指的是**系统自动**不替历史条
 - 基线：**797/796/0/1**；CHANGELOG Unreleased 已补三条；真实云端操作（真实库上云首次 push、真实 syncd 备份、macOS CI）仍未做，均需用户拍板。
 
 > 本节的完整版（含验证证据表、API 地图、四个待办任务的逐步推进路线、接手纪律与事故记录）见 `docs/handoff-2026-11-12-session-summary-and-next.md`。
+
+---
+
+## 2026-11-12 追加：修复 syncd DELETE 对目录形 key 打死进程
+
+- **漏洞**：`syncd/cairn-syncd.mjs` 的 DELETE 分支直接 `rmSync(full, { force: true })`。目录形 key（如 `chunks/vaults/<v>/backups/<dev>`）让 `rmSync` 抛 `ERR_FS_EISDIR`，异常逃出 handler → 进程退出。本地已复现：DELETE 得到 ECONNRESET、`/healthz` 变 ECONNREFUSED、子进程 `exit=1`。需有效 Bearer token 才能触发；systemd 会拉起、不丢数据，但仍是一次可达的服务中断。
+- **修复**：删前 `lstatSync(full).isFile()`（用 lstat，stat 会跟随符号链接看不出链本身）；目录/符号链接等非普通文件 → 400 `delete target is not a regular file`，文件系统不动；目标不存在 → 200（幂等）；整段包 try/catch，EISDIR/EACCES/EBUSY 等 → 500 `{error:'fs_error',code}`。`/backups/` 红线与 403 未动。
+- **为什么 400 而不是 403**：403 已被「不是备份对象」占据，客户端把它映射为 `syncd_delete_not_backup`；目录形 key 是 API 使用错误而非授权拒绝，400 不会把两类拒绝混成一条。
+- **证据**：`tests/sync/syncd-purge.test.ts` 追加 2 条（目录形 key 被拒 + 目录内容不动 + `/healthz` 200；同进程随后仍能正常删备份文件），既有 9 条断言未动。`npm test` = **808 / 807 / 0 / 1**（基线 806/805/0/1）；`npm run typecheck` 0 错；`openspec validate add-syncd-purge --strict` 通过。符号链接另用临时探针验证：400，链接与目标均存活，healthz 200。
+- **未做**：ECS 未重新部署（任务明令禁止）。生产仍是旧版，部署前该路径仍可被持有 token 者触发一次重启。

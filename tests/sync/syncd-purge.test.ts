@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, existsSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RemoteStore } from '../../src/jobs/remote.js';
@@ -204,6 +204,48 @@ test('DELETE：不存在的备份对象返回 200（幂等，与 OBS deleteObjec
     assert.equal(first.status, 200);
     const second = await req(s.baseUrl, s.token, 'DELETE', `/chunks/${encodeURIComponent(key)}`);
     assert.equal(second.status, 200, '重复删除仍成功');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('DELETE：目录形 key 被拒绝（400），目录与内容不动，服务仍存活', async () => {
+  const s = await startSyncd();
+  try {
+    // 回归守卫：rmSync 对目录抛 ERR_FS_EISDIR，原先未捕获会直接打死进程
+    const key = 'vaults/v1/backups/dev-dir';
+    const dir = diskPath(s.dataDir, 'chunks', key);
+    mkdirSync(dir, { recursive: true });
+    const inner = join(dir, 'keep.enc');
+    writeFileSync(inner, 'keep-me');
+
+    const del = await req(s.baseUrl, s.token, 'DELETE', `/chunks/${encodeURIComponent(key)}`);
+    assert.equal(del.status, 400, '目录不是普通文件：拒绝');
+    assert.ok(existsSync(dir), '目录仍在');
+    assert.equal(readFileSync(inner, 'utf8'), 'keep-me', '目录内文件未被动');
+
+    const h = await req(s.baseUrl, s.token, 'GET', '/healthz');
+    assert.equal(h.status, 200, '服务仍存活');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('DELETE：目录形 key 被拒后同一进程仍能正常删备份对象', async () => {
+  const s = await startSyncd();
+  try {
+    const dirKey = 'vaults/v1/backups/devA';
+    mkdirSync(diskPath(s.dataDir, 'chunks', dirKey), { recursive: true });
+    const rejected = await req(s.baseUrl, s.token, 'DELETE', `/chunks/${encodeURIComponent(dirKey)}`);
+    assert.equal(rejected.status, 400);
+
+    // 进程未退出：同一进程继续服务 healthz 与正常删除
+    assert.equal((await req(s.baseUrl, s.token, 'GET', '/healthz')).status, 200, 'healthz 仍 200');
+    const fileKey = `${dirKey}/cairn-backup-1.db-abc.enc`;
+    await req(s.baseUrl, s.token, 'PUT', `/chunks/${encodeURIComponent(fileKey)}`, Buffer.from('sealed'));
+    const del = await req(s.baseUrl, s.token, 'DELETE', `/chunks/${encodeURIComponent(fileKey)}`);
+    assert.equal(del.status, 200, '普通备份文件仍可删');
+    assert.equal(existsSync(diskPath(s.dataDir, 'chunks', fileKey)), false, '文件已删除');
   } finally {
     await s.stop();
   }

@@ -6,7 +6,8 @@
  *   PUT  /chunks/<key>       不可变上传（同 key 同体幂等；带 Content-MD5 校验可选）
  *   GET  /chunks/<key>       下载（404 = 不存在）
  *   DELETE /chunks/<key>     删除【备份对象】：解码后 key 必须含 `/backups/`，否则 403；
- *                            同步链（chunk / manifest）一律不可删；对象不存在也返回 200
+ *                            同步链（chunk / manifest）一律不可删；目标必须是普通文件
+ *                            （目录/符号链接 400）；对象不存在也返回 200
  *   GET  /manifests/<key>    下载 manifest（404 = 不存在）
  *   PUT  /manifests/<key>    发布 manifest；头 X-Cairn-Generation 必须大于服务器当前值，回退 409
  *   GET  /healthz            健康检查
@@ -19,7 +20,7 @@
  */
 
 import { createServer } from 'node:http';
-import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname, normalize, relative } from 'node:path';
 
 const PORT = Number(process.env['CAIRN_SYNCD_PORT'] ?? 8471);
@@ -181,8 +182,26 @@ const server = createServer((req, res) => {
         send(res, 403, 'delete only allowed for /backups/ objects');
         return;
       }
-      // 幂等：对象不存在也 200（与 OBS deleteObject 语义一致）
-      rmSync(full, { force: true });
+      // 只允许删普通文件：用 lstat 不用 stat（stat 跟随符号链接，看不出链本身）。
+      // 目录 / 符号链接 / 其他类型一律 400 且文件系统原样不动。
+      // 任何文件系统错误都必须转成响应码——异常逃出 handler 会打死整个进程
+      // （rmSync 对目录抛 ERR_FS_EISDIR，曾在此处造成一次可达的服务中断）。
+      try {
+        if (!lstatSync(full).isFile()) {
+          send(res, 400, 'delete target is not a regular file');
+          return;
+        }
+        rmSync(full, { force: true });
+      } catch (e) {
+        // 幂等：对象不存在也 200（与 OBS deleteObject 语义一致）
+        if (e.code === 'ENOENT') {
+          send(res, 200, JSON.stringify({ ok: true, deleted: true }), { 'content-type': 'application/json' });
+          return;
+        }
+        // EISDIR / EACCES / EBUSY 等：如实报错，不退出进程
+        send(res, 500, JSON.stringify({ error: 'fs_error', code: e.code ?? 'unknown' }), { 'content-type': 'application/json' });
+        return;
+      }
       send(res, 200, JSON.stringify({ ok: true, deleted: true }), { 'content-type': 'application/json' });
       return;
     }
