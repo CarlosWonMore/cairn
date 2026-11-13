@@ -195,3 +195,44 @@ test('UI_JS：批量处理只纳入有建议的条目，需人判断的单列且
   assert.ok(UI_JS.includes('ok.disabled = usable.length === 0'), '一条可用都没有时不得让人按下去');
   assert.equal(/createElement\('input'\)[\s\S]{0,80}checked/.test(UI_JS), false, '不得预选任何条目');
 });
+
+// ---------------------------------------------------------------------------
+// 作用域徽章与过滤器消歧（add-console-scope-badge）
+// ---------------------------------------------------------------------------
+
+test('UI_JS：记忆卡片按 scopeId 查表渲染作用域徽章，本地限定带文字标记', () => {
+  assert.match(UI_JS, /byScope\[mem\.scopeId\]/, '徽章必须由 scopeId 查 scopes 得出，不能靠猜');
+  assert.ok(UI_JS.includes("chip('scope?', 'muted')"), '查不到时渲染中性徽章，既不崩也不静默省略');
+  // 判据必须落在 scopeLocalOnly 这一处：只断言全文含 syncPolicy === 'local_only' 会被
+  // 「作用域层级表」里同名字面量满足，把判据改成 return false 也照样绿（实测漏网）。
+  assert.ok(
+    UI_JS.includes("function scopeLocalOnly(s) { return s.syncPolicy === 'local_only'; }"),
+    '本地限定判据必须是 scopeLocalOnly 里的 syncPolicy，不是 preset 名',
+  );
+  assert.ok(UI_JS.includes("' · 仅本机'"), '色觉障碍用户不能只靠颜色，徽章文本必须自解释');
+  // 徽章自己必须带「仅本机」，不靠工具栏选项里那处同名字面量满足（实测漏网）。
+  assert.ok(
+    UI_JS.includes("chip(scope.preset + (scopeLocalOnly(scope) ? ' · 仅本机' : '')"),
+    '卡片徽章本身必须拼上「仅本机」，且判据走 scopeLocalOnly',
+  );
+  assert.match(
+    UI_JS,
+    /chip\(mem\.status[\s\S]{0,600}byScope\[mem\.scopeId\][\s\S]{0,600}chip\(mem\.authority/,
+    '徽章应插在 status 与 authority 之间',
+  );
+});
+
+test('UI_JS：paintMemories 接收 scopes，静态与在线两处调用点都传', () => {
+  assert.match(UI_JS, /function paintMemories\(host, list, total, scopes\)/);
+  assert.ok(UI_JS.includes('paintMemories(host, list, list.length, model.scopes)'), '静态分支必须传 model.scopes');
+  assert.ok(UI_JS.includes('paintMemories(host, data.memories, data.total, data.scopes)'), '在线分支必须传 data.scopes');
+});
+
+test('UI_JS：作用域过滤选项带消歧标识、同步策略与记忆数', () => {
+  assert.match(UI_JS, /scopeCue\(s\)/, '选项必须用限定标识消歧，不能只渲染 preset');
+  assert.match(UI_JS, /if \(s\.projectId\) parts\.push\(s\.spaceName \|\| s\.projectId\.slice\(0, 8\)\)/, '项目作用域优先显示人读的项目名');
+  assert.match(UI_JS, /if \(s\.deviceId && s\.deviceId !== 'all'\) parts\.push\(s\.deviceId\.slice\(0, 12\)\)/, '设备绑定作用域用设备标识消歧');
+  assert.ok(UI_JS.includes("(scopeLocalOnly(s) ? ' · 仅本机' : '')"), '选项必须标明同步策略');
+  assert.match(UI_JS, /s\.counts && s\.counts\.total \? ' · ' \+ s\.counts\.total/, '既有的记忆数必须保留');
+});
+

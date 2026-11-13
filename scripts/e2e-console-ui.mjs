@@ -327,9 +327,38 @@ async function main() {
     const addOut = await runCli(['add', '这条记忆用于验证批注：部署窗口是周四晚十点。']);
     if (addOut.code !== 0) throw new Error(`批注样本写入失败: ${addOut.stderr || addOut.stdout}`);
     const memId = JSON.parse(addOut.stdout).id;
+    // 本地限定作用域的一条：用于断言「仅本机」徽章真的出现在列表层
+    const localOut = await runCli(['add', '这条只留在本机：离线缓存目录是 .cairn/tmp。', '--scope', 'device-local']);
+    if (localOut.code !== 0) throw new Error(`device-local 样本写入失败: ${localOut.stderr || localOut.stdout}`);
 
     await page.click('[data-view="memories"]');
     await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
+
+    // 作用域徽章：每张卡片都有，且本地限定那条自解释（不只靠颜色）
+    const SCOPE_BADGE = /^(personal-global|device-local|project-global|project-device|agent-private|session-ephemeral|custom|scope\?)( · 仅本机)?$/;
+    const cardChips = await page.$$eval('#view div.card', (cards) =>
+      cards.map((c) => Array.from(c.querySelectorAll('.chip')).map((n) => n.textContent || '')),
+    );
+    check(
+      '每张记忆卡片都带作用域徽章',
+      cardChips.length >= 2 && cardChips.every((chips) => chips.some((t) => SCOPE_BADGE.test(t))),
+      `${cardChips.length} 张卡：${cardChips.flat().filter((t) => SCOPE_BADGE.test(t)).slice(0, 4).join(' | ')}`,
+    );
+    check(
+      '本地限定记忆的徽章写明「仅本机」',
+      cardChips.some((chips) => chips.includes('device-local · 仅本机')),
+      cardChips.flat().filter((t) => /仅本机/.test(t)).join(' | ') || '未找到',
+    );
+
+    // 作用域过滤器：选项文案互不相同且带同步策略，能分辨选哪一个
+    const scopeOpts = await page.locator('#view select.action').first().locator('option').allInnerTexts();
+    const scopeBody = scopeOpts.filter((o) => !/全部层级/.test(o));
+    check(
+      '作用域过滤选项互不相同（同 preset 多实例可区分）',
+      scopeBody.length >= 2 && new Set(scopeBody).size === scopeBody.length,
+      scopeBody.join(' | '),
+    );
+    check('作用域过滤选项标出同步策略与记忆数', scopeBody.some((o) => /仅本机/.test(o)) && scopeBody.every((o) => / · \d+$/.test(o)), scopeBody.join(' | '));
 
     // 5.2 详情页"写下意见"入口存在（不改正文）
     await page.locator('div.card').filter({ has: page.locator(`input[data-pick="${memId}"]`) }).locator('button:has-text("详情 / 修订史")').click();
@@ -436,7 +465,11 @@ async function main() {
       check('导出文件名带 scope 后缀（安全告知第 1 层）', /-personal\.html$/.test(written), written);
       const sp = await ctx.newPage();
       const staticErrors = [];
+      const netRequests = [];
       sp.on('pageerror', (e) => staticErrors.push(e.message));
+      sp.on('request', (r) => {
+        if (/^https?:/i.test(r.url())) netRequests.push(r.url());
+      });
       await sp.goto('file:///' + written.replace(/\\/g, '/'), { waitUntil: 'load' });
       await sp.waitForTimeout(500);
       await sp.click('[data-view="imports"]').catch(() => {});
@@ -448,7 +481,22 @@ async function main() {
       check('静态页无修订提案采纳/拒绝按钮', (await sp.locator('[data-rev-apply]').count()) === 0 && (await sp.locator('[data-rev-reject]').count()) === 0);
       check('静态页不含提案拟改正文', !/先跑 doctor/.test(sBody));
       check('静态页明确说明只读边界', /只读快照/.test(sBody), (sBody.match(/静态导出[^\n]*/) || [''])[0]);
+
+      // 作用域徽章在静态页照常渲染：同一条渲染路径，不发任何请求
+      await sp.click('[data-view="memories"]');
+      await sp.waitForTimeout(400);
+      const staticChips = await sp.$$eval('#view div.card .chip', (els) => els.map((e) => e.textContent || ''));
+      check(
+        '静态页记忆卡片同样渲染作用域徽章',
+        staticChips.some((t) => SCOPE_BADGE.test(t)),
+        staticChips.filter((t) => SCOPE_BADGE.test(t)).slice(0, 4).join(' | ') || '未找到',
+      );
+      check('静态页本地限定徽章仍写明「仅本机」', staticChips.includes('device-local · 仅本机'), staticChips.filter((t) => /仅本机/.test(t)).join(' | ') || '未找到');
+      check('静态页渲染徽章未发起网络请求', netRequests.length === 0, netRequests.slice(0, 2).join(' | '));
+
       // 静态页仍要能点开抽屉看条目，只是没有写入口
+      await sp.click('[data-view="imports"]');
+      await sp.waitForTimeout(300);
       const sView = sp.locator('table button:has-text("查看")');
       if ((await sView.count()) >= 1) {
         await sView.first().click();

@@ -284,6 +284,18 @@ export const UI_JS = String.raw`
   }
   function empty(host, text) { host.appendChild(el('div', { 'class': 'empty' }, text)); }
 
+  /** 同 preset 多条作用域时用来消歧的限定信息：项目名优先，其次设备与 Agent。 */
+  function scopeCue(s) {
+    var parts = [];
+    if (s.projectId) parts.push(s.spaceName || s.projectId.slice(0, 8));
+    if (s.deviceId && s.deviceId !== 'all') parts.push(s.deviceId.slice(0, 12));
+    if (!parts.length && s.agentId && s.agentId !== 'all') parts.push(s.agentId);
+    return parts.join(' · ');
+  }
+
+  /** 同步策略是「永不出本机」的唯一判据，不按 preset 名推断。 */
+  function scopeLocalOnly(s) { return s.syncPolicy === 'local_only'; }
+
   function toolbar(host, opts) {
     var bar = el('div', { 'class': 'toolbar' });
     var search = el('input', { type: 'search', placeholder: '检索内容（/）', value: state.q });
@@ -294,7 +306,10 @@ export const UI_JS = String.raw`
       sel.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
       sel.appendChild(el('option', { value: '' }, '全部层级'));
       opts.scopes.forEach(function (s) {
-        var o = el('option', { value: s.id }, s.preset + (s.counts && s.counts.total ? ' · ' + s.counts.total : ''));
+        var cue = scopeCue(s);
+        var text = s.preset + (cue ? ' · ' + cue : '') + (scopeLocalOnly(s) ? ' · 仅本机' : '') +
+          (s.counts && s.counts.total ? ' · ' + s.counts.total : '');
+        var o = el('option', { value: s.id }, text);
         if (s.id === state.scope) o.setAttribute('selected', 'selected');
         sel.appendChild(o);
       });
@@ -444,18 +459,20 @@ export const UI_JS = String.raw`
       var model = staticModel();
       toolbar(host, { scopes: model.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
       var list = localFilter(model.memories, { scope: state.scope, status: state.status });
-      paintMemories(host, list, list.length);
+      paintMemories(host, list, list.length, model.scopes);
       return;
     }
     loading(host);
     api('/api/memories?' + qs()).then(function (data) {
       clear(host);
       toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
-      paintMemories(host, data.memories, data.total);
+      paintMemories(host, data.memories, data.total, data.scopes);
     }).catch(function (e) { clear(host); fail(host, e); });
   }
 
-  function paintMemories(host, list, total) {
+  function paintMemories(host, list, total, scopes) {
+    var byScope = {};
+    (scopes || []).forEach(function (s) { byScope[s.id] = s; });
     host.appendChild(el('div', { 'class': 'empty', style: 'padding:0 0 10px' }, '命中 ' + total + ' 条，已展示 ' + list.length + ' 条 · 模式 ' + state.mode));
     if (!STATIC) host.appendChild(annotationBar());
     if (!list.length) { empty(host, '没有匹配的记忆。'); return; }
@@ -474,6 +491,9 @@ export const UI_JS = String.raw`
       }
       head.appendChild(chip(mem.kind, 'info'));
       head.appendChild(chip(mem.status, STATUS_CHIP[mem.status] || 'muted'));
+      var scope = byScope[mem.scopeId];
+      if (!scope) head.appendChild(chip('scope?', 'muted'));
+      else head.appendChild(chip(scope.preset + (scopeLocalOnly(scope) ? ' · 仅本机' : ''), scopeLocalOnly(scope) ? 'warn' : 'muted'));
       head.appendChild(chip(mem.authority, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
       if (mem.sensitivity === 'sensitive') head.appendChild(chip('sensitive', 'danger'));
       if (mem.openConflicts > 0) head.appendChild(chip('冲突 ' + mem.openConflicts, 'danger'));

@@ -99,6 +99,29 @@ test('model: 各段计数与库实测一致', async () => {
   }
 });
 
+test('model: 每条记忆的 scopeId 都能在 scopes 里查到（列表徽章的查表契约）', async () => {
+  const ctx = setup();
+  try {
+    await seed(ctx.store, ctx.home);
+    const model = buildModel(ctx.store, { mode: 'brief', redact: true });
+    const byId = new Map(model.scopes.map((s) => [s.id, s]));
+    assert.ok(model.memories.length >= 2);
+    for (const m of model.memories) {
+      const scope = byId.get(m.scopeId);
+      assert.ok(scope != null, `记忆 ${m.id.slice(0, 8)} 的 scopeId 查不到对应作用域`);
+      assert.ok(scope!.preset.length > 0, '徽章要显示人读的 preset 名，不能只剩内部 UUID');
+    }
+    // 「仅本机」判据来自作用域表实际存储的 syncPolicy，不来自 preset 名
+    const sensitive = model.memories.find((m) => m.sensitivity === 'sensitive');
+    assert.ok(sensitive != null);
+    const localScope = byId.get(sensitive!.scopeId)!;
+    assert.equal(localScope.preset, 'device-local');
+    assert.equal(localScope.syncPolicy, 'local_only');
+  } finally {
+    ctx.cleanup();
+  }
+});
+
 test('model: activeBatchId 只返回 1 个时 batches 仍返回全部行', async () => {
   const ctx = setup();
   try {
