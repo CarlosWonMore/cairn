@@ -1047,3 +1047,22 @@ DSH 的 request/header 只覆盖 call config + 工具 schema；系统提示词�
 ### 归档补记（2026-11-13）
 
 四变更归档为 `2026-11-13-fix-onboarding-tool-surface-flip` / `-add-memory-scope-visibility` / `-add-two-stage-memory-recall` / `-add-project-scope-recall`。归档后 `openspec validate --specs --strict` 一度 9/10：P1 改写后的 `记忆调用对用户可见` 正文 549 字符超 strict 上限（500）——按校验器建议**拆分**为「记忆调用对用户可见」（显示内容/三态/点选/作用域标签）与新增「面板布局与两栏交互」（两栏滚动/自适应/拖拽/记住布局），场景随语义归位，语义零增减；复验 **10/10**。这是第一条因长度上限触发的规格拆分，后续往这条需求再加段落时会再次触发——届时优先拆不要压缩措辞。
+
+## 2026-11-14 追加：refine-drawer-nav-reachability 实现完成（未归档）
+
+抽屉打开时主导航点不动（遮罩 `inset:0; z-index:50` 压住无定位的 nav，实测 `elementFromPoint` 命中遮罩、Playwright 点导航 5s 超时）。实现：`nav { position: relative; z-index: 60 }`（CSS 注释写明层级约定：任何覆盖层必须 > 60）+ `openDrawer` 删 `aria-modal`（如实非模态）+ 文档同步。**未归档，等审阅。**
+
+### 实施期发现（值得记住）
+
+1. **提案只列了两处 aria-modal 断言，实际有三处**：`e2e-console-ui.mjs:450`（记忆详情面板）也断言 `aria-modal === 'true'`，不找到它 test:ui 必红。同一规格修正应全仓 grep 而不是只信提案清单。
+2. **导航抬层后，遮罩点击坐标必须移进内容区**：`closeBy('mask')` 与遮罩关闭测试原来点 `{x:5,y:300}`——那落在导航列（0–190px）里，nav 抬到遮罩之上后 Playwright"可接收事件"检查会失败。改成 `{x:300,y:300}`（视口 1280、抽屉 720，内容区 190–560）。坐标变了但语义没变：规格本来就说"点内容区"。
+3. **`focus()` 证明不了层级**：被遮罩盖住的元素照样能 programmatic focus，变异去掉 z-index 时"可被聚焦"仍绿——真正的层级断言是 `elementFromPoint` 命中导航中心。两条都写进了 C+ 段，注释说明为什么命中那条才是变异真断言。
+4. **反向断言用裸词最稳**：`UI_JS.includes('aria-modal')` 一度被我自己在 ui-js.ts 里写的注释字面量踩红——改注释措辞（"不声明模态属性"）而不放宽断言；裸词形式以后以任何形式加回都会被抓到。
+
+### 测试基线（本轮后）
+
+- 主仓 `npm test`：**846 / 845 / 0 / 1**（上轮 845/844 → +1：CSS 层级单测）。
+- `npm run test:ui`：**112/112**，exit 0（上轮 99 项基线 → +13：一次点击×2、命中、聚焦、aria-current、遮罩视图不变、移动端×4、非模态×2 等）。报告 `artifacts/console-ui-2026-11-13.json`。
+- typecheck 0 错；`openspec validate refine-drawer-nav-reachability --strict` 通过。
+- 变异对照：① aria-modal 加回 → 单测 + e2e 两处反向断言全红（110/112）；② nav 去掉 z-index → CSS 单测红 + elementFromPoint 红 + 一次点击超时中止（exit 1）。两轮变异后手工还原（无 MUTATION 残留），复跑全绿。
+- 真库冒烟（任务 5.7）：`cairn ui` 起真库，抽屉打开点导航一次切视图 + 点内容区空白关闭 + 无脚本异常 9/9，主库文件 sha256 前后一致（零写入），报告 `artifacts/console-nav-smoke-2026-11-14.json`。探针本体在临时目录、已删。

@@ -110,13 +110,31 @@ test('UI_JS：抽屉三入口共用同一段关闭逻辑，且把焦点还给打
   // 一个自制 DOM 面板最容易漏的是"Esc 关了但焦点丢了"：键盘用户关掉抽屉后
   // 落回 body，等于每次都要重新 Tab 一遍。这里把四个入口都钉住。
   assert.ok(UI_JS.includes("role: 'dialog'"), '抽屉必须是 dialog 语义');
-  assert.ok(UI_JS.includes("'aria-modal': 'true'"), '模态要声明，读屏才知道外面不可交互');
+  // 2026-11-14 规格修正（refine-drawer-nav-reachability）：导航在抽屉打开期间仍可交互，
+  // aria-modal="true" 是虚报"外面不可交互"，源码里 MUST NOT 出现。
+  // 这条从正向断言改为反向断言是规格修正的必然结果，不是为了变绿而改断言：
+  // 把 aria-modal 加回去，本条必须变红。
+  assert.equal(UI_JS.includes('aria-modal'), false, '抽屉 MUST NOT 声明 aria-modal（如实非模态，导航可达）');
   assert.ok(UI_JS.includes("ev.key === 'Escape'"), 'Esc 必须能关');
   assert.ok(/if \(ev\.target === mask\) close\(\)/.test(UI_JS), '点遮罩要能关，点面板内部不能关');
   assert.ok(UI_JS.includes('x.addEventListener(\'click\', close)'), '关闭按钮与 Esc 必须是同一个 close');
   assert.ok(UI_JS.includes('prev.focus()'), '关闭后必须把焦点还给打开抽屉的那个元素');
   assert.ok(UI_JS.includes('document.removeEventListener(\'keydown\', onKey)'), '关闭要摘掉键盘监听，否则会叠加');
   assert.ok(UI_JS.includes('drawerCloser'), '重复打开必须先关掉上一个，避免叠两层遮罩');
+});
+
+test('CSS：主导航浮在抽屉遮罩之上（refine-drawer-nav-reachability）', () => {
+  // 抽屉打开时导航必须仍可点：遮罩 z-index 50 铺满视口，nav 若还是普通流内元素
+  // （无定位，z-index 不适用）就被压在遮罩下面，点导航先关抽屉、视图不变，
+  // 要切视图得点第二下。这里从源码上钉住层级关系，变异（去掉 nav 的 z-index）必须变红。
+  const navRule = (UI_CSS.match(/(?:^|\n)nav\s*\{[^}]*\}/) || [])[0] || '';
+  const maskRule = (UI_CSS.match(/\.drawer-mask\s*\{[^}]*\}/) || [])[0] || '';
+  assert.ok(navRule.includes('position: relative'), 'z-index 生效前提是脱离 static，nav 必须 position: relative');
+  const navZ = Number((navRule.match(/z-index:\s*(\d+)/) || [])[1]);
+  const maskZ = Number((maskRule.match(/z-index:\s*(\d+)/) || [])[1]);
+  assert.ok(Number.isFinite(navZ), `nav 规则必须声明 z-index，实际规则：${navRule.trim()}`);
+  assert.ok(Number.isFinite(maskZ), '遮罩规则必须声明 z-index（层级比较的基准）');
+  assert.ok(navZ > maskZ, `nav 的 z-index（${navZ}）必须大于遮罩（${maskZ}）`);
 });
 
 test('UI_JS：抽屉状态进地址，刷新可还原', () => {

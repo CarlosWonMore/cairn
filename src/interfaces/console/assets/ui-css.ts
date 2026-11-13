@@ -39,7 +39,10 @@ header {
 header h1 { font-size: 15px; margin: 0; letter-spacing: .04em; font-weight: 600; }
 header .sub { color: var(--text-dim); font-size: 12px; }
 main { display: grid; grid-template-columns: 190px 1fr; min-height: calc(100vh - 53px); }
-nav { border-right: 1px solid var(--border); padding: 12px 0; background: var(--surface); }
+/* 导航必须浮在覆盖层之上（refine-drawer-nav-reachability）：抽屉打开时导航仍可点，
+   一次点击完成"关抽屉 + 切视图"。z-index 生效前提是脱离 static，position: relative 必需。
+   层级约定：任何覆盖层（如 .drawer-mask 的 50）必须 > 60，否则盖不住导航。 */
+nav { position: relative; z-index: 60; border-right: 1px solid var(--border); padding: 12px 0; background: var(--surface); }
 nav button {
   display: block; width: 100%; text-align: left; padding: 9px 18px;
   background: none; border: 0; border-left: 2px solid transparent;
@@ -85,7 +88,8 @@ button.action.primary { border-color: var(--warn); color: var(--warn); }
 }
 details summary { color: var(--text-dim); }
 /* 右侧抽屉（任务 4.3）：整体覆盖在内容上，不挤压表格列宽。
-   遮罩用固定透明度而不是变量：它要压暗的是它自己下面的内容，与主题无关。 */
+   遮罩用固定透明度而不是变量：它要压暗的是它自己下面的内容，与主题无关。
+   导航（z-index:60）在遮罩（50）之上，抽屉打开期间仍亮、仍可点——遮罩只压暗内容区。 */
 .drawer-mask {
   position: fixed; inset: 0; z-index: 50;
   background: rgba(2, 6, 23, .58);

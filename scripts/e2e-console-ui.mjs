@@ -200,7 +200,10 @@ async function main() {
     await page.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
 
     const dialog = page.locator('aside.drawer[role="dialog"]');
-    check('抽屉以 role=dialog + aria-modal 出现', (await dialog.getAttribute('aria-modal')) === 'true');
+    // 2026-11-14 规格修正（refine-drawer-nav-reachability）：导航在抽屉打开期间仍可交互，
+    // 抽屉如实声明非模态——从正向断言 aria-modal 改为反向断言（MUST NOT 出现）。
+    // 这是规格修正的必然结果，不是为了变绿而改断言：把 aria-modal 加回去，本条必须变红。
+    check('抽屉以非模态 dialog 出现（无 aria-modal）', (await dialog.getAttribute('aria-modal')) == null);
     check('抽屉有可读标题（aria-label）', ((await dialog.getAttribute('aria-label')) || '').length > 3);
 
     // 焦点必须移进抽屉，否则键盘用户在遮罩后的一堆表格里 tab
@@ -229,12 +232,14 @@ async function main() {
     check('Esc 关闭后焦点回到"查看"按钮', backText.trim() === '查看', backText.trim());
     check('关闭后地址栏不再带 drawer', !/drawer=/.test(page.url()), page.url());
 
-    // 2) 遮罩
+    // 2) 遮罩。点击点必须在内容区（x > 导航列 190px）：导航现在浮在遮罩之上（z-index 60），
+    //    点 x=5 会落在导航上而不是遮罩。视口 1280 宽，抽屉占右侧 720，内容区空白取 x=300。
     await viewBtns.first().click();
     await page.waitForSelector('aside.drawer[role="dialog"]');
-    await page.locator('.drawer-mask').click({ position: { x: 5, y: 300 } });
+    await page.locator('.drawer-mask').click({ position: { x: 300, y: 300 } });
     await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
     check('点遮罩关闭抽屉', (await page.locator('aside.drawer').count()) === 0);
+    check('点遮罩关闭后视图不变（仍在导入）', /[?&]view=imports/.test(page.url()), page.url());
 
     // 3) 关闭按钮
     await viewBtns.first().click();
@@ -242,6 +247,60 @@ async function main() {
     await page.locator('aside.drawer button:has-text("关闭")').click();
     await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
     check('点"关闭"按钮关闭抽屉', (await page.locator('aside.drawer').count()) === 0);
+
+    // ---------------------------------------------------------- C+. 导航可达（refine-drawer-nav-reachability）
+    // 抽屉打开时主导航必须一次可点：locator.click() 会等元素真正可接收事件，
+    // 若导航仍被遮罩（z-index 50）压住，这里直接超时失败——"能点过去"本身就是断言。
+    await viewBtns.first().click();
+    await page.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
+
+    // 命中测试：修正前实测 elementFromPoint(导航中心) 返回 .drawer-mask。
+    // 单独的 programmatic focus() 对被盖住的元素照样生效，证明不了层级，
+    // 所以命中这条才是 z-index 修正的真断言（变异去掉 nav 的 z-index 必须变红）。
+    const navHit = await page.evaluate(() => {
+      const b = document.querySelector('[data-view="memories"]');
+      if (!b) return false;
+      const r = b.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return hit === b || (hit != null && b.contains(hit));
+    });
+    check('抽屉打开时导航不被遮罩挡住（elementFromPoint 命中导航）', navHit);
+    const focusedView = await page.evaluate(() => {
+      document.querySelector('[data-view="memories"]').focus();
+      const a = document.activeElement;
+      return a && a.getAttribute ? a.getAttribute('data-view') : null;
+    });
+    check('抽屉打开时导航项可被聚焦（focus 后 activeElement 是导航项）', focusedView === 'memories', String(focusedView));
+
+    // 一次点击完成"关抽屉 + 切视图"（go() 内置切视图先收抽屉，此前只是鼠标够不着）
+    await page.click('[data-view="memories"]', { timeout: 5000 });
+    await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
+    check('抽屉打开时点导航一次切视图（无需先关抽屉）', (await page.locator('aside.drawer').count()) === 0);
+    check('一次点击后视图切到「记忆」', /[?&]view=memories/.test(page.url()), page.url());
+    check('一次点击后地址清除 drawer/mem 参数', !/drawer=|mem=/.test(page.url()), page.url());
+    check('aria-current 移到目标导航项', (await page.getAttribute('[data-view="memories"]', 'aria-current')) === 'true');
+
+    // ---------------------------------------------------------- C2. 移动端 375px：导航变顶部横条，同样一次可点（refine-drawer-nav-reachability）
+    const mctx = await browser.newContext({ viewport: { width: 375, height: 720 } });
+    const mp = await mctx.newPage();
+    const mErrors = [];
+    mp.on('pageerror', (e) => mErrors.push('pageerror: ' + e.message));
+    await mp.goto(`${server.tokenUrl}&view=imports`, { waitUntil: 'networkidle' });
+    const mBtn = mp.locator('table button:has-text("查看")').first();
+    const mBtnReady = await mBtn.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false);
+    if (mBtnReady) {
+      await mBtn.click();
+      await mp.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
+      await mp.click('[data-view="memories"]', { timeout: 5000 });
+      await mp.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
+      check('移动端抽屉打开时点顶部导航一次切视图', (await mp.locator('aside.drawer').count()) === 0);
+      check('移动端一次点击后视图切到「记忆」', /[?&]view=memories/.test(mp.url()), mp.url());
+      check('移动端一次点击后地址清除 drawer/mem 参数', !/drawer=|mem=/.test(mp.url()), mp.url());
+      check('移动端无脚本异常', mErrors.length === 0, mErrors.join(' | '));
+    } else {
+      check('移动端 375px 能打开导入抽屉（前置）', false, '未见可点的"查看"按钮');
+    }
+    await mctx.close();
 
     // ---------------------------------------------------------- D. 刷新还原
     await page.goto(`${server.tokenUrl}&view=imports&drawer=${drawerId}`, { waitUntil: 'networkidle' });
@@ -438,7 +497,8 @@ async function main() {
     const focusNow = async () => ((await page.evaluate(() => (document.activeElement || {}).textContent || '')) || '').trim();
     const closeBy = async (how) => {
       if (how === 'esc') await page.keyboard.press('Escape');
-      else if (how === 'mask') await page.locator('.drawer-mask').click({ position: { x: 5, y: 300 } });
+      // 遮罩点击点同样取内容区（x>190）：导航浮在遮罩之上后，x=5 会点在导航上
+      else if (how === 'mask') await page.locator('.drawer-mask').click({ position: { x: 300, y: 300 } });
       else await page.locator('aside.drawer button:has-text("关闭")').click();
       await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
     };
@@ -446,9 +506,10 @@ async function main() {
     // 1) Esc
     await detailBtn.click();
     await page.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
+    // 规格修正（refine-drawer-nav-reachability）：抽屉如实非模态，不再断言 aria-modal
     check(
-      '记忆详情在覆盖面板里打开（role=dialog + aria-modal）',
-      (await page.locator('aside.drawer[role="dialog"]').getAttribute('aria-modal')) === 'true',
+      '记忆详情在覆盖面板里打开（非模态 dialog：role=dialog，无 aria-modal）',
+      (await page.locator('aside.drawer[role="dialog"]').getAttribute('aria-modal')) == null,
     );
     await page.waitForSelector('[data-annotation-disposition]', { timeout: 5000 });
     check('详情抽屉有"写下意见"入口（类别下拉）', (await page.locator('[data-annotation-disposition] option').count()) >= 6);

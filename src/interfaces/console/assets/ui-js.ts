@@ -1346,7 +1346,9 @@ export const UI_JS = String.raw`
     closeDrawer();
     var prev = document.activeElement;
     var mask = el('div', { 'class': 'drawer-mask' });
-    var panel = el('aside', { 'class': 'drawer', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
+    // 非模态（refine-drawer-nav-reachability）：抽屉打开期间主导航仍可交互，
+    // 不声明模态属性，避免向读屏虚报"外面不可交互"。对话框语义与标题照旧。
+    var panel = el('aside', { 'class': 'drawer', role: 'dialog', 'aria-label': title });
     var head = el('div', { 'class': 'drawer-head' });
     head.appendChild(el('span', { style: 'font-weight:600' }, title));
     var x = el('button', { type: 'button', 'class': 'action close' }, '关闭');
