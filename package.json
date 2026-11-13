@@ -1,6 +1,6 @@
 {
   "name": "@carloswon/cairn-memory",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Cairn — 个人、多设备、多 Agent 的本地优先记忆主权层。本地 SQLite 为权威副本，云端仅作可选加密中继。",
   "license": "MIT",
   "type": "module",
