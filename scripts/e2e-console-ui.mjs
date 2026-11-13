@@ -331,8 +331,28 @@ async function main() {
     const localOut = await runCli(['add', '这条只留在本机：离线缓存目录是 .cairn/tmp。', '--scope', 'device-local']);
     if (localOut.code !== 0) throw new Error(`device-local 样本写入失败: ${localOut.stderr || localOut.stdout}`);
 
+    // 把列表撑长：4.5 断言"关闭详情后 scrollY 不变"，页面撑不满时那条断言是空过。
+    // 一次进程里灌 20 条（逐条 spawn CLI 会拖慢整轮），形状就够真实了。
+    writeFileSync(
+      join(home, 'seed-many.mjs'),
+      [
+        `import { AppService } from ${JSON.stringify(appUrl)};`,
+        `const svc = AppService.open(process.env.CAIRN_HOME);`,
+        `for (let i = 1; i <= 20; i++) svc.addMemory({ content: '滚动样本 ' + i + '：用来把记忆列表撑长的合成条目。' });`,
+        `svc.close();`,
+      ].join('\n'),
+      'utf8',
+    );
+    const many = await run([join(home, 'seed-many.mjs')], env);
+    if (many.code !== 0) throw new Error(`灌样本失败: ${many.stderr || many.stdout}`);
+
     await page.click('[data-view="memories"]');
     await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
+
+    // add-console-zh-labels 起默认态是中文标签：下面这组断言一字未改，只是先切到「原文」，
+    // 因为原文模式必须与引入本能力之前逐字节一致——这些断言正是那条边界的检查。
+    await page.click('button[data-action="label-lang"]');
+    await page.waitForTimeout(250);
 
     // 作用域徽章：每张卡片都有，且本地限定那条自解释（不只靠颜色）
     const SCOPE_BADGE = /^(personal-global|device-local|project-global|project-device|agent-private|session-ephemeral|custom|scope\?)( · 仅本机)?$/;
@@ -360,12 +380,123 @@ async function main() {
     );
     check('作用域过滤选项标出同步策略与记忆数', scopeBody.some((o) => /仅本机/.test(o)) && scopeBody.every((o) => / · \d+$/.test(o)), scopeBody.join(' | '));
 
-    // 5.2 详情页"写下意见"入口存在（不改正文）
-    await page.locator('div.card').filter({ has: page.locator(`input[data-pick="${memId}"]`) }).locator('button:has-text("详情 / 修订史")').click();
+    // ---------------------------------------------------------- G.0 标签语言可切换（add-console-zh-labels）
+    // 4.4 中↔原文互切、4.5 title 保留原值；并实测 5.4：切换不重查列表（design D5）。
+    let labelReqs = 0;
+    const onLabelRequest = (r) => { if (/\/api\/memories(\?|$)/.test(r.url())) labelReqs++; };
+    page.on('request', onLabelRequest);
+    const readChips = () =>
+      page.$$eval('#view div.card .chip', (els) =>
+        els.map((e) => ({ t: (e.textContent || '').trim(), title: e.getAttribute('title') })),
+      );
+
+    await page.click('button[data-action="label-lang"]');
+    await page.waitForTimeout(250);
+    const zhChips = await readChips();
+    const factChip = zhChips.find((c) => c.title === 'fact');
+    check('中文模式：kind 显示中文标签', factChip != null && factChip.t === '事实', factChip ? factChip.t : zhChips.slice(0, 6).map((c) => c.t).join(' | '));
+    check('中文模式：hover 的 title 保留原始枚举值', factChip != null && factChip.title === 'fact', factChip ? factChip.title : '');
+    check(
+      '中文模式：卡片上不再出现未翻译的枚举值',
+      !zhChips.some((c) => /^(fact|instruction|preference|decision|active|candidate|user_explicit|user_confirmed|personal-global|device-local)$/.test(c.t)),
+      zhChips.map((c) => c.t).slice(0, 8).join(' | '),
+    );
+
+    await page.click('button[data-action="label-lang"]');
+    await page.waitForTimeout(250);
+    const rawChips = await readChips();
+    check(
+      '切到原文后 chip 恢复原始枚举值（且不再挂 title）',
+      rawChips.some((c) => c.t === 'fact') && rawChips.every((c) => c.title == null),
+      rawChips.slice(0, 6).map((c) => c.t).join(' | '),
+    );
+
+    await page.click('button[data-action="label-lang"]');
+    await page.waitForTimeout(250);
+    page.off('request', onLabelRequest);
+    const backChips = await readChips();
+    check('再切回中文恢复中文标签', backChips.some((c) => c.t === '事实'), backChips.slice(0, 6).map((c) => c.t).join(' | '));
+    check('切换标签语言全程未重查 /api/memories（design D5）', labelReqs === 0, `${labelReqs} 次`);
+
+    // ---------------------------------------------------------- G.1 详情改为覆盖面板（refine-memory-detail-drawer）
+    // 4.3 列表不销毁 / 4.4 列表端点不重查 / 4.5 滚动位置不变 / 4.6 三入口都能关且归还焦点
+    const detailBtn = page
+      .locator('div.card')
+      .filter({ has: page.locator(`input[data-pick="${memId}"]`) })
+      .locator('button:has-text("详情 / 修订史")');
+    const cardsBefore = await page.locator('#view div.card').count();
+    await detailBtn.scrollIntoViewIfNeeded();
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    check('记忆列表已滚动到中部（scrollY 断言的前提）', scrollBefore > 0, `scrollY=${scrollBefore}；${cardsBefore} 张卡`);
+
+    let listReqs = 0;
+    const onRequest = (r) => {
+      if (/\/api\/memories(\?|$)/.test(r.url())) listReqs++;
+    };
+    page.on('request', onRequest);
+
+    const focusNow = async () => ((await page.evaluate(() => (document.activeElement || {}).textContent || '')) || '').trim();
+    const closeBy = async (how) => {
+      if (how === 'esc') await page.keyboard.press('Escape');
+      else if (how === 'mask') await page.locator('.drawer-mask').click({ position: { x: 5, y: 300 } });
+      else await page.locator('aside.drawer button:has-text("关闭")').click();
+      await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 });
+    };
+
+    // 1) Esc
+    await detailBtn.click();
+    await page.waitForSelector('aside.drawer[role="dialog"]', { timeout: 5000 });
+    check(
+      '记忆详情在覆盖面板里打开（role=dialog + aria-modal）',
+      (await page.locator('aside.drawer[role="dialog"]').getAttribute('aria-modal')) === 'true',
+    );
     await page.waitForSelector('[data-annotation-disposition]', { timeout: 5000 });
-    check('记忆详情有"写下意见"入口（类别下拉）', (await page.locator('[data-annotation-disposition] option').count()) >= 6);
-    await page.locator('button:has-text("← 返回列表")').click();
-    await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 5000 });
+    check('详情抽屉有"写下意见"入口（类别下拉）', (await page.locator('[data-annotation-disposition] option').count()) >= 6);
+    check('详情抽屉展示修订史', /修订史（\d+）/.test(await page.locator('aside.drawer').innerText()));
+    const cardsOpen = await page.locator('#view div.card').count();
+    check('打开详情后列表卡片仍在（数量不变）', cardsOpen === cardsBefore, `${cardsBefore} → ${cardsOpen}`);
+    check('打开详情后地址栏记录 mem（刷新/分享可还原）', /[?&]mem=/.test(page.url()), page.url());
+
+    await closeBy('esc');
+    check('Esc 关闭详情', (await page.locator('aside.drawer').count()) === 0);
+    const scrollAfter = await page.evaluate(() => window.scrollY);
+    check('Esc 关闭后滚动位置不变（容差 ≤ 2px）', Math.abs(scrollAfter - scrollBefore) <= 2, `${scrollBefore} → ${scrollAfter}`);
+    check('Esc 关闭后焦点回到触发按钮', (await focusNow()) === '详情 / 修订史', await focusNow());
+    check('关闭后地址栏不再带 mem', !/[?&]mem=/.test(page.url()), page.url());
+
+    // 2) 遮罩 / 3) 关闭按钮
+    await detailBtn.click();
+    await page.waitForSelector('aside.drawer[role="dialog"]');
+    await closeBy('mask');
+    check('点遮罩关闭详情', (await page.locator('aside.drawer').count()) === 0);
+    check('遮罩关闭后焦点回到触发按钮', (await focusNow()) === '详情 / 修订史', await focusNow());
+
+    await detailBtn.click();
+    await page.waitForSelector('aside.drawer[role="dialog"]');
+    await closeBy('button');
+    check('点"关闭"按钮关闭详情', (await page.locator('aside.drawer').count()) === 0);
+
+    page.off('request', onRequest);
+    check('进/出详情全程未发起列表查询（/api/memories）', listReqs === 0, `${listReqs} 次`);
+
+    // 4.7 地址带 mem → 刷新直接呈现同一条详情
+    await page.goto(`${server.tokenUrl}&view=memories&mem=${memId}`, { waitUntil: 'networkidle' });
+    const restoredDetail = await page
+      .waitForSelector('aside.drawer[role="dialog"]', { timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+    check('地址带 mem 时刷新直接呈现该详情面板', restoredDetail);
+    const restoredText = restoredDetail ? await page.locator('aside.drawer').innerText() : '';
+    check('刷新还原的是同一条记忆', /验证批注/.test(restoredText), restoredText.slice(0, 50).replace(/\n/g, ' | '));
+
+    // 4.8 切视图时面板关闭、mem 从地址移除（走导航按钮用的同一条 go() 路径）
+    await page.keyboard.press('5');
+    await page.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 }).catch(() => {});
+    check('切视图时详情面板关闭', (await page.locator('aside.drawer').count()) === 0);
+    check('切视图后地址不再残留 mem', !/[?&]mem=/.test(page.url()), page.url());
+
+    await page.click('[data-view="memories"]');
+    await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
 
     // 5.3 点选 + 批量标记
     await page.locator(`input[data-pick="${memId}"]`).check();
@@ -485,6 +616,9 @@ async function main() {
       // 作用域徽章在静态页照常渲染：同一条渲染路径，不发任何请求
       await sp.click('[data-view="memories"]');
       await sp.waitForTimeout(400);
+      // 默认中文标签：先切原文，下面两条断言保持原样（原文态逐字节不变）
+      await sp.click('button[data-action="label-lang"]');
+      await sp.waitForTimeout(200);
       const staticChips = await sp.$$eval('#view div.card .chip', (els) => els.map((e) => e.textContent || ''));
       check(
         '静态页记忆卡片同样渲染作用域徽章',
@@ -493,6 +627,40 @@ async function main() {
       );
       check('静态页本地限定徽章仍写明「仅本机」', staticChips.includes('device-local · 仅本机'), staticChips.filter((t) => /仅本机/.test(t)).join(' | ') || '未找到');
       check('静态页渲染徽章未发起网络请求', netRequests.length === 0, netRequests.slice(0, 2).join(' | '));
+
+      // 4.6 静态导出页同样可切换标签语言，且不发起任何网络请求
+      const netBefore = netRequests.length;
+      await sp.click('button[data-action="label-lang"]');
+      await sp.waitForTimeout(250);
+      const staticZh = await sp.$$eval('#view div.card .chip', (els) =>
+        els.map((e) => ({ t: (e.textContent || '').trim(), title: e.getAttribute('title') })),
+      );
+      check(
+        '静态页切回中文后标签变中文（title 保留原文）',
+        staticZh.some((c) => /[\u4e00-\u9fff]/.test(c.t) && c.title != null),
+        staticZh.slice(0, 6).map((c) => c.t).join(' | '),
+      );
+      const netAfterToggle = netRequests.length;
+      check('静态页切换标签语言不发请求', netAfterToggle === netBefore, `${netAfterToggle - netBefore} 个`);
+      // 切回中文，让后续断言跑在确定的语言态上（详情面板与语言无关，但不要留悬念）
+      await sp.click('button[data-action="label-lang"]');
+      await sp.waitForTimeout(200);
+
+      // 静态页详情也从内嵌模型进抽屉（两种形态同一套抽屉，只读边界不变）
+      const sDetail = sp.locator('#view div.card button:has-text("详情 / 修订史")').first();
+      if ((await sDetail.count()) >= 1) {
+        await sDetail.click();
+        const sDetailOk = await sp
+          .waitForSelector('aside.drawer[role="dialog"]', { timeout: 4000 })
+          .then(() => true)
+          .catch(() => false);
+        check('静态页详情同样进抽屉', sDetailOk);
+        const sDetailText = sDetailOk ? await sp.locator('aside.drawer').innerText() : '';
+        check('静态页详情不发请求（数据来自内嵌模型）', sDetailOk && netRequests.length === 0, `${netRequests.length} 个请求`);
+        check('静态页详情不提供写入口', !/写下意见/.test(sDetailText), sDetailText.slice(0, 40).replace(/\n/g, ' | '));
+        await sp.keyboard.press('Escape');
+        await sp.waitForSelector('aside.drawer', { state: 'detached', timeout: 3000 }).catch(() => {});
+      }
 
       // 静态页仍要能点开抽屉看条目，只是没有写入口
       await sp.click('[data-view="imports"]');

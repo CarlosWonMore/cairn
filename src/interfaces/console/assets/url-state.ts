@@ -6,12 +6,12 @@
  * 不会出现"测试绿了、页面另写一份"的双实现漂移。
  */
 
-export const URL_STATE_KEYS = ['view', 'q', 'scope', 'status', 'kind', 'batch', 'plan', 'drawer', 'item'] as const;
+export const URL_STATE_KEYS = ['view', 'q', 'scope', 'status', 'kind', 'batch', 'plan', 'drawer', 'item', 'mem'] as const;
 
 export const URL_STATE_SRC = String.raw`
   var DEFAULT_VIEW = 'overview';
   /** 唯一键表：encode / decode 都从这里读，加键只改这一处。 */
-  var KEYS = ['view', 'q', 'scope', 'status', 'kind', 'batch', 'plan', 'drawer', 'item'];
+  var KEYS = ['view', 'q', 'scope', 'status', 'kind', 'batch', 'plan', 'drawer', 'item', 'mem'];
 
   /** 只认白名单键；未给出的键不写，避免把 undefined 写成字符串 "undefined"。 */
   function encodeState(st) {

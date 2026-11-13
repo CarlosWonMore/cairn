@@ -32,6 +32,7 @@ test('往返一致：全部白名单键都能原样还原', () => {
     plan: 'p-1',
     drawer: 'archive-1',
     item: 'item-9',
+    mem: 'mem-1',
     mode: 'full',
   };
   const got = codec.decodeState('?' + codec.encodeState(st), null);
@@ -53,6 +54,20 @@ test('抽屉状态可分享：drawer + item 同时还原', () => {
   assert.equal(got.drawer, 'archive-42');
   assert.equal(got.item, 'item-7');
   assert.equal(got.view, 'imports');
+});
+
+test('mem：详情标识往返，没打开详情时不写进地址', () => {
+  // 详情可寻址（refine-memory-detail-drawer 3.1）：mem 与 drawer 是两个语义，
+  // 各自独立往返，避免切视图时互相清错。
+  assert.equal(parse(codec.encodeState({ view: 'memories', mem: 'mem-9', mode: 'brief' })).get('mem'), 'mem-9');
+  assert.equal(parse(codec.encodeState({ view: 'memories', mode: 'brief' })).get('mem'), null, '没有详情就不该多一个空参数');
+  assert.equal(codec.decodeState('?view=memories&mem=mem-9&mode=brief', null).mem, 'mem-9');
+  assert.equal(codec.decodeState('?view=memories&mem=&mode=brief', null).mem, undefined, '空值按未打开处理');
+  assert.equal(
+    codec.decodeState('?view=imports&drawer=archive-1&mem=mem-9&mode=brief', null).drawer,
+    'archive-1',
+    '两个键并存时互不干扰',
+  );
 });
 
 test('默认视图不写进 URL，保持地址干净', () => {

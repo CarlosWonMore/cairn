@@ -38,6 +38,8 @@ export const UI_JS = String.raw`
 
   var MODE_KEY = 'cairn.mode';
   var THEME_KEY = 'cairn.theme';
+  /** 标签语言与主题同类：只是阅读偏好，不进地址栏（design D4）。 */
+  var LABEL_KEY = 'cairn.labelLang';
   var BRIEF_CHARS = 240;
 
   var state = {
@@ -47,10 +49,16 @@ export const UI_JS = String.raw`
     status: '',
     kind: '',
     mode: 'brief',
+    /** 'zh' 中文标签（默认）/ 'raw' 原文，见 add-console-zh-labels。 */
+    labelLang: 'zh',
+    /** 最近一次 /api/memories 的结果：切换标签语言只重绘它，不重查（design D5）。 */
+    memData: null,
     batch: '',
     plan: '',
     drawer: '',
     item: '',
+    /** 抽屉里正在查看的记忆 id（与 drawer 的导入语义分开，见 refine-memory-detail-drawer D3）。 */
+    mem: '',
     reveal: {},
     itemsCache: {},
     revisionStatus: '',
@@ -67,12 +75,16 @@ export const UI_JS = String.raw`
   // ---------------------------------------------------------------- 基础工具
   function el(tag, attrs, text) {
     var n = document.createElement(tag);
-    if (attrs) Object.keys(attrs).forEach(function (k) { n.setAttribute(k, attrs[k]); });
+    // null/undefined 属性跳过：否则 setAttribute 会写成字符串 "null"。
+    if (attrs) Object.keys(attrs).forEach(function (k) { if (attrs[k] != null) n.setAttribute(k, attrs[k]); });
     if (text !== undefined && text !== null) n.textContent = String(text);
     return n;
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-  function chip(text, kind) { return el('span', { 'class': 'chip ' + (kind || 'muted') }, text); }
+  /** title 可选：只有中文模式下被翻译过的标签才挂原文（design D3）。 */
+  function chip(text, kind, title) {
+    return el('span', { 'class': 'chip ' + (kind || 'muted'), title: title }, text);
+  }
   function card(k, v, kind) {
     var c = el('div', { 'class': 'card' + (kind ? ' ' + kind : '') });
     c.appendChild(el('div', { 'class': 'k' }, k));
@@ -114,6 +126,42 @@ export const UI_JS = String.raw`
     needs_rescope: 'warn'
   };
   var ANN_STATUS_LABEL = { open: '待处理', resolved: '已处置', ignored: '已忽略' };
+
+  // 记忆本体与作用域这组枚举的中文表达（add-console-zh-labels）。单点定义：
+  // 新增枚举只改这里；页面各处一律走 label()，不各自拼一份词表。
+  var KIND_LABEL = {
+    instruction: '指令', preference: '偏好', fact: '事实', decision: '决策',
+    episode: '经历', procedure: '流程', environment: '环境', lesson: '经验'
+  };
+  var STATUS_LABEL = {
+    candidate: '候选', active: '生效', conflicted: '冲突', superseded: '已被取代',
+    archived: '已归档', tombstoned: '已遗忘'
+  };
+  var AUTHORITY_LABEL = {
+    user_explicit: '用户明示', user_confirmed: '用户确认', agent_inferred: 'Agent 推断',
+    imported_unverified: '导入未核实'
+  };
+  var PRESET_LABEL = {
+    'personal-global': '个人全局', 'device-local': '本机限定', 'project-global': '项目全局',
+    'project-device': '项目本机', 'agent-private': 'Agent 私有',
+    'session-ephemeral': '会话临时', custom: '自定义'
+  };
+  var SYNC_POLICY_LABEL = { encrypted: '云端同步', local_only: '仅本机' };
+  var SCAN_STATE_LABEL = { pending: '待扫描', clean: '干净', blocked: '已阻断' };
+  // 键是落库值去掉 scanned_ 前缀后的形态——原文模式显示的正是这个形态，保持逐字节一致。
+  var REDACTION_LABEL = { not_scanned: '未扫描', clean: '未发现阻断', blocked: '已阻断' };
+
+  /**
+   * 单点映射：原文模式或词表缺该值时原样返回（新枚举最坏是回到原文，不是空白）。
+   * 语言判断放在这里而不是各调用点——否则漏包一处的表现是"原文模式里冒出中文"，很难发现。
+   */
+  function label(v, table) { return state.labelLang === 'raw' || !table || !table[v] ? v : table[v]; }
+
+  /** 中文模式下的标签 chip：把原始枚举值挂到 title，切语言也不丢真实取值。 */
+  function chipLabel(v, table, kind) {
+    var t = label(v, table);
+    return chip(t, kind, t === v ? null : v);
+  }
 
   function toast(msg, isErr) {
     var t = el('div', { 'class': 'warnbar' }, msg);
@@ -204,6 +252,7 @@ export const UI_JS = String.raw`
     state.plan = got.plan || '';
     state.drawer = got.drawer || '';
     state.item = got.item || '';
+    state.mem = got.mem || '';
     state.mode = got.mode;
   }
 
@@ -247,6 +296,7 @@ export const UI_JS = String.raw`
     if (view !== state.view) {
       state.drawer = '';
       state.item = '';
+      state.mem = '';
       closeDrawer();
     }
     state.view = view;
@@ -255,7 +305,11 @@ export const UI_JS = String.raw`
     render();
   }
 
-  function render() {
+  /**
+   * reuseMem：只重绘已加载的记忆列表，不重查（标签语言切换用，design D5）。
+   * 其它调用点一律不带参数，走的仍是原来的"重新拉数据"路径。
+   */
+  function render(reuseMem) {
     var host = document.getElementById('view');
     var banners = Array.prototype.slice.call(host.querySelectorAll ? host.children : []).filter(function (n) {
       return n.className && String(n.className).indexOf('warnbar') === 0;
@@ -267,7 +321,7 @@ export const UI_JS = String.raw`
     host.appendChild(body);
     if (STATIC && state.view === 'overview') return renderOverview(body);
     if (state.view === 'overview') return renderOverview(body);
-    if (state.view === 'memories') return renderMemories(body);
+    if (state.view === 'memories') return renderMemories(body, reuseMem);
     if (state.view === 'annotations') return renderAnnotations(body);
     if (state.view === 'revisions') return renderRevisions(body);
     if (state.view === 'imports') return renderImports(body);
@@ -307,9 +361,10 @@ export const UI_JS = String.raw`
       sel.appendChild(el('option', { value: '' }, '全部层级'));
       opts.scopes.forEach(function (s) {
         var cue = scopeCue(s);
-        var text = s.preset + (cue ? ' · ' + cue : '') + (scopeLocalOnly(s) ? ' · 仅本机' : '') +
+        var presetText = label(s.preset, PRESET_LABEL);
+        var text = presetText + (cue ? ' · ' + cue : '') + (scopeLocalOnly(s) ? ' · 仅本机' : '') +
           (s.counts && s.counts.total ? ' · ' + s.counts.total : '');
-        var o = el('option', { value: s.id }, text);
+        var o = el('option', { value: s.id, title: presetText === s.preset ? null : s.preset }, text);
         if (s.id === state.scope) o.setAttribute('selected', 'selected');
         sel.appendChild(o);
       });
@@ -321,7 +376,8 @@ export const UI_JS = String.raw`
       ss.style.cssText = sel ? sel.style.cssText : '';
       ss.appendChild(el('option', { value: '' }, '全部状态'));
       (opts.statuses || []).forEach(function (v) {
-        var o = el('option', { value: v }, v);
+        var t = label(v, STATUS_LABEL);
+        var o = el('option', { value: v, title: t === v ? null : v }, t);
         if (v === state.status) o.setAttribute('selected', 'selected');
         ss.appendChild(o);
       });
@@ -331,7 +387,20 @@ export const UI_JS = String.raw`
     var modeBtn = el('button', { type: 'button', 'class': 'action', 'data-action': 'mode', title: '切换摘要/全文（M）' }, state.mode === 'full' ? '显示摘要' : '显示全文');
     modeBtn.addEventListener('click', toggleMode);
     bar.appendChild(modeBtn);
+    var langBtn = el('button', {
+      type: 'button', 'class': 'action', 'data-action': 'label-lang',
+      title: '切换标签语言（当前' + (state.labelLang === 'zh' ? '中文标签' : '原文标签') + '）'
+    }, state.labelLang === 'zh' ? '原文标签' : '中文标签');
+    langBtn.addEventListener('click', toggleLabelLang);
+    bar.appendChild(langBtn);
     host.appendChild(bar);
+  }
+
+  function toggleLabelLang() {
+    state.labelLang = state.labelLang === 'zh' ? 'raw' : 'zh';
+    try { localStorage.setItem(LABEL_KEY, state.labelLang); } catch (e) {}
+    // 只重绘已加载的列表：标签语言不是查询条件，重查会重置滚动位置（design D5）。
+    render(true);
   }
 
   function toggleMode() {
@@ -370,13 +439,15 @@ export const UI_JS = String.raw`
         table.appendChild(head);
         model.scopes.forEach(function (s) {
           var tr = el('tr');
-          tr.appendChild(el('td', null, s.preset));
+          var presetText = label(s.preset, PRESET_LABEL);
+          tr.appendChild(el('td', { title: presetText === s.preset ? null : s.preset }, presetText));
           tr.appendChild(el('td', null, s.scopeKind));
-          var td2 = el('td'); td2.appendChild(chip(s.syncPolicy, s.syncPolicy === 'local_only' ? 'muted' : 'info')); tr.appendChild(td2);
+          var td2 = el('td'); td2.appendChild(chipLabel(s.syncPolicy, SYNC_POLICY_LABEL, s.syncPolicy === 'local_only' ? 'muted' : 'info')); tr.appendChild(td2);
           tr.appendChild(el('td', null, s.counts.total));
           var td3 = el('td');
           Object.keys(s.counts.byStatus).forEach(function (st) {
-            td3.appendChild(chip(st + ' ' + s.counts.byStatus[st], STATUS_CHIP[st] || 'muted'));
+            var stText = label(st, STATUS_LABEL);
+            td3.appendChild(chip(stText + ' ' + s.counts.byStatus[st], STATUS_CHIP[st] || 'muted', stText === st ? null : st));
             td3.appendChild(document.createTextNode(' '));
           });
           tr.appendChild(td3);
@@ -421,13 +492,15 @@ export const UI_JS = String.raw`
         table.appendChild(head);
         scopes.forEach(function (s) {
           var tr = el('tr');
-          tr.appendChild(el('td', null, s.preset));
+          var presetText = label(s.preset, PRESET_LABEL);
+          tr.appendChild(el('td', { title: presetText === s.preset ? null : s.preset }, presetText));
           tr.appendChild(el('td', null, s.scopeKind));
-          var td2 = el('td'); td2.appendChild(chip(s.syncPolicy, s.syncPolicy === 'local_only' ? 'muted' : 'info')); tr.appendChild(td2);
+          var td2 = el('td'); td2.appendChild(chipLabel(s.syncPolicy, SYNC_POLICY_LABEL, s.syncPolicy === 'local_only' ? 'muted' : 'info')); tr.appendChild(td2);
           tr.appendChild(el('td', null, s.counts.total));
           var td3 = el('td');
           Object.keys(s.counts.byStatus || {}).forEach(function (st) {
-            td3.appendChild(chip(st + ' ' + s.counts.byStatus[st], STATUS_CHIP[st] || 'muted'));
+            var stText = label(st, STATUS_LABEL);
+            td3.appendChild(chip(stText + ' ' + s.counts.byStatus[st], STATUS_CHIP[st] || 'muted', stText === st ? null : st));
             td3.appendChild(document.createTextNode(' '));
           });
           tr.appendChild(td3);
@@ -454,20 +527,32 @@ export const UI_JS = String.raw`
     return pre;
   }
 
-  function renderMemories(host) {
+  function renderMemories(host, reuse) {
     if (STATIC) {
       var model = staticModel();
       toolbar(host, { scopes: model.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
       var list = localFilter(model.memories, { scope: state.scope, status: state.status });
       paintMemories(host, list, list.length, model.scopes);
+      // 地址带 mem = 刷新/分享回来的详情，直接重新打开（静态页不发请求）。
+      if (state.mem) openDetail(state.mem);
       return;
     }
+    // 标签语言切换：重绘上一次的结果。抽屉开着时按钮在遮罩下点不到，所以这里不重开详情
+    // ——重开必然要再查一次详情，与本能力"切换不触发数据请求"的承诺冲突。
+    if (reuse && state.memData) { paintMemoriesView(host, state.memData); return; }
     loading(host);
     api('/api/memories?' + qs()).then(function (data) {
+      state.memData = data;
       clear(host);
-      toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
-      paintMemories(host, data.memories, data.total, data.scopes);
+      paintMemoriesView(host, data);
+      if (state.mem) openDetail(state.mem);
     }).catch(function (e) { clear(host); fail(host, e); });
+  }
+
+  /** 列表骨架：工具栏 + 卡片。数据已在手时只重绘，不再请求。 */
+  function paintMemoriesView(host, data) {
+    toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
+    paintMemories(host, data.memories, data.total, data.scopes);
   }
 
   function paintMemories(host, list, total, scopes) {
@@ -489,12 +574,15 @@ export const UI_JS = String.raw`
         });
         head.appendChild(pick);
       }
-      head.appendChild(chip(mem.kind, 'info'));
-      head.appendChild(chip(mem.status, STATUS_CHIP[mem.status] || 'muted'));
+      head.appendChild(chipLabel(mem.kind, KIND_LABEL, 'info'));
+      head.appendChild(chipLabel(mem.status, STATUS_LABEL, STATUS_CHIP[mem.status] || 'muted'));
       var scope = byScope[mem.scopeId];
       if (!scope) head.appendChild(chip('scope?', 'muted'));
-      else head.appendChild(chip(scope.preset + (scopeLocalOnly(scope) ? ' · 仅本机' : ''), scopeLocalOnly(scope) ? 'warn' : 'muted'));
-      head.appendChild(chip(mem.authority, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
+      else {
+        var presetText = label(scope.preset, PRESET_LABEL);
+        head.appendChild(chip(presetText + (scopeLocalOnly(scope) ? ' · 仅本机' : ''), scopeLocalOnly(scope) ? 'warn' : 'muted', presetText === scope.preset ? null : scope.preset));
+      }
+      head.appendChild(chipLabel(mem.authority, AUTHORITY_LABEL, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
       if (mem.sensitivity === 'sensitive') head.appendChild(chip('sensitive', 'danger'));
       if (mem.openConflicts > 0) head.appendChild(chip('冲突 ' + mem.openConflicts, 'danger'));
       head.appendChild(el('span', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11.5px' }, mem.id.slice(0, 8)));
@@ -513,13 +601,12 @@ export const UI_JS = String.raw`
       }
       box.appendChild(head);
       box.appendChild(contentNode(mem.content));
-      if (!STATIC) {
-        var link = el('div', { style: 'margin-top:8px' });
-        var b = el('button', { type: 'button', 'class': 'action' }, '详情 / 修订史');
-        b.addEventListener('click', function () { state.plan = ''; openDetail(mem.id); });
-        link.appendChild(b);
-        box.appendChild(link);
-      }
+      // 静态页也能看详情：数据走内嵌模型，不发请求（提案要求两种形态行为一致）。
+      var link = el('div', { style: 'margin-top:8px' });
+      var b = el('button', { type: 'button', 'class': 'action' }, '详情 / 修订史');
+      b.addEventListener('click', function () { state.plan = ''; openDetail(mem.id); });
+      link.appendChild(b);
+      box.appendChild(link);
       host.appendChild(box);
     });
   }
@@ -771,73 +858,115 @@ export const UI_JS = String.raw`
     return c;
   }
 
+  /**
+   * 详情以**覆盖面板**呈现（refine-memory-detail-drawer）：复用导入视图那个 openDrawer，
+   * 不再 clear(#view)。列表 DOM 从头到尾没被销毁，所以关闭后滚动位置与顺序天然保持
+   * ——不恢复，而是不破坏，因此这里没有任何 saveScroll/restoreScroll。
+   */
   function openDetail(id) {
-    var host = document.getElementById('view');
-    api('/api/memories/' + encodeURIComponent(id) + '?mode=' + state.mode + '&redact=0').then(function (d) {
-      clear(host);
-      var back = el('button', { type: 'button', 'class': 'action' }, '← 返回列表');
-      back.addEventListener('click', function () { render(); });
-      host.appendChild(back);
-      var box = el('div', { 'class': 'card', style: 'margin-top:12px' });
-      box.appendChild(el('div', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11.5px;margin-bottom:8px' }, d.memory.id));
-      box.appendChild(contentNode(d.memory.content));
-      host.appendChild(box);
+    if (STATIC) {
+      var d = detailFromModel(id);
+      if (!d) { toast('静态导出里没有这条记忆', true); return; }
+      showDetail(d);
+      return;
+    }
+    api('/api/memories/' + encodeURIComponent(id) + '?mode=' + state.mode + '&redact=0')
+      .then(showDetail)
+      .catch(function (e) { toast('读取详情失败：' + e.message, true); });
+  }
 
-      var meta = el('table', { style: 'margin-top:16px' });
-      [['kind', d.memory.kind], ['status', d.memory.status], ['authority', d.memory.authority],
-       ['sensitivity', d.memory.sensitivity], ['scope', d.scope ? d.scope.preset + ' / ' + d.scope.syncPolicy : '—'],
-       ['createdAt', fmtTime(d.memory.createdAt)], ['updatedAt', fmtTime(d.memory.updatedAt)],
-       ['contentHash', d.memory.contentHash]].forEach(function (pair) {
+  /** 静态导出没有 /api/*：详情从内嵌模型拼，不发任何请求。修订史与证据不在导出里。 */
+  function detailFromModel(id) {
+    var model = staticModel();
+    var mem = null;
+    (model.memories || []).forEach(function (x) { if (x.id === id) mem = x; });
+    if (!mem) return null;
+    var scope = null;
+    (model.scopes || []).forEach(function (s) { if (s.id === mem.scopeId) scope = s; });
+    return { memory: mem, scope: scope, revisions: [], evidence: [], conflicts: [], tombstone: null };
+  }
+
+  function showDetail(d) {
+    state.mem = d.memory.id;
+    writeUrl(false);
+    var text = d.memory.content && d.memory.content.text;
+    var title = short(text ? String(text).replace(/\s+/g, ' ') : String(d.memory.id).slice(0, 8), 40);
+    // onClose 只清状态与地址，不 render()：列表没被销毁，重查一次既没必要也会打乱顺序。
+    openDrawer(title, buildDetailBody(d), function () {
+      state.mem = '';
+      writeUrl(false);
+    });
+  }
+
+  /** 详情内容本身：正文、meta 表、写下意见、批注、修订史。承载容器由调用方决定。 */
+  function buildDetailBody(d) {
+    var host = el('div');
+    var box = el('div', { 'class': 'card', style: 'margin-top:12px' });
+    box.appendChild(el('div', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11.5px;margin-bottom:8px' }, d.memory.id));
+    box.appendChild(contentNode(d.memory.content));
+    host.appendChild(box);
+
+    var meta = el('table', { style: 'margin-top:16px' });
+    var scopeRaw = d.scope ? d.scope.preset + ' / ' + d.scope.syncPolicy : '—';
+    var scopeShown = d.scope ? label(d.scope.preset, PRESET_LABEL) + ' / ' + label(d.scope.syncPolicy, SYNC_POLICY_LABEL) : '—';
+    // [字段名, 显示值, 原始值]：两者不同时把原文挂到 title，中文模式也看得到库里的真实取值。
+    [['kind', label(d.memory.kind, KIND_LABEL), d.memory.kind],
+     ['status', label(d.memory.status, STATUS_LABEL), d.memory.status],
+     ['authority', label(d.memory.authority, AUTHORITY_LABEL), d.memory.authority],
+     ['sensitivity', d.memory.sensitivity, d.memory.sensitivity],
+     ['scope', scopeShown, scopeRaw],
+     ['createdAt', fmtTime(d.memory.createdAt), null], ['updatedAt', fmtTime(d.memory.updatedAt), null],
+     ['contentHash', d.memory.contentHash, null]].forEach(function (pair) {
+      var tr = el('tr');
+      tr.appendChild(el('th', null, pair[0]));
+      tr.appendChild(el('td', { 'class': 'mono', title: pair[1] === pair[2] ? null : pair[2] }, pair[1]));
+      meta.appendChild(tr);
+    });
+    host.appendChild(meta);
+
+    if (!STATIC) {
+      host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '写下意见（不修改记忆）'));
+      var annHost = el('div', { 'data-memory-annotations': '1' });
+      host.appendChild(annotationForm(d.memory.id, function () { loadAnnotationCards(d.memory.id, annHost); }));
+      host.appendChild(annHost);
+      loadAnnotationCards(d.memory.id, annHost);
+    }
+
+    host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '修订史（' + d.revisions.length + '）'));
+    d.revisions.forEach(function (r) {
+      var rv = el('div', { 'class': 'card', style: 'margin-bottom:8px' });
+      var h = el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px' });
+      h.appendChild(chip('seq ' + r.seq, 'info'));
+      h.appendChild(el('span', { 'class': 'empty', style: 'padding:0;font-size:11.5px' }, r.author + ' · ' + fmtTime(r.createdAt) + (r.reason ? ' · ' + r.reason : '')));
+      rv.appendChild(h);
+      rv.appendChild(contentNode(r.content));
+      host.appendChild(rv);
+    });
+
+    if (d.tombstone) {
+      host.appendChild(el('div', { 'class': 'warnbar', style: 'margin-top:14px' },
+        '已遗忘：' + (d.tombstone.reason || '(无理由)') + ' · ' + d.tombstone.forgottenBy + ' · ' + fmtTime(d.tombstone.forgottenAt)));
+    }
+    if (d.evidence.length) {
+      host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '证据（' + d.evidence.length + '）'));
+      var et = el('table');
+      d.evidence.forEach(function (e) {
         var tr = el('tr');
-        tr.appendChild(el('th', null, pair[0]));
-        tr.appendChild(el('td', { 'class': 'mono' }, pair[1]));
-        meta.appendChild(tr);
+        tr.appendChild(el('td', null, e.evidenceKind));
+        tr.appendChild(el('td', null, e.trustLevel));
+        tr.appendChild(el('td', { 'class': 'mono' }, e.locator || '—'));
+        tr.appendChild(el('td', null, fmtTime(e.createdAt)));
+        et.appendChild(tr);
       });
-      host.appendChild(meta);
-
-      if (!STATIC) {
-        host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '写下意见（不修改记忆）'));
-        var annHost = el('div', { 'data-memory-annotations': '1' });
-        host.appendChild(annotationForm(d.memory.id, function () { loadAnnotationCards(d.memory.id, annHost); }));
-        host.appendChild(annHost);
-        loadAnnotationCards(d.memory.id, annHost);
-      }
-
-      host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '修订史（' + d.revisions.length + '）'));
-      d.revisions.forEach(function (r) {
-        var rv = el('div', { 'class': 'card', style: 'margin-bottom:8px' });
-        var h = el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px' });
-        h.appendChild(chip('seq ' + r.seq, 'info'));
-        h.appendChild(el('span', { 'class': 'empty', style: 'padding:0;font-size:11.5px' }, r.author + ' · ' + fmtTime(r.createdAt) + (r.reason ? ' · ' + r.reason : '')));
-        rv.appendChild(h);
-        rv.appendChild(contentNode(r.content));
-        host.appendChild(rv);
+      host.appendChild(et);
+    }
+    if (d.conflicts.length) {
+      host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '冲突（' + d.conflicts.length + '）'));
+      d.conflicts.forEach(function (c) {
+        host.appendChild(el('div', { 'class': 'empty' }, c.status + ' · 检测于 ' + fmtTime(c.detectedAt)));
       });
-
-      if (d.tombstone) {
-        host.appendChild(el('div', { 'class': 'warnbar', style: 'margin-top:14px' },
-          '已遗忘：' + (d.tombstone.reason || '(无理由)') + ' · ' + d.tombstone.forgottenBy + ' · ' + fmtTime(d.tombstone.forgottenAt)));
-      }
-      if (d.evidence.length) {
-        host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '证据（' + d.evidence.length + '）'));
-        var et = el('table');
-        d.evidence.forEach(function (e) {
-          var tr = el('tr');
-          tr.appendChild(el('td', null, e.evidenceKind));
-          tr.appendChild(el('td', null, e.trustLevel));
-          tr.appendChild(el('td', { 'class': 'mono' }, e.locator || '—'));
-          tr.appendChild(el('td', null, fmtTime(e.createdAt)));
-          et.appendChild(tr);
-        });
-        host.appendChild(et);
-      }
-      if (d.conflicts.length) {
-        host.appendChild(el('h2', { style: 'font-size:13px;color:var(--text-dim);margin:18px 0 8px' }, '冲突（' + d.conflicts.length + '）'));
-        d.conflicts.forEach(function (c) {
-          host.appendChild(el('div', { 'class': 'empty' }, c.status + ' · 检测于 ' + fmtTime(c.detectedAt)));
-        });
-      }
-    }).catch(function (e) { toast('读取详情失败：' + e.message, true); });
+    }
+    return host;
   }
 
   // ---------------------------------------------------------------- 导入工作台
@@ -1052,7 +1181,8 @@ export const UI_JS = String.raw`
       var meta = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px' });
       meta.appendChild(chip(r.sourceKind, 'info'));
       meta.appendChild(chip(r.parser, 'muted'));
-      meta.appendChild(chip(r.redactionState.replace('scanned_', ''), r.redactionState === 'scanned_blocked' ? 'warn' : 'ok'));
+      var redaction = r.redactionState.replace('scanned_', '');
+      meta.appendChild(chipLabel(redaction, REDACTION_LABEL, r.redactionState === 'scanned_blocked' ? 'warn' : 'ok'));
       meta.appendChild(chip(fmtBytes(r.byteSize), 'muted'));
       meta.appendChild(chip('导入 ' + fmtTime(r.importedAt), 'muted'));
       if (r.importCount > 1) meta.appendChild(chip('同源 ' + r.importCount + ' 次导入', 'pending'));
@@ -1115,7 +1245,7 @@ export const UI_JS = String.raw`
         var c = el('div', { 'class': 'card', style: 'margin-bottom:8px' + (it.id === state.item ? ';border-color:var(--layer)' : '') });
         var h = el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap' });
         h.appendChild(chip('#' + (it.itemIndex + 1), 'muted'));
-        h.appendChild(chip(it.scanState, it.scanState === 'blocked' ? 'warn' : 'ok'));
+        h.appendChild(chipLabel(it.scanState, SCAN_STATE_LABEL, it.scanState === 'blocked' ? 'warn' : 'ok'));
         if (it.contentAvailable === false) h.appendChild(chip('原文未入库', 'danger'));
         h.appendChild(el('span', { 'class': 'mono', style: 'color:var(--text-dim);font-size:11px' }, it.contentHash.slice(0, 12)));
         c.appendChild(h);
@@ -1396,6 +1526,10 @@ export const UI_JS = String.raw`
   var savedTheme = null;
   try { savedTheme = localStorage.getItem(THEME_KEY); } catch (e) {}
   if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+  // 没有这个键就按默认中文：旧用户不需要迁移代码（design Migration）。
+  var savedLabel = null;
+  try { savedLabel = localStorage.getItem(LABEL_KEY); } catch (e) {}
+  if (savedLabel === 'raw') state.labelLang = 'raw';
   readUrl();
   renderNav();
   render();
