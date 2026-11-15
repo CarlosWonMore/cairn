@@ -95,6 +95,12 @@ export interface MemoryRecord {
   sensitivity: Sensitivity;
   currentRevisionId: string | null;
   contentHash: string;
+  /**
+   * 归属设备（add-cloud-preserve-mode D7）：本机创建 = 本机设备标识；
+   * 同步到达 = 事件来源设备；NULL = 未知（存量记忆）。溯源事实，一经写入
+   * 不被修订改写，不参与读取授权（授权仍以作用域为唯一依据）。
+   */
+  originDeviceId: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;

@@ -28,6 +28,7 @@ test('往返一致：全部白名单键都能原样还原', () => {
     scope: 'scope-1',
     status: 'active',
     kind: 'fact',
+    device: 'dev_abc123',
     batch: 'b-1',
     plan: 'p-1',
     drawer: 'archive-1',
@@ -37,6 +38,12 @@ test('往返一致：全部白名单键都能原样还原', () => {
   };
   const got = codec.decodeState('?' + codec.encodeState(st), null);
   assert.deepEqual(got, st);
+});
+
+test('来源设备过滤的 unknown 保留值原样往返（add-cloud-preserve-mode 0a.3）', () => {
+  const st = { view: 'memories', device: 'unknown', mode: 'brief' };
+  const got = codec.decodeState('?' + codec.encodeState(st), null);
+  assert.equal(got.device, 'unknown');
 });
 
 test('白名单键表与页面源码里的 KEYS 一致', () => {

@@ -397,3 +397,50 @@ test('imports：自动整理后行上挂策略标识，撤销后标已撤销', a
     ctx.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 来源设备过滤与徽章数据（add-cloud-preserve-mode 0a.2）
+// ---------------------------------------------------------------------------
+
+test('model: 来源设备过滤走服务端；deviceOptions 含「未知」并带记忆数', async () => {
+  const ctx = setup();
+  try {
+    await seed(ctx.store, ctx.home);
+    const store = ctx.store;
+    const localDevice = 'dev_test_local';
+    // 三种来源形态：本机、其他设备、未知（存量）。直写 3 条专用记忆再改列——
+    // 装配层只测「给定来源值时的过滤与选项聚合」，不绕过任何写入判定。
+    const scope = store.scopes.resolvePreset('personal-global');
+    const ids = [
+      store.memories.add({ kind: 'fact', content: '来源设备过滤样本一', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_test_local').id,
+      store.memories.add({ kind: 'fact', content: '来源设备过滤样本二', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_test_local', 'dev_test_other').id,
+      store.memories.add({ kind: 'fact', content: '来源设备过滤样本三', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_test_local', 'dev_test_local').id,
+    ];
+    store.db.run('UPDATE memory SET origin_device_id = NULL WHERE id = ?', ids[2]); // 未知形态
+
+    const all = buildModel(store, { mode: 'brief', redact: true });
+    assert.ok(all.deviceOptions.some((d) => d.deviceId === localDevice && d.count >= 1), '选项含本机来源并带记忆数');
+    assert.ok(all.deviceOptions.some((d) => d.deviceId === 'dev_test_other'), '选项含其他设备来源');
+    assert.ok(all.deviceOptions.some((d) => d.deviceId === null), '选项含「未知」');
+    const unknownOption = all.deviceOptions.find((d) => d.deviceId === null)!;
+    assert.equal(unknownOption.label, '未知', '未知如实显示，不隐藏');
+
+    // 服务端过滤：按设备 id
+    const mine = buildModel(store, { mode: 'brief', redact: true, devices: [localDevice] });
+    assert.equal(mine.memories.length, 1);
+    assert.equal(mine.memories[0]!.originDeviceId, localDevice);
+    // 服务端过滤：unknown 命中 NULL
+    const unknown = buildModel(store, { mode: 'brief', redact: true, devices: ['unknown'] });
+    assert.equal(unknown.memories.length, 1);
+    assert.equal(unknown.memories[0]!.originDeviceId, null);
+    // 组合过滤：设备 + 未知并选
+    const both = buildModel(store, { mode: 'brief', redact: true, devices: [localDevice, 'unknown'] });
+    assert.equal(both.memories.length, 2);
+    // filter 回写（地址还原的依据）
+    assert.deepEqual(both.filter.devices, [localDevice, 'unknown']);
+    // 徽章数据在列表载荷里
+    assert.ok(all.memories.every((m) => 'originDeviceId' in m));
+  } finally {
+    ctx.cleanup();
+  }
+});

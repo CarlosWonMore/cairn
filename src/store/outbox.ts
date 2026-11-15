@@ -12,11 +12,15 @@ import { WriteGuardMixin } from './write-guard.js';
  * 默认不安装同步 hook，任务由独立 worker 或显式 CLI 处理。
  */
 
+import { preserveModeEnabled, isPreserveScopePreset } from '../sync/vault.js';
+
 // sync_scope_exit：迁出通知任务（add-scope-migration）。不是上行内容任务——
 // 迁出到 local_only 作用域的记忆被 sync_upstream 的物理排除挡住（enqueue 处），
 // 且 spec 要求「迁移到 local_only 后未产生新的上行任务」，所以独立 jobType 绕开排除、
 // 由 push 生成 scope_exit 控制事件（不是修订内容）。
-export type JobType = 'sync_upstream' | 'sync_scope_exit' | 'extract' | 'embed' | 'maintain' | 'projection_rebuild';
+// sync_preserve：保管链上行任务（add-cloud-preserve-mode）——同一绕开模式：
+// 设备限定/项目内容过不了 sync_upstream 的触发器，经它上行到本设备保管链。
+export type JobType = 'sync_upstream' | 'sync_scope_exit' | 'sync_preserve' | 'extract' | 'embed' | 'maintain' | 'projection_rebuild';
 export type JobStatus = 'pending' | 'running' | 'done' | 'retry' | 'failed' | 'dead' | 'conflict';
 
 export interface JobRow {
@@ -54,6 +58,8 @@ export class OutboxRepository extends WriteGuardMixin {
   constructor(
     private readonly db: CairnDb,
     private readonly audit: AuditLog,
+    /** dataDir 用于读 vault.json 判定保管模式（sync_preserve 防线）；测试直连时可省。 */
+    private readonly dataDir?: string,
   ) {
     super();
   }
@@ -61,6 +67,8 @@ export class OutboxRepository extends WriteGuardMixin {
   /**
    * 入队。local_only/设备限定内容对 sync_upstream 物理排除：
    * 返回 { enqueued: false, reason: 'scope_local_only' } 并记录审计。
+   * sync_preserve 的防线（add-cloud-preserve-mode）：只收保管链承载的作用域，
+   * 且保管模式必须开启——路由判定在 sync/route.ts，这里是 enqueue 层兜底。
    */
   enqueue(input: EnqueueJobInput): { job: JobRow | null; enqueued: boolean; reason?: string } {
     this.checkWritable();
@@ -74,6 +82,25 @@ export class OutboxRepository extends WriteGuardMixin {
           reason: scope.sync_policy !== 'encrypted' ? 'local_only' : 'device_bound',
         });
         return { job: null, enqueued: false, reason: scope.sync_policy !== 'encrypted' ? 'scope_local_only' : 'scope_device_bound' };
+      }
+    }
+    if (input.jobType === 'sync_preserve') {
+      if (!input.scopeId) throw err('E_VALIDATION', 'sync_preserve 任务必须携带 scopeId');
+      const scope = this.db.get('SELECT preset FROM scope WHERE id = ?', input.scopeId);
+      if (!scope) throw err('E_NOT_FOUND', `作用域不存在: ${input.scopeId}`);
+      if (!isPreserveScopePreset(String(scope.preset))) {
+        this.audit.record('scope_exclusion', 'outbox_preserve_excluded', { type: 'scope', id: input.scopeId }, {
+          jobId: input.idempotencyKey,
+          reason: 'preset_not_preservable',
+        });
+        return { job: null, enqueued: false, reason: 'preset_not_preservable' };
+      }
+      if (!preserveModeEnabled(this.dataDir ?? '')) {
+        this.audit.record('scope_exclusion', 'outbox_preserve_excluded', { type: 'scope', id: input.scopeId }, {
+          jobId: input.idempotencyKey,
+          reason: 'preserve_mode_off',
+        });
+        return { job: null, enqueued: false, reason: 'preserve_mode_off' };
       }
     }
     const payload = input.payload ?? {};

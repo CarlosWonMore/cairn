@@ -225,7 +225,9 @@ test('UI_JS：记忆卡片按 scopeId 查表渲染作用域徽章，本地限定
   );
   assert.match(
     UI_JS,
-    /chipLabel\(mem\.status[\s\S]{0,600}byScope\[mem\.scopeId\][\s\S]{0,600}chipLabel\(mem\.authority/,
+    /chipLabel\(mem\.status[\s\S]{0,1500}byScope\[mem\.scopeId\][\s\S]{0,1500}chipLabel\(mem\.authority/,
+    // add-cloud-preserve-mode 在同一区间插入了来源设备徽章（与作用域徽章同一渲染路径），
+    // 窗口随之放宽；断言意图不变——作用域徽章仍在 status 与 authority 之间。
     '徽章应插在 status 与 authority 之间',
   );
 });
@@ -234,6 +236,34 @@ test('UI_JS：paintMemories 接收 scopes，静态与在线两处调用点都传
   assert.match(UI_JS, /function paintMemories\(host, list, total, scopes\)/);
   assert.ok(UI_JS.includes('paintMemories(host, list, list.length, model.scopes)'), '静态分支必须传 model.scopes');
   assert.ok(UI_JS.includes('paintMemories(host, data.memories, data.total, data.scopes)'), '在线分支必须传 data.scopes');
+});
+
+// ---------------------------------------------------------------------------
+// 来源设备徽章与过滤（add-cloud-preserve-mode 0a）
+// ---------------------------------------------------------------------------
+
+test('UI_JS：归属设备徽章与作用域徽章同一渲染路径，未知如实显示', () => {
+  assert.match(
+    UI_JS,
+    /if \(mem\.originDeviceId\) \{[\s\S]{0,300}chip\('来源 ' \+ short\(mem\.originDeviceId, 12\)/,
+    '徽章必须挂在卡片头部 chip 上（与作用域徽章同一渲染路径）',
+  );
+  assert.ok(UI_JS.includes("chip('来源未知'"), '未知必须如实显示，不得省略徽章');
+  assert.ok(UI_JS.includes("x.originDeviceId == null"), '本地过滤按 null 判未知');
+});
+
+test('UI_JS：来源设备过滤器选项带设备标识与记忆数，unknown 为未知保留值', () => {
+  assert.match(UI_JS, /opts\.deviceSelect/, '工具栏必须支持来源设备下拉');
+  assert.match(UI_JS, /全部来源设备/, '空值选项必须存在');
+  assert.match(UI_JS, /d\.deviceId == null \? '未知' : '设备 ' \+ short\(name, 12\)/, '选项文案带设备标识，未知如实显示');
+  assert.match(UI_JS, /\+ ' · ' \+ d\.count/, '选项带记忆数');
+  assert.match(UI_JS, /d\.deviceId == null \? 'unknown' : d\.deviceId/, '未知选项用 unknown 保留值');
+  assert.match(UI_JS, /state\.device = ds\.value; writeUrl\(false\); render\(\)/, '选择后回写地址并重绘');
+  // 静态页与在线两处都传 deviceOptions
+  assert.ok(UI_JS.includes('devices: model.deviceOptions || []'), '静态分支传内嵌模型选项');
+  assert.ok(UI_JS.includes('devices: data.deviceOptions || []'), '在线分支传 API 选项');
+  // 静态页零请求过滤：localFilter 支持 device
+  assert.match(UI_JS, /opts\.device === 'unknown' \? x\.originDeviceId == null : x\.originDeviceId === opts\.device/, '本地过滤按来源判定，unknown 命中未知');
 });
 
 test('UI_JS：作用域过滤选项带消歧标识、同步策略与记忆数', () => {

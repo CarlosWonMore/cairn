@@ -56,7 +56,12 @@ export class MemoryRepository extends WriteGuardMixin {
     super();
   }
 
-  add(input: AddMemoryInput, deviceId: string): MemoryRecord {
+  /**
+   * 新增。`deviceId` 是执行写入的设备（修订行的 device_id）；
+   * `originDeviceId` 是内容归属设备（add-cloud-preserve-mode D7）：
+   * 本机创建两者相同，同步落地时由 apply 传事件来源设备。
+   */
+  add(input: AddMemoryInput, deviceId: string, originDeviceId: string = deviceId): MemoryRecord {
     this.checkWritable();
     validateMemoryInput(input);
     const id = uuidv7();
@@ -70,9 +75,9 @@ export class MemoryRepository extends WriteGuardMixin {
       this.db.run(
         `INSERT INTO memory (id, owner_id, kind, content, normalized_content, scope_id, status, authority,
            confidence, source_agent, source_session_id, source_import_batch_id, source_message_range,
-           observed_at, valid_from, valid_to, expires_at, sensitivity, content_hash, created_by, created_at, updated_at,
+           observed_at, valid_from, valid_to, expires_at, sensitivity, content_hash, origin_device_id, created_by, created_at, updated_at,
            importance, usage_count)
-         VALUES (?, 'local-user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+         VALUES (?, 'local-user', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
         id,
         input.kind,
         input.content,
@@ -91,6 +96,7 @@ export class MemoryRepository extends WriteGuardMixin {
         input.expiresAt ?? null,
         sensitivity,
         hash,
+        originDeviceId,
         input.createdBy,
         at,
         at,
@@ -615,6 +621,7 @@ export function mapMemory(r: Record<string, unknown>): MemoryRecord {
     sensitivity: r.sensitivity as Sensitivity,
     currentRevisionId: (r.current_revision_id as string | null) ?? null,
     contentHash: r.content_hash as string,
+    originDeviceId: (r.origin_device_id as string | null) ?? null,
     createdBy: r.created_by as string,
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,

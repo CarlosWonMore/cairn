@@ -602,3 +602,69 @@ BEGIN
      OR (SELECT device_id   FROM scope WHERE id = NEW.scope_id) <> 'all';
 END;
 `;
+
+/**
+ * 007：保管模式与归属设备（add-cloud-preserve-mode）。
+ *
+ * 两个结构变化，一张重建 + 一条加列：
+ * 1. `memory` 加 `origin_device_id`（NULL = 未知）：归属设备是溯源事实，
+ *    只加列即可，不需要重建 memory 表（为两列重建全项目风险最高表的时代已经过去，
+ *    见 005 的注释）。
+ * 2. `outbox_job.job_type` CHECK 加 `sync_preserve`：保管模式开启时，设备限定与
+ *    项目内容经它上行到本设备保管链。为什么新增 jobType 而不是放宽 sync_upstream
+ *    触发器：触发器是「非个人全局内容绝不产生 sync_upstream」的数据库层安全边界
+ *    （006 同款理由——值得为它付一次重建）；sync_scope_exit 已经用独立 jobType
+ *    合法绕开排除，sync_preserve 是同一模式。触发器保持逐字不变。
+ *
+ * outbox_job 是叶子表（无入向外键），但出向 FK（scope_id）与 2 索引 1 触发器
+ * 必须逐字保留；迁移范式与 006 相同（外键在 BEGIN 之前关掉）。
+ */
+export const MIGRATION_007_PRESERVE_ORIGIN = /* sql */ `
+PRAGMA legacy_alter_table = ON;
+
+ALTER TABLE outbox_job RENAME TO outbox_job_old;
+
+CREATE TABLE outbox_job (
+  id              TEXT PRIMARY KEY,
+  job_type        TEXT NOT NULL CHECK (job_type IN
+                    ('sync_upstream','sync_scope_exit','sync_preserve','extract','embed','maintain','projection_rebuild')),
+  scope_id        TEXT REFERENCES scope(id) ON DELETE RESTRICT,
+  entity_type     TEXT NOT NULL CHECK (entity_type IN ('memory','revision','plan','archive','system')),
+  entity_id       TEXT NOT NULL,
+  payload         TEXT NOT NULL DEFAULT '{}',
+  payload_hash    TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  status          TEXT NOT NULL CHECK (status IN
+                    ('pending','running','done','retry','failed','dead','conflict')),
+  attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts    INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts >= 1),
+  next_attempt_at TEXT,
+  last_error      TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  CHECK (status <> 'dead' OR attempts >= 1)
+);
+
+INSERT INTO outbox_job SELECT * FROM outbox_job_old;
+
+DROP TABLE outbox_job_old;
+
+PRAGMA legacy_alter_table = OFF;
+
+-- 索引与触发器随旧表一起被 DROP，必须原样重建。
+CREATE INDEX IF NOT EXISTS outbox_ready  ON outbox_job(status, next_attempt_at) WHERE status IN ('pending','retry');
+CREATE INDEX IF NOT EXISTS outbox_entity ON outbox_job(entity_type, entity_id);
+
+CREATE TRIGGER outbox_reject_local_upstream
+BEFORE INSERT ON outbox_job
+WHEN NEW.job_type = 'sync_upstream' AND NEW.scope_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'scope_not_upstreamable')
+  WHERE (SELECT sync_policy FROM scope WHERE id = NEW.scope_id) <> 'encrypted'
+     OR (SELECT device_id   FROM scope WHERE id = NEW.scope_id) <> 'all';
+END;
+
+-- 归属设备（D7）：NULL = 未知（存量行如实展示「未知」）；一经写入不被修订改写
+-- （应用层纪律：revise/migrate/promote 不碰这一列）。
+ALTER TABLE memory ADD COLUMN origin_device_id TEXT;
+`;

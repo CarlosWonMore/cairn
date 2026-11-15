@@ -25,8 +25,10 @@ import { scanText } from '../core/secrets.js';
 import { loadVaultConfig } from '../sync/vault.js';
 import { loadKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } from '../sync/cryptoutil.js';
 import { nowIso } from '../core/time.js';
-import { syncContext, initRemote, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext, PERSONAL_SPACE_KEY } from '../sync/orchestrate.js';
-import { findUpstreamGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
+import { syncContext, initRemote, setPreserveMode, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext, PERSONAL_SPACE_KEY } from '../sync/orchestrate.js';
+import { findUpstreamGap, findUpstreamGapChains, findScopeExitGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
+import { enqueueMemorySync, enqueueScopeExit, enqueuePreserveResync, isPersonalChainScope } from '../sync/route.js';
+import { preserveSpaceKey } from '../sync/vault.js';
 import {
   proposeRevision,
   readRevisionProposals,
@@ -132,6 +134,22 @@ export interface DoctorReport {
     openConflicts: number;
     /** 作用域允许上行但没有过任何 sync_upstream 任务的活动记忆数（design D4）。 */
     upstreamGap: number;
+  };
+  /** 同步链状态（add-cloud-preserve-mode tasks 5.1）：保管模式 + 各链本地序号/游标/缺口。 */
+  sync: {
+    preserveDeviceBound: boolean;
+    chains: {
+      spaceKey: string;
+      role: 'personal' | 'preserve';
+      /** 本机已发布到的序号（meta sync_seq）；从未 push 过为 0。 */
+      localSeq: number;
+      /** 对各远端设备的拉取游标。 */
+      pullCursors: Record<string, number>;
+      /** 该链的待处理上行任务数（pending/retry/running）。 */
+      pendingJobs: number;
+      /** 该链的上行缺口（应上行但从未入队）。 */
+      gap: number;
+    }[];
   };
   remote: 'not_configured' | 'configured_untested' | 'verified';
   remoteProvider?: string;
@@ -346,16 +364,7 @@ export class AppService {
       },
       ctx.deviceId,
     );
-    if (scopeAllowsUpstream(scope)) {
-      store.outbox.enqueue({
-        jobType: 'sync_upstream',
-        scopeId: scope.id,
-        entityType: 'memory',
-        entityId: memory.id,
-        payload: { op: 'memory_upsert', memoryId: memory.id },
-        idempotencyKey: `memory:${memory.id}`,
-      });
-    }
+    enqueueMemorySync(store, { memoryId: memory.id, scopeId: scope.id, op: 'memory_upsert', idempotencyKey: `memory:${memory.id}` });
     const auditAction = decision.action === 'candidate' ? 'added_candidate' : 'added';
     store.audit.record('memory', auditAction, { type: 'memory', id: memory.id }, { ...auditDetail, kind, authority, sensitivity });
     return { action: decision.action, basis: decision.basis, memory, duplicateOf: null };
@@ -379,16 +388,7 @@ export class AppService {
       { reason: opts.reason ?? '用户更正', author: ctx.agentId, expectedCurrentRevisionId: opts.expectedCurrentRevisionId, authority: opts.authority },
       ctx.deviceId,
     );
-    if (scopeAllowsUpstream(scope)) {
-      store.outbox.enqueue({
-        jobType: 'sync_upstream',
-        scopeId: scope.id,
-        entityType: 'memory',
-        entityId: id,
-        payload: { op: 'memory_upsert', memoryId: id },
-        idempotencyKey: `memory:${id}:rev:${out.revision.id}`,
-      });
-    }
+    enqueueMemorySync(store, { memoryId: id, scopeId: scope.id, op: 'memory_upsert', idempotencyKey: `memory:${id}:rev:${out.revision.id}` });
     store.audit.record('memory', 'revised', { type: 'memory', id }, { revisionId: out.revision.id });
     return out;
   }
@@ -398,17 +398,7 @@ export class AppService {
     store.assertWritable();
     const mem = store.memories.require(id);
     const out = store.memories.forget(id, reason, this.caller.agentId);
-    const scope = store.scopes.requireById(mem.scopeId);
-    if (scopeAllowsUpstream(scope)) {
-      store.outbox.enqueue({
-        jobType: 'sync_upstream',
-        scopeId: scope.id,
-        entityType: 'memory',
-        entityId: id,
-        payload: { op: 'memory_tombstone', memoryId: id },
-        idempotencyKey: `memory:${id}:tombstone`,
-      });
-    }
+    enqueueMemorySync(store, { memoryId: id, scopeId: mem.scopeId, op: 'memory_tombstone', idempotencyKey: `memory:${id}:tombstone` });
     store.audit.record('memory', 'forgotten', { type: 'memory', id }, { reason: reason ?? null });
     return out;
   }
@@ -485,7 +475,17 @@ export class AppService {
       "DELETE FROM outbox_job WHERE entity_type = 'memory' AND entity_id = ? AND status = 'pending'",
       id,
     );
-    if (scopeAllowsUpstream(scope)) {
+    // 迁出完整性（D4）：候选也可能推送过（add 即入队）；晋升带作用域迁移离开个人链时，
+    // 与 rescope 同一语义——对端残缺副本要靠迁出通知收敛。
+    const previousScope = store.scopes.getById(previousScopeId);
+    const wasPushedPersonal = store.db.get(
+      'SELECT value FROM meta WHERE key = ?',
+      `sync_pushed:${PERSONAL_SPACE_KEY}:${id}`,
+    ) != null;
+    if (previousScope && isPersonalChainScope(previousScope) && wasPushedPersonal && previousScope.id !== scope.id) {
+      enqueueScopeExit(store, id);
+    }
+    if (scopeAllowsUpstream(scope) && scope.preset === 'personal-global') {
       store.outbox.enqueue({
         jobType: 'sync_upstream',
         scopeId: scope.id,
@@ -494,6 +494,13 @@ export class AppService {
         payload: { op: 'memory_upsert', memoryId: id },
         idempotencyKey: `memory:${id}:rev:${out.currentRevisionId ?? ''}`,
       });
+    } else if (scope.preset === 'device-local' || scope.preset === 'project-global' || scope.preset === 'project-device') {
+      const wasPushedPreserve = store.db.get(
+        'SELECT value FROM meta WHERE key = ?',
+        `sync_pushed:${preserveSpaceKey(store.identity.deviceId)}:${id}`,
+      ) != null;
+      if (wasPushedPreserve) enqueuePreserveResync(store, id, scope.id);
+      else enqueueMemorySync(store, { memoryId: id, scopeId: scope.id, op: 'memory_upsert', idempotencyKey: `memory:${id}:rev:${out.currentRevisionId ?? ''}` });
     }
 
     store.audit.record('memory', 'promoted_candidate', { type: 'memory', id }, {
@@ -549,11 +556,15 @@ export class AppService {
       throw err('E_FORBIDDEN', '用户明确陈述（user_explicit）的记忆迁移会改变可见范围，需要 --force 显式确认');
     }
     const willLoseSync = scopeAllowsUpstream(previousScope) && !scopeAllowsUpstream(target);
-    // 「曾同步过」= 该记忆在本空间链上推送过修订（sync_pushed 元数据存在）。
+    // 「曾同步过」= 该记忆在个人链上推送过修订（sync_pushed 元数据存在）。
     // 只有这种情况对端才持有副本，迁出才需要通知；从未上行的记忆迁出无人需要知道。
-    const wasPushed = store.db.get(
+    const wasPushedPersonal = store.db.get(
       'SELECT value FROM meta WHERE key = ?',
       `sync_pushed:${PERSONAL_SPACE_KEY}:${id}`,
+    ) != null;
+    const wasPushedPreserve = store.db.get(
+      'SELECT value FROM meta WHERE key = ?',
+      `sync_pushed:${preserveSpaceKey(store.identity.deviceId)}:${id}`,
     ) != null;
 
     const scopeExitEnqueued = store.db.transaction(() => {
@@ -564,8 +575,14 @@ export class AppService {
         "DELETE FROM outbox_job WHERE entity_type = 'memory' AND entity_id = ? AND status = 'pending'",
         id,
       );
-      if (scopeAllowsUpstream(target)) {
-        // 迁入可同步作用域：重新入队。若此前同步过，修订未变会被 push 的幂等检查
+      // 迁出完整性（add-cloud-preserve-mode D4 / tasks 2.1，模式无关）：
+      // 记忆离开个人链 → 必入队迁出通知，无论去向是项目、设备限定还是其他任何地方——
+      // 对端据此把残缺副本转「不再持有」（2026-11-14~15 双设备事故的核心修复）。
+      // 入队固化 fromSpace=personal（D4）：push 延迟期间二次迁移不会把通知发错链。
+      const leftPersonalChain = isPersonalChainScope(previousScope) && wasPushedPersonal;
+      const exitResult = leftPersonalChain ? enqueueScopeExit(store, id) : null;
+      if (scopeAllowsUpstream(target) && target.preset === 'personal-global') {
+        // 迁回个人链：重新入队。若此前同步过，修订未变会被 push 的幂等检查
         // 跳过、对端永远收不到「重新持有」的信号——因此带 force 让 push 无条件重发
         // 一次修订快照（payload.reentry），对端据此解除「不再持有」标记。
         store.outbox.enqueue({
@@ -573,26 +590,20 @@ export class AppService {
           scopeId: target.id,
           entityType: 'memory',
           entityId: id,
-          payload: { op: 'memory_upsert', memoryId: id, ...(wasPushed ? { force: true } : {}) },
-          idempotencyKey: wasPushed ? `memory:${id}:re-entry:${Date.now()}` : `memory:${id}:rev:${mem.currentRevisionId ?? ''}`,
+          payload: { op: 'memory_upsert', memoryId: id, ...(wasPushedPersonal ? { force: true } : {}) },
+          idempotencyKey: wasPushedPersonal ? `memory:${id}:re-entry:${Date.now()}` : `memory:${id}:rev:${mem.currentRevisionId ?? ''}`,
         });
-        return false;
+      } else if (target.preset === 'device-local' || target.preset === 'project-global' || target.preset === 'project-device') {
+        // 迁入保管链承载的作用域（device-local / project-*）：开启保管模式时入队
+        // 保管链上行（D4：新空间可发布时也要有上行任务）；同一修订已推送过保管链时
+        // 带 force 重发，让对端（自设备重放）按新描述符重新物化。
+        const vaultPreserveOn = loadVaultConfig(store.paths.dataDir)?.preserveDeviceBound === true;
+        if (vaultPreserveOn) {
+          if (wasPushedPreserve) enqueuePreserveResync(store, id, target.id);
+          else enqueueMemorySync(store, { memoryId: id, scopeId: target.id, op: 'memory_upsert', idempotencyKey: `memory:${id}:rev:${mem.currentRevisionId ?? ''}` });
+        }
       }
-      if (scopeAllowsUpstream(previousScope) && wasPushed) {
-        // 迁出通知：独立 jobType（不是上行内容任务，spec 要求迁移不产生新的上行任务）。
-        // 幂等键带时间戳：迁出→迁回→再迁出的每一轮都要各发一次通知，
-        // 固定键会被已完成的历史任务挡住（enqueue 按键去重不分状态）。
-        const enq = store.outbox.enqueue({
-          jobType: 'sync_scope_exit',
-          scopeId: target.id,
-          entityType: 'memory',
-          entityId: id,
-          payload: { op: 'scope_exit', memoryId: id },
-          idempotencyKey: `memory:${id}:scope-exit:${Date.now()}`,
-        });
-        return enq.enqueued;
-      }
-      return false;
+      return exitResult?.enqueued ?? false;
     });
 
     store.audit.record('memory', 'scope_migrated', { type: 'memory', id }, {
@@ -894,6 +905,11 @@ export class AppService {
     if (upstreamGap > 0) {
       notes.push(`上行缺口 ${upstreamGap} 条：作用域允许上行但未入队，执行 cairn sync backfill --apply 补齐`);
     }
+    // 存量迁出通知缺口（add-cloud-preserve-mode）：对端残缺副本收敛的前提，同一自愈纪律。
+    const scopeExitGap = findScopeExitGap(store).length;
+    if (scopeExitGap > 0) {
+      notes.push(`存量迁出通知缺口 ${scopeExitGap} 条：曾同步到个人链的记忆已迁出但从未通知对端，执行 cairn sync backfill --apply 补发`);
+    }
     // 待办批注：与 upstreamGap 同一条纪律——只进 notes，不进 problems，不改退出码。
     let pendingAnnotations = 0;
     try {
@@ -929,6 +945,40 @@ export class AppService {
         remote = 'configured_untested';
       }
     }
+
+    // 各链状态（tasks 5.1）：全部来自本地 meta 与 outbox，不触网——doctor 保持离线可用。
+    const preserveOn = vault?.preserveDeviceBound === true;
+    const gapChains = findUpstreamGapChains(store);
+    const chainSpecs: { spaceKey: string; role: 'personal' | 'preserve'; gap: number }[] = [
+      { spaceKey: PERSONAL_SPACE_KEY, role: 'personal', gap: gapChains.personal },
+      ...(preserveOn ? [{ spaceKey: preserveSpaceKey(store.identity.deviceId), role: 'preserve' as const, gap: gapChains.preserve }] : []),
+    ];
+    const syncChains = chainSpecs.map((c) => {
+      const seqRow = store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${c.spaceKey}`);
+      const cursors: Record<string, number> = {};
+      for (const r of store.db.all('SELECT key, value FROM meta WHERE key LIKE ?', `sync_pull:${c.spaceKey}:%`)) {
+        const remoteDevice = String(r['key']).slice(`sync_pull:${c.spaceKey}:`.length);
+        cursors[remoteDevice] = Number(r['value']);
+      }
+      // pending 按任务类型归属链：sync_preserve 只会发布到保管链；
+      // sync_upstream / sync_scope_exit 发布到个人链（不可路由的会在 push 时完成并审计）。
+      const pendingTypes = c.role === 'preserve' ? ['sync_preserve'] : ['sync_upstream', 'sync_scope_exit'];
+      const placeholders = pendingTypes.map(() => '?').join(',');
+      const pending = Number(
+        store.db.scalar(
+          `SELECT COUNT(*) AS n FROM outbox_job WHERE status IN ('pending','retry','running') AND job_type IN (${placeholders})`,
+          ...pendingTypes,
+        ) ?? 0,
+      );
+      return {
+        spaceKey: c.spaceKey,
+        role: c.role,
+        localSeq: Number(seqRow?.value ?? 0),
+        pullCursors: cursors,
+        pendingJobs: pending,
+        gap: c.gap,
+      };
+    });
     if (remote === 'not_configured') {
       notes.push('模型未配置（本变更无模型路径）；云端未配置（remote=not_configured）。核心功能不依赖二者。');
     }
@@ -949,6 +999,7 @@ export class AppService {
         openConflicts: store.conflicts.countOpen(),
         upstreamGap,
       },
+      sync: { preserveDeviceBound: preserveOn, chains: syncChains },
       remote,
       remoteProvider,
       model: 'not_configured',
@@ -961,8 +1012,14 @@ export class AppService {
   // 云同步（OpenSpec: add-real-cloud-sync）
   // -------------------------------------------------------------------------
 
-  vaultInitRemote(input: { provider: 'obs' | 'syncd'; obs?: { endpoint: string; bucket: string; prefix: string }; syncd?: { baseUrl: string } }): { vault: ReturnType<typeof loadVaultConfig>; recovery: string } {
+  vaultInitRemote(input: { provider: 'obs' | 'syncd'; obs?: { endpoint: string; bucket: string; prefix: string }; syncd?: { baseUrl: string }; preserveDeviceBound?: boolean }): { vault: ReturnType<typeof loadVaultConfig>; recovery: string } {
     return initRemote(this.store, input);
+  }
+
+  /** 保管模式开关（add-cloud-preserve-mode D1）：vault config 子命令的落点。 */
+  vaultConfigPreserve(enabled: boolean): Record<string, unknown> {
+    const vault = setPreserveMode(this.store, enabled);
+    return { vaultId: vault.vaultId, preserveDeviceBound: vault.preserveDeviceBound === true };
   }
 
   vaultStatus(): Record<string, unknown> {
@@ -975,6 +1032,7 @@ export class AppService {
       obs: vault?.obs ?? null,
       syncd: vault?.syncd ?? null,
       keysPresent: keys,
+      preserveDeviceBound: vault?.preserveDeviceBound === true,
     };
   }
 
@@ -1031,11 +1089,28 @@ export class AppService {
   status(): Record<string, unknown> {
     const store = this.store;
     const outbox = store.outbox.counts();
+    const gapChains = findUpstreamGapChains(store);
+    const vault = loadVaultConfig(store.paths.dataDir);
+    const preserveOn = vault?.preserveDeviceBound === true;
+    const chains: Record<string, { localSeq: number; gap: number }> = {
+      [PERSONAL_SPACE_KEY]: {
+        localSeq: Number(store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${PERSONAL_SPACE_KEY}`)?.value ?? 0),
+        gap: gapChains.personal,
+      },
+    };
+    if (preserveOn) {
+      const key = preserveSpaceKey(store.identity.deviceId);
+      chains[key] = {
+        localSeq: Number(store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${key}`)?.value ?? 0),
+        gap: gapChains.preserve,
+      };
+    }
     return {
       device: store.identity.deviceId,
       memories: store.memories.countsByStatus(),
       outbox,
       openConflicts: store.conflicts.countOpen(),
+      sync: { preserveDeviceBound: preserveOn, chains },
     };
   }
 
@@ -1190,7 +1265,8 @@ export class AppService {
 
 
 /**
- * 编排层上行落点（spec cloud-sync「上行入队完备性」）：准入判定复用 `scopeAllowsUpstream`，
+ * 编排层上行落点（spec cloud-sync「上行入队完备性」+ add-cloud-preserve-mode）：
+ * 路由与物理排除判定只在 sync/route.ts 一处——本函数是它的兼容包装。
  * 作用域不允许上行时静默返回——这是正常结果，不是错误。
  */
 function enqueueMemoryUpstream(
@@ -1200,16 +1276,7 @@ function enqueueMemoryUpstream(
   op: 'memory_upsert' | 'memory_tombstone',
   idempotencyKey: string,
 ): void {
-  const scope = store.scopes.requireById(scopeId);
-  if (!scopeAllowsUpstream(scope)) return;
-  store.outbox.enqueue({
-    jobType: 'sync_upstream',
-    scopeId: scope.id,
-    entityType: 'memory',
-    entityId: memoryId,
-    payload: { op, memoryId },
-    idempotencyKey,
-  });
+  enqueueMemorySync(store, { memoryId, scopeId, op, idempotencyKey });
 }
 
 /** 扫描命中错误：秘密优先；仅注入命中 → E_INJECTION_SUSPECTED。均不回显原文。 */

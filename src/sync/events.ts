@@ -11,6 +11,21 @@ import { err } from '../core/errors.js';
 
 export const SYNC_EVENT_VERSION = 1;
 
+/**
+ * 作用域描述符（add-cloud-preserve-mode D3）：upsert 事件携带的「内容属于哪类作用域」
+ * 声明。拉取侧物化过滤的依据：个人链事件按链语义物化（personal-global）；
+ * 本设备保管链事件按描述符物化。旧版本事件没有该字段——物化按现状处理（向后兼容）。
+ */
+export interface SyncScopeDescriptor {
+  preset: string;
+  /** project-global / project-device 的稳定项目身份（add-stable-project-identity 的 UUID）。 */
+  projectId?: string;
+  /** 项目显示名（物化端重建 project 行时使用；缺省回落 projectId）。 */
+  spaceName?: string;
+  /** 设备限定作用域绑定的设备。 */
+  deviceId?: string;
+}
+
 export interface SyncUpsertPayload {
   revisionId: string;
   content: string;
@@ -27,6 +42,8 @@ export interface SyncUpsertPayload {
   sourceAgent: string | null;
   createdBy: string;
   reason: string | null;
+  /** 作用域描述符（D3）：旧版本事件缺省——按链语义物化。 */
+  scope?: SyncScopeDescriptor;
   /**
    * 迁回重推标记（add-scope-migration）：这条 upsert 来自「迁出后重新迁回」的强制重发。
    * 对端据此解除「不再持有」标记；没有该标记的普通 upsert 在标记存在时按迟到修订跳过。
@@ -44,6 +61,8 @@ export interface SyncTombstonePayload {
 /**
  * 迁出通知 payload（add-scope-migration D3）：一条已同步的记忆迁出了可同步作用域。
  * 对端语义是「本设备不再持有」——不是遗忘（无墓碑），不是删除（数据保留）。
+ * （来源链固化在 outbox 任务的 payload.fromSpace，由 push 据此选择发布链；
+ * 事件本身不带 fromSpace——对端只关心「这条链上的记忆不再持有」。）
  */
 export interface SyncScopeExitPayload {
   /** 推送端最后已知（已推送）的内容哈希。 */

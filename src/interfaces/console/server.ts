@@ -164,6 +164,7 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
           scopeIds: listParam(q.get('scope')),
           statuses: listParam(q.get('status')),
           kinds: listParam(q.get('kind')),
+          devices: listParam(q.get('device')),
         });
         const limit = clampInt(q.get('limit'), 1, 2000, 500);
         return {
@@ -173,6 +174,7 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
           redacted: redact,
           memories: model.memories.slice(0, limit),
           scopes: model.scopes,
+          deviceOptions: model.deviceOptions,
         };
       }
       if (path.startsWith('/api/memories/')) {

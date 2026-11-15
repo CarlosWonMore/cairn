@@ -272,6 +272,41 @@ test('HTTP 响应默认掩码 sensitive 正文；redact=0 才给明文', async (
   }
 });
 
+test('来源设备过滤：/api/memories?device= 服务端过滤；未知保留值命中 NULL（0a.2）', async () => {
+  // 独立 setup：三种来源形态（本机默认 / 其他设备 / 未知）。
+  const home = makeTestHome('cairn-server-dev-');
+  const writable = openStore({ home });
+  const scope = writable.scopes.resolvePreset('personal-global', {});
+  writable.memories.add({ kind: 'fact', content: 'HTTP 过滤样本一', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local');
+  writable.memories.add({ kind: 'fact', content: 'HTTP 过滤样本二', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local', 'dev_http_other');
+  const unknownId = writable.memories.add({ kind: 'fact', content: 'HTTP 过滤样本三', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local').id;
+  writable.db.run('UPDATE memory SET origin_device_id = NULL WHERE id = ?', unknownId);
+  writable.close();
+  const readOnly = openStore({ home, readOnly: true });
+  const srv = await startConsoleServer({ home, port: 0, token: TOKEN });
+  try {
+    const all = (await (await api(srv, '/api/memories?mode=brief')).json()) as {
+      data: { memories: Array<{ id: string; originDeviceId: string | null }>; deviceOptions: Array<{ deviceId: string | null; label: string; count: number }> };
+    };
+    assert.ok(all.data.deviceOptions.some((d) => d.deviceId === 'dev_http_other'), '选项含其他设备');
+    assert.ok(all.data.deviceOptions.some((d) => d.deviceId === null && d.label === '未知'), '选项含「未知」');
+    const other = (await (await api(srv, '/api/memories?mode=brief&device=dev_http_other')).json()) as {
+      data: { memories: Array<{ originDeviceId: string | null }>; total: number };
+    };
+    assert.equal(other.data.total, 1);
+    assert.equal(other.data.memories[0]!.originDeviceId, 'dev_http_other');
+    const unknown = (await (await api(srv, '/api/memories?mode=brief&device=unknown')).json()) as {
+      data: { memories: Array<{ originDeviceId: string | null }>; total: number };
+    };
+    assert.equal(unknown.data.total, 1);
+    assert.equal(unknown.data.memories[0]!.originDeviceId, null);
+  } finally {
+    await srv.close();
+    readOnly.close();
+    cleanupTestHome(home);
+  }
+});
+
 test('批次不存在：404，而不是空进度', async () => {
   const ctx = await setup();
   const s = await serve(ctx);

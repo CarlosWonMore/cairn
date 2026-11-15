@@ -760,6 +760,7 @@ function summarize(
     sensitivity?: string;
     importance?: number | null;
     usageCount?: number;
+    originDeviceId?: string | null;
   },
   extra: { matchedBy?: string; conflictId?: string; unverifiableImport?: boolean; scopePreset?: string; syncPolicy?: string },
 ): unknown {
@@ -774,6 +775,9 @@ function summarize(
     // 不带出来就只能显示内容（add-memory-importance-and-usage-signal tasks 8.2.3）。
     importance: m.importance ?? null,
     usage_count: m.usageCount ?? 0,
+    // 归属设备随载荷带出（add-cloud-preserve-mode D7）：null = 未知（存量记忆）。
+    // 仅用于展示与溯源，不参与读取授权（授权仍以作用域为唯一依据）。
+    origin_device_id: m.originDeviceId ?? null,
     // 作用域边界属性随条目带出（add-memory-scope-visibility）：人读 preset 名 +
     // 敏感度 + 同步策略，让插件注入闸与面板徽章不靠猜。scope 行缺失时字段缺省
     // （JSON 序列化丢 undefined 键）——插件闸对缺失字段按不可注入处理（fail-closed）。

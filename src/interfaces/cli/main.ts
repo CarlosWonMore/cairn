@@ -51,6 +51,9 @@ const VALUE_FLAGS = new Set([
   'scope-preset', 'scope-project', 'stale-days',
   // project resolve --name（add-stable-project-identity）
   'name',
+  // vault config --preserve-device-bound on|off（add-cloud-preserve-mode）：取值型，
+  // 漏登记会让 'on'/'off' 落成位置参数、开关永远解析失败。
+  'preserve-device-bound',
 ]);
 
 function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
@@ -748,7 +751,7 @@ async function main(): Promise<void> {
         const sub = args[0];
         if (sub === 'init-remote') {
           const provider = str(flags, 'provider') as 'obs' | 'syncd' | undefined;
-          if (provider !== 'obs' && provider !== 'syncd') throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote --provider obs|syncd [--endpoint URL --bucket B --prefix cairn/] [--base-url URL]');
+          if (provider !== 'obs' && provider !== 'syncd') throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote --provider obs|syncd [--endpoint URL --bucket B --prefix cairn/] [--base-url URL] [--preserve-device-bound]');
           const r = service.vaultInitRemote({
             provider,
             obs: provider === 'obs' ? {
@@ -757,8 +760,22 @@ async function main(): Promise<void> {
               prefix: str(flags, 'prefix') ?? 'cairn/',
             } : undefined,
             syncd: provider === 'syncd' ? { baseUrl: str(flags, 'base-url') ?? (process.env[ENV.syncdUrl] || throwUsage('--base-url 必填（或用环境变量 CAIRN_SYNCD_URL）')) } : undefined,
+            preserveDeviceBound: flags['preserve-device-bound'] === true,
           });
-          out({ vaultId: r.vault!.vaultId, provider: r.vault!.provider, recovery: r.recovery, warning: '恢复材料请抄写到安全位置；密钥丢失 = 云端数据不可恢复' }, flags);
+          out({
+            vaultId: r.vault!.vaultId,
+            provider: r.vault!.provider,
+            preserveDeviceBound: r.vault!.preserveDeviceBound === true,
+            recovery: r.recovery,
+            warning: '恢复材料请抄写到安全位置；密钥丢失 = 云端数据不可恢复',
+          }, flags);
+        } else if (sub === 'config') {
+          // 保管模式开关（add-cloud-preserve-mode D1）：显式 on|off，不接受布尔猜测。
+          const raw = str(flags, 'preserve-device-bound');
+          if (raw !== 'on' && raw !== 'off') {
+            throw new CairnError('E_VALIDATION', '用法: cairn vault config --preserve-device-bound on|off（保管模式：开启后设备限定与项目内容密文上云到本设备保管链）');
+          }
+          out(service.vaultConfigPreserve(raw === 'on'), flags);
         } else if (sub === 'status') {
           out(service.vaultStatus(), flags);
         } else if (sub === 'import-key') {
@@ -771,7 +788,7 @@ async function main(): Promise<void> {
           const recovery = service.vaultExportKey();
           out({ recovery, warning: '不要提交到任何仓库或发送给他人；密钥丢失 = 云端数据不可恢复' }, flags);
         } else {
-          throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote|status|export-key');
+          throw new CairnError('E_VALIDATION', '用法: cairn vault init-remote|config|status|export-key');
         }
         break;
       }
@@ -1215,9 +1232,10 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   policy sign|list|show|revoke  自动整理策略（签发只在终端或本机控制台）[--file] [--id] [--force]
   ui                            只读控制台（回环 HTTP；端口默认 7767，占用则随机）
                                 [--port N] [--no-open] [--export <file.html>] [--redact]
-  vault init-remote|status|export-key|import-key  云同步 vault（OBS / 自建 syncd；syncd 的 --base-url 可省，取 CAIRN_SYNCD_URL）
-  sync push|pull|backfill       加密同步上行 / 下行；backfill 补齐未入队的上行任务
-                                [--apply] [--limit N]（默认只读，不与云端交互；详见 docs/cairn-sync.md）
+  vault init-remote|config|status|export-key|import-key  云同步 vault（OBS / 自建 syncd；syncd 的 --base-url 可省，取 CAIRN_SYNCD_URL）
+                                config --preserve-device-bound on|off 切换保管模式（开启后设备限定/项目内容密文上云到本设备保管链）
+  sync push|pull|backfill       加密同步上行 / 下行（push/pull 会真实发布与落地）；backfill 补齐未入队的上行任务
+                                [--apply] [--limit N]（仅 backfill 默认只读且不与云端交互；详见 docs/cairn-sync.md）
   backup / restore              一致性备份与恢复
          --upload             加密上传到远端（独立前缀 backups/<设备>/）[--keep N]（默认保留 5 份）
          --list-remote        列出本设备的远端备份（名称/时间/密文字节）

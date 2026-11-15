@@ -194,7 +194,7 @@ function assembleStore(
   const memories = new MemoryRepository(db);
   const archives = new ImportArchiveRepository(db);
   const plans = new PlanRepository(db);
-  const outbox = new OutboxRepository(db, audit);
+  const outbox = new OutboxRepository(db, audit, paths.dataDir);
   const blocks = new ManagedBlockRepository(db);
   const installations = new DeviceInstallationRepository(db);
   const conflicts = new ConflictRepository(db);

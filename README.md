@@ -144,13 +144,13 @@ npm run test:real      # 真实 OBS 云同步往返（需五个 OBS_* 变量齐�
 | `cloud-sync` | OBS/ECS 加密同步 |
 | `local-console` | 本地控制台 |
 
-测试基线：`npm test` **不联网**，恒 668 项 / 667 通过 / 0 失败 / 1 显式 skip。真实云端往返单独用 `npm run test:real`。
+测试基线：`npm test` **不联网**（当前 865 项 / 864 通过 / 0 失败 / 1 显式 skip，以最近一次全量运行为准）。真实云端往返单独用 `npm run test:real`。
 
 ### 已知边界
 
 - 仅验证 Windows x64 与 Linux/Ubuntu 22.04；macOS 未验证。
 - Claude Code / Cursor / Copilot 的宿主接入为 `fixture-only`，未在真实 CLI 认证下跑过。
-- 云端需要自备 OBS + ECS；默认不安装任何同步 hook。
+- 云端需要自备 OBS + ECS；默认不安装任何同步 hook。设备限定与项目内容默认不上云；对 vault 显式开启保管模式（`vault config --preserve-device-bound on`）后以密文上行到本设备保管链，他机不拉取（见 `docs/cairn-sync.md` 保管模式章节）。
 - 无本地模型依赖；不做抽取推理。
 
 ---

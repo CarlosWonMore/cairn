@@ -1066,3 +1066,46 @@ DSH 的 request/header 只覆盖 call config + 工具 schema；系统提示词�
 - typecheck 0 错；`openspec validate refine-drawer-nav-reachability --strict` 通过。
 - 变异对照：① aria-modal 加回 → 单测 + e2e 两处反向断言全红（110/112）；② nav 去掉 z-index → CSS 单测红 + elementFromPoint 红 + 一次点击超时中止（exit 1）。两轮变异后手工还原（无 MUTATION 残留），复跑全绿。
 - 真库冒烟（任务 5.7）：`cairn ui` 起真库，抽屉打开点导航一次切视图 + 点内容区空白关闭 + 无脚本异常 9/9，主库文件 sha256 前后一致（零写入），报告 `artifacts/console-nav-smoke-2026-11-14.json`。探针本体在临时目录、已删。
+
+### 归档与发版补记（2026-11-14）
+
+用户确认后同日完成闭环：变更归档为 `2026-11-14-refine-drawer-nav-reachability`（local-console 更新 1 条需求），`openspec validate --specs --strict` **10/10**、活动变更清零。提交 `32f1527`（feat 实现+归档+AGENTS.md 基线更正为 846/112）+ `900debb`（chore release 0.6.1），`e38a9dc..900debb` 推送成功（远端=本地）。npm `@carloswon/cairn-memory@0.6.1` 已发布并**双重确认**：registry REST dist-tags.latest=0.6.1 + unpkg CDN 放出（第 8 次轮询）；再以 tarball URL 真装验证——dist 产物含 `z-index: 60`、`aria-modal` 0 处，版本号 0.6.1。插件本轮未动，保持 0.5.0。**再次踩中「管道吃掉 git/npm 失败信号」**：`if git push | tail` 判的是 tail 的退出码且 origin/main 没更新，第一次推送实际未落地——不带管道 `if git push` 重推才确认 `e38a9dc..900debb`。
+
+## 2026-11-15 追加：add-cloud-preserve-mode 实现完成（未归档，8.5 待授权）
+
+保管模式（方案 B：全量密文保管 + 拉取侧物化过滤）实现完成。**未归档**——任务 8.5（真实云端两设备验证）需用户单独授权，其余全部完成。
+
+### 实现要点（按 tasks.md 分节）
+
+- **schema v7**（`MIGRATION_007_PRESERVE_ORIGIN`）：`memory` 加 `origin_device_id`（NULL=未知）+ 重建 `outbox_job` 加 `sync_preserve` 任务类型。**与 design.md 的偏差**：design 说 v7「仅加列」，但设备限定内容过不了 `sync_upstream` 的触发器（006 同款安全边界），按 `sync_scope_exit` 的既定模式新增独立 jobType 才能入队——重建不可避免，无数据改写。
+- **路由单点**：新增 `src/sync/route.ts`，app-service / governance.apply / backfill 全部经它入队（promotedPredicate/firstLine 教训：不在两处各写一份）。OFF 模式下 project-global **保留入队**（既有语义），由 push「完成 + 审计 `sync_job_unroutable`」收口——初版在 enqueue 前排除是错的（规格「MUST 完成并写审计」会落空），写测试时发现并纠正。
+- **push 按链分组发布**（`chains[]` 按链分列 + `unroutable` 计数）：sync_upstream 按记忆当前作用域路由（personal→个人链；device-local/project→开启时保管链）；不可路由一律 done + 审计。事件 payload 增 `scope` 描述符（preset/projectId/spaceName/deviceId，项目名从 space 表取）。
+- **apply 物化过滤**：个人链→personal-global（现状）；本设备保管链按描述符物化（项目行 find-or-create，projectId 跨设备稳定）；agent-private/session-ephemeral 描述符永不落地。三处语义修正：scope_exit 幂等改「标记存在即跳过」；归档只在记忆还在 personal 作用域时发生（保管链重放先行到达时不误归档）；保管链 upsert 落在带标记记忆上 = 自设备重放，解除归档按描述符落位、保留个人链标记。
+- **pull 自链找回**：发现范围**不再排除自己**（原 `d !== myDevice`）——数据目录丢失后个人链与保管链都靠重放自己的 manifest 恢复；游标机制保证健康设备自拉取「全部跳过 + 游标推进」，此后增量。这是实现期发现的设计缺口：提案只说「pull 保管链即恢复」，个人链内容找回同样需要自拉取。
+- **迁出完整性（D4）**：离开个人链必入队 scope_exit（入队固化 `fromSpace`），**无论去向**；个人链之外的内迁（project→device-local）不重复通知；迁回再迁出会重新武装（时间戳幂等键）。
+- **backfill 多链**：个人链缺口口径不变（加 preset 过滤）；开启时保管链缺口另列（只看无 `sync_preserve` 任务——旧版给 project-global 排过的黑任务不算已处理）；报告按链分列。
+- **控制台**：MemoryView/MemoryDetailView 增 `originDeviceId`；`/api/memories?device=`（`unknown`=NULL）服务端过滤；`deviceOptions`（含未知、带记忆数）；卡片徽章与作用域徽章同一 chip 路径；url-state 增 `device` 键；静态导出同构（内嵌模型过滤零请求）。
+- **CLI/可观测**：`vault config --preserve-device-bound on|off`（新子命令）+ `init-remote --preserve-device-bound`；doctor/status 汇报模式与各链 localSeq/游标/待办/缺口；help 文案修正「仅 backfill 默认只读」。
+
+### 实施期发现
+
+1. **pull 自发现排除自己**是找回场景的隐形前提破坏者（见上）——spec 场景「个人全局内容与保管链内容均恢复」逼出这个修正。
+2. **变异对照三连**（artifacts 无残留，手工还原）：A 静默完成回潮→关闭模式测试红；B D4 退回「仅迁往不可同步地才通知」→迁出完整性+双设备全场景红；C 物化过滤去掉→apply 三态测试红。变异用 python 补丁 + 备份还原，**没有 git checkout**（工作树有未提交实现）。
+3. **e2e 两条新增检查踩的坑**：设备徽章「来源未知」无空格，`/^来源 /` 匹配不到；未知徽章原挂了说明性 title，违反 zh-labels「原文模式无 title」不变量——说明移到详情抽屉的「来源设备」行。规格（local-console 420 行）只约束「被翻译的标签」，e2e 的 `every(title==null)` 比规格严——按「title 是未截断设备 id 非翻译对」豁免 `/^dev_/`。
+4. **跨设备断言一律按内容哈希血统查找**：applyEvent 落地生成新本地 id，`memories.get(对端id)` 恒 null——测试里 `byContent()` helper 统一处理。
+5. **fixture 直写时 `ids[i]!.id` 陷阱**：数组元素已是 id 字符串，再 `.id` 得 undefined，UPDATE 落空且不报错。
+
+### 测试基线（本轮后）
+
+- 主仓 `npm test`：**861 / 860 / 0 / 1**（上轮 846/845 → +15：preserve-mode 8 + origin-device 2 + model 1 + server 1 + render 2 + url-state 1）。
+- `npm run test:ui`：**115/115**（上轮 112 → +3：设备徽章、未知选项带记忆数、静态页选未知零请求过滤）。报告 `artifacts/console-ui-2026-11-15.json`。
+- typecheck 0 错；`npm run test:e2e`（onboarding）verdict PASS；`openspec validate add-cloud-preserve-mode --strict` 通过。
+- 真实云端两设备验证（8.5）未执行——需用户授权 OBS/syncd 环境变量与真实库操作。
+
+### 升级/迁移路径（发版后）
+
+存量库打开即自动 v6→v7（零行为变化，模式默认关）。想启用：`vault config --preserve-device-bound on` → `sync backfill --apply`（存量设备限定/项目内容入链）→ `push`；对端 pull 收迁出通知自动收敛 27 条残缺副本（本机这次事故的收尾即可走这条路径）。
+
+### 真机验证补记（2026-11-15 下午，8.5 完成）
+
+用户授权后真实云端双设备验证**通过**（完整记录：`docs/verify-preserve-mode-2026-11-15.md`）。要点：真实库 v7 迁移无损；backfill 48+27 与事故形状逐条吻合；云端 137/137 事件完整性校验、明文 0 命中；**对端 0.6.1 收 27 条迁出通知，active 33→6、archived 11→38、总数 46 不变**——事故残留收敛闭环。验证中修了三个问题（都已带回归测试）：① backfill 存量迁出补发（27 条事故残留的事件来源缺口）；② markDone 先于 publishChain 的重构回归（发布失败任务卡死 done）；③ 自链重放陈旧修订永远 waited（自游标卡死）。对端升级到 0.6.2 后的自有保管链找回留作发版后可选动作。**变更待归档 + npm 0.6.2 发版。**

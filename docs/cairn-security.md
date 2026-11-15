@@ -37,14 +37,21 @@
 
 ## 2. 作用域物理边界
 
-### 2.1 上行排除：两层执行
+### 2.1 上行排除与保管模式（双模，add-cloud-preserve-mode 起）
 
-`local_only` 与设备限定内容（`device-local` / `project-device` / `agent-private` / `session-ephemeral` / 自定义 local_only 空间）被排除在上行任务之外，执行在两层：
+`local_only` 与设备限定内容（`device-local` / `project-device` / `agent-private` / `session-ephemeral` / 自定义 local_only 空间）的上行语义由 **vault 级保管模式开关**（`cairn vault config --preserve-device-bound on|off`，默认关闭）决定：
 
-1. **应用层入口**：写入、更正、遗忘时统一调用 `scopeAllowsUpstream`（只有 `syncPolicy=encrypted` 的作用域才会生成 `sync_upstream` 任务）。检索、详情、导出、投影走同一个 `scopeAllowsRead` / 同一组判定入口，禁止各入口自行解释作用域（spec scoped-retrieval「全通道作用域隔离」）。
-2. **数据库触发器兜底**：`outbox_reject_local_upstream` 在 `outbox_job` 插入前检查——`sync_policy <> 'encrypted'` 或 `device_id <> 'all'` 的作用域直接 `RAISE(ABORT, 'scope_not_upstreamable')`。即使未来某条代码路径遗漏了入口检查，SQLite 层也会物理拒绝该任务落库，并留下可审计的失败。
+- **关闭（默认）**：延续既有物理排除语义——设备限定内容不产生任何上行任务；`agent-private` 与 `session-ephemeral` 永不上云。project-global 等非个人全局内容即使有历史入队任务，也只会被「完成 + 审计 `sync_job_unroutable`」，不产生任何远端事件。
+- **开启（用户显式决定）**：设备限定与项目内容以密文上行到**本设备的保管链**（`preserve/<deviceId>`），事件携带归属设备标签与作用域描述符；**其他设备的保管链不会被拉取**，云端对象仍无明文。`agent-private` 与 `session-ephemeral` 在任何模式下都**不上云**。
+
+无论哪种模式，个人链内容的排除都是两层执行：
+
+1. **应用层入口**：写入、更正、遗忘、计划应用统一经 `sync/route.ts` 的单一路由判定（个人链 / 保管链 / 不入队）。检索、详情、导出、投影走同一个 `scopeAllowsRead` / 同一组判定入口，禁止各入口自行解释作用域（spec scoped-retrieval「全通道作用域隔离」）。
+2. **数据库触发器兜底**：`outbox_reject_local_upstream` 在 `outbox_job` 插入前检查——`sync_upstream` 任务的作用域若非 `encrypted` + `device_id='all'` 直接 `RAISE(ABORT, 'scope_not_upstreamable')`。保管链任务（`sync_preserve`）在应用层只收保管链承载的作用域，且必须保管模式开启。
 
 作用域校验（`validateScopeSpec`）另有硬规则：设备绑定作用域必须是 `local_only`；`sensitive` 内容必须 `local_only`；`encrypted` 同步要求设备为 all。这些规则无法通过 CLI/MCP 参数绕过。
+
+**密钥泄露爆炸半径（用户已确认的取舍）**：保管模式开启的 vault 上，vault 密钥泄露的影响范围从「个人全局内容」扩大到「全部记忆」——对端与本机共享 vault 密钥，被入侵的对端可解其他设备保管链的密文。这是换取「全量密文异地保管 + 设备找回」能力的代价；不接受该取舍的用户保持开关关闭即可，关闭时语义与 0.6.x 完全一致。`candidate` / `sensitive` 内容在保管模式下同样会密文上云——某条内容若绝不能离开本机，请使用 `agent-private` 作用域（任何模式都不上云）。
 
 ### 2.2 导出与投影
 

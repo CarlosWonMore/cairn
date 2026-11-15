@@ -20,7 +20,7 @@
 - **「整个 DSH 会话都走 cairn」的落点是 user-global 指令层**，不是逐个项目改：`D:\AIAgents_Data\DSH_DATA\AGENTS.md`（= `$DSH_HOME/AGENTS.md`）由 `@deepseek-ai/dsh-agent-instructions` 在**每个会话首个请求**加载，与项目级 `AGENTS.md` **叠加而非覆盖**（另有 `~/.agents/AGENTS.md` 为同级第二根）。已写入与 `ROUTER_BLOCK_CONTENT` 一致的受管块（`cairn-router` / revision 1）。注意 `cairn agent` 的 `AGENT_KINDS` **不含 dsh**，这条是手工复用受管块格式，不是产品命令（见 `docs/M0-session-handoff.md` §10）。
 - **DSH 的 patch 行必须写成 `- insert:` 再嵌套条目**，不能直接写 `- id: mcp-cairn`：顶层数组是补丁行（覆盖/禁用既有条目），裸 id 行找不到目标就被静默丢弃，日志只留一行 `[warn] patch: entry "mcp-cairn" not found`。**这条我已踩过一次**（2026-11-01），改正后热加载即生效。改前已备份 `cordis.patch.yml.bak-pre-cairn-20261101`。2026-11-01 20:35 端到端确认：插件 state 1→2、cairn 进程 ppid 为 DSH NEXT.exe、14 个 `mcp__cairn__*` 工具可调。
 - 浏览器点击级验收 `npm run test:ui`（`scripts/e2e-console-ui.mjs`，Playwright + 系统 Chrome，`channel: 'chrome'` 不下载 Chromium）：真点导航/抽屉/折叠/批量/静态页，断言 `role=dialog`、焦点移入与归还、Esc·遮罩·按钮三入口、地址往返还原、只读预览页无写入口。**依赖是一次性的，未写入 package.json**：缺 playwright 时脚本 exit 2 并给出 `npm i --no-save --no-package-lock playwright`，不静默跳过。2026-10-30 实测 46/46，报告落 `artifacts/console-ui-<date>.json`。
-- 测试基线：`npm test` 默认不联网，恒 846 项 / 845 通过 / 0 失败 / 1 显式 skip（2026-11-14 起；e2e-console-ui 为 112/112）；真实云端往返用 `npm run test:real`（需 `OBS_*` 五个变量齐全，缺任一即 exit 2，不静默 skip）。
+- 测试基线：`npm test` 默认不联网，恒 865 项 / 864 通过 / 0 失败 / 1 显式 skip（2026-11-15 起；e2e-console-ui 为 115/115）；真实云端往返用 `npm run test:real`（需 `OBS_*` 五个变量齐全，缺任一即 exit 2，不静默 skip）。
 - 下一入口候选（需用户决定）：macOS 平台 CI（用户 2026-10-28 明确暂缓）；项目/自定义空间的云同步扩展；公开发布准备（private→public、npm 发包、`@cairn/memory` 包名核查）。
 - **DSH 插件相关的问题，先读源码再动手，不要猜 API。** 2026-11-02 实测教训：做 DSH 记忆插件时连续 8 轮修改都失败，根因是猜宿主 API——`ctx.tools.call` 不存在、`tools.get()` 返回的定义上没有 `call`。真实入口是 `ctx.tools.execute({callId,name,arguments,signal,agent})` 与 `definition.execute(args,exec)`。**权威来源**：`D:\Program Files\DSH NEXT\resources\app.asar` 里的实现（可按字节串 grep），以及已装插件 `profiles/desktop/node_modules/*/lib/*.js` 的真实用法。三次交接（ZCode 两次、CodeBuddy 一次）都比自查有效：ZCode 找到 list slot 要 `id`、`session/event` 是双参数 `(session,event)`；CodeBuddy 找到 `execute`。**但 2026-11-02 12:36 后的实测更进了一步**：本机部署默认是 **ptc 呈现模式**，`tools.execute` 对非 `run_code` 的直呼一律折叠成 `UNKNOWN_TOOL`（错误文案 `only \`run_code\` is callable directly`），所以插件内**主路径应是 `tools.get(name, scope)` → `definition.execute(args, exec)`**，`tools.execute` 只在定义上没有 `execute` 时兜底。顺序写反的代价不是失败，是每轮六条查询各撞一次必然拒绝、并把假错误永久写进 `usage?debug=1` 的 `lastError`——排查时会被它带偏。
 - **DSH 插件改动必须重建 `dist`**：插件从 `plugin/dsh/dist/index.js` 加载，只改 `src/` 不 `npx tsc -p tsconfig.json` 等于没改。我已经在这上面栽过一次。
@@ -43,7 +43,7 @@
 
 - 不读取真实个人记忆，除非用户明确指定来源并授权；发现阶段只看元数据。
 - 记忆导入、MCP 配置、原生记忆修改是三个独立授权步骤。
-- `local_only` 和设备限定内容必须在上行任务生成前物理排除。
+- `local_only` 和设备限定内容默认在上行任务生成前物理排除；用户对 vault 显式开启保管模式后（`vault config --preserve-device-bound on`，2026-11 已确认推翻「唯一物理排除」语义），此类内容以密文上行到本设备保管链（`preserve/<deviceId>`），他机不拉取、云端对象无明文；`agent-private` 与 `session-ephemeral` 任何模式都不上云。
 - 模型只生成候选；`plan_hash + approval_id`、目标修订和一次性有效期由确定性代码校验。
 - 调用方声明 `user_confirmed` 不代表真实批准；秘密和注入文本不得进入日志、投影或上行内容。
 - 默认只用合成 HOME、合成记忆和 fake backend；真实 Agent 配置或云端资源需要另行明确授权。

@@ -1,6 +1,6 @@
 import { err, isCairnError } from '../core/errors.js';
 import { EvidenceInput, SecretScanResult } from '../core/types.js';
-import { scopeAllowsUpstream } from '../core/scope.js';
+import { routeMemoryUpstream } from '../sync/route.js';
 import { CairnStore } from '../store/open.js';
 import { PlanOpRecord, PlanRecord } from '../store/plans.js';
 
@@ -248,19 +248,11 @@ function applyOp(
 
 /**
  * 治理写入的上行落点（spec cloud-sync「上行入队完备性」）。
- * 准入判定复用 `scopeAllowsUpstream`；作用域不允许上行属正常结果，不入队也不报错，
+ * 路由与排除判定只在 sync/route.ts 一处；作用域不允许上行属正常结果，不入队也不报错，
  * 因此不会让计划应用失败、不会把 op 标记 failed（design D1/D2）。
  */
 function enqueueUpstream(store: CairnStore, memoryId: string, scopeId: string, idempotencyKey: string): void {
-  if (!scopeAllowsUpstream(store.scopes.requireById(scopeId))) return;
-  store.outbox.enqueue({
-    jobType: 'sync_upstream',
-    scopeId,
-    entityType: 'memory',
-    entityId: memoryId,
-    payload: { op: 'memory_upsert', memoryId },
-    idempotencyKey,
-  });
+  routeMemoryUpstream(store, memoryId, scopeId, 'memory_upsert', idempotencyKey);
 }
 
 function evidenceForOp(op: PlanOpRecord, evidenceByItem: Record<string, EvidenceInput[]>): EvidenceInput[] {

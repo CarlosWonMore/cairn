@@ -36,6 +36,8 @@ export interface ModelOptions {
   statuses?: string[];
   /** 记忆 kind 过滤。 */
   kinds?: string[];
+  /** 来源设备过滤（add-cloud-preserve-mode 0a）：设备 id 列表；特殊值 'unknown' = 归属设备未知。 */
+  devices?: string[];
   /** 关键词过滤（记忆正文 + 快照条目正文，走有界 LIKE，不走 FTS 以免污染只读快照语义）。 */
   q?: string;
   /** 是否把 import_item 明细一并装配（导出需要；工作台首屏不需要）。 */
@@ -72,6 +74,8 @@ export interface MemoryView {
   scopeId: string;
   content: ContentView;
   contentHash: string;
+  /** 归属设备（add-cloud-preserve-mode D7）：null = 未知（存量记忆如实展示）。 */
+  originDeviceId: string | null;
   sourceAgent: string | null;
   createdBy: string;
   createdAt: string;
@@ -81,6 +85,16 @@ export interface MemoryView {
   evidenceCount: number;
   openConflicts: number;
   tombstoned: boolean;
+}
+
+/** 「来源设备」过滤器的一个选项（含消歧标识与记忆数）。 */
+export interface DeviceOptionView {
+  /** 设备 id；null = 未知（历史记忆）。 */
+  deviceId: string | null;
+  /** 选项文案：设备标识（未知如实显示「未知」）。 */
+  label: string;
+  /** 该来源的记忆数（不含 superseded）。 */
+  count: number;
 }
 
 export interface ArchiveView {
@@ -252,7 +266,7 @@ export interface ConsoleModel {
   schemaVersion: number;
   mode: ViewMode;
   redacted: boolean;
-  filter: { q: string | null; scopeIds: string[]; statuses: string[]; kinds: string[] };
+  filter: { q: string | null; scopeIds: string[]; statuses: string[]; kinds: string[]; devices: string[] };
   counts: ConsoleCounts;
   scopes: ScopeLayerView[];
   memories: MemoryView[];
@@ -262,6 +276,8 @@ export interface ConsoleModel {
   approvals: ApprovalView[];
   outbox: OutboxView;
   sync: SyncView;
+  /** 来源设备过滤选项（库中实际出现的归属设备，含「未知」，带记忆数）。 */
+  deviceOptions: DeviceOptionView[];
   /** 导入工作台的单表数据（任务 4.1）：一条来源一次导入一行。 */
   imports: ImportRowsView;
   /** 仅在 includeItems 时存在。 */
@@ -291,6 +307,7 @@ export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleM
   const scopes = loadScopes(store);
   const archives = loadArchives(store);
   const batches = loadBatches(store);
+  const devices = opts.devices ?? [];
   const memories = loadMemories(store, {
     mode,
     redact,
@@ -299,7 +316,9 @@ export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleM
     scopeIds,
     statuses,
     kinds,
+    devices,
   });
+  const deviceOptions = loadDeviceOptions(store);
   const plans = loadPlans(store);
   const approvals = plans.flatMap((p) => p.approvals);
   const outbox = loadOutbox(store);
@@ -318,7 +337,7 @@ export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleM
     schemaVersion: schemaVersion(store.db),
     mode,
     redacted: redact,
-    filter: { q: q.length > 0 ? q : null, scopeIds, statuses, kinds },
+    filter: { q: q.length > 0 ? q : null, scopeIds, statuses, kinds, devices },
     counts: {
       memoriesByStatus,
       memoriesTotal: memories.length,
@@ -348,6 +367,7 @@ export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleM
     approvals,
     outbox,
     sync,
+    deviceOptions,
     imports,
     notes,
   };
@@ -404,7 +424,7 @@ function loadScopes(store: CairnStore): ScopeLayerView[] {
 
 function loadMemories(
   store: CairnStore,
-  o: { mode: ViewMode; redact: boolean; briefChars: number; q: string; scopeIds: string[]; statuses: string[]; kinds: string[] },
+  o: { mode: ViewMode; redact: boolean; briefChars: number; q: string; scopeIds: string[]; statuses: string[]; kinds: string[]; devices: string[] },
 ): MemoryView[] {
   const where: string[] = [];
   const params: unknown[] = [];
@@ -419,6 +439,19 @@ function loadMemories(
   if (o.kinds.length > 0) {
     where.push(`m.kind IN (${o.kinds.map(() => '?').join(',')})`);
     params.push(...o.kinds);
+  }
+  if (o.devices.length > 0) {
+    // 'unknown' 是「来源设备未知」的保留值（spec：选项含「未知」）；
+    // 服务端过滤（spec：检索 MUST 由服务端执行，不用前端过滤伪造结果集）。
+    const unknownSelected = o.devices.includes('unknown');
+    const ids = o.devices.filter((d) => d !== 'unknown');
+    const parts: string[] = [];
+    if (ids.length > 0) {
+      parts.push(`m.origin_device_id IN (${ids.map(() => '?').join(',')})`);
+      params.push(...ids);
+    }
+    if (unknownSelected) parts.push('m.origin_device_id IS NULL');
+    where.push(`(${parts.join(' OR ')})`);
   }
   if (o.q.length > 0) {
     where.push('m.content LIKE ?');
@@ -449,6 +482,7 @@ function loadMemories(
         hash: String(r['content_hash']),
       }),
       contentHash: String(r['content_hash']),
+      originDeviceId: (r['origin_device_id'] as string | null) ?? null,
       sourceAgent: (r['source_agent'] as string | null) ?? null,
       createdBy: String(r['created_by']),
       createdAt: String(r['created_at']),
@@ -460,6 +494,22 @@ function loadMemories(
       tombstoned: Number(r['tombstone_count']) > 0 || String(r['status']) === 'tombstoned',
     };
   });
+}
+
+/** 来源设备选项（spec：选项为库中实际出现的归属设备，含「未知」，带消歧标识与记忆数）。 */
+function loadDeviceOptions(store: CairnStore): DeviceOptionView[] {
+  const rows = store.db.all(
+    "SELECT origin_device_id AS d, COUNT(*) AS n FROM memory WHERE status <> 'superseded' GROUP BY origin_device_id ORDER BY n DESC",
+  );
+  return rows
+    .map((r) => {
+      const d = r['d'] == null ? null : String(r['d']);
+      return {
+        deviceId: d,
+        label: d ?? '未知',
+        count: Number(r['n']),
+      };
+    });
 }
 
 function loadArchives(store: CairnStore): ArchiveView[] {
@@ -943,6 +993,7 @@ export function memoryDetail(
       hash: String(row['content_hash']),
     }),
     contentHash: String(row['content_hash']),
+    originDeviceId: (row['origin_device_id'] as string | null) ?? null,
     sourceAgent: (row['source_agent'] as string | null) ?? null,
     createdBy: String(row['created_by']),
     createdAt: String(row['created_at']),

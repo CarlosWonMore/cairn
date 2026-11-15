@@ -6,6 +6,7 @@ import {
   MIGRATION_004_KIND_LESSON,
   MIGRATION_005_MEMORY_IMPORTANCE_USAGE,
   MIGRATION_006_OUTBOX_SCOPE_EXIT,
+  MIGRATION_007_PRESERVE_ORIGIN,
 } from './schema.js';
 import { err } from '../core/errors.js';
 
@@ -46,6 +47,15 @@ export const MIGRATIONS: readonly Migration[] = [
     sql: MIGRATION_006_OUTBOX_SCOPE_EXIT,
     // 重建 outbox_job（job_type CHECK 加 sync_scope_exit）：出向 FK 引用 scope，
     // 同 004 的纪律——外键在 BEGIN 之前关掉，否则 DROP 旧表可能级联出问题。
+    preTransactionPragma: ['PRAGMA foreign_keys = OFF'],
+    postTransactionPragma: ['PRAGMA foreign_keys = ON'],
+  },
+  {
+    version: 7,
+    name: 'preserve_origin_device',
+    sql: MIGRATION_007_PRESERVE_ORIGIN,
+    // 重建 outbox_job（job_type CHECK 加 sync_preserve）+ memory 加 origin_device_id。
+    // 外键纪律同 006。
     preTransactionPragma: ['PRAGMA foreign_keys = OFF'],
     postTransactionPragma: ['PRAGMA foreign_keys = ON'],
   },

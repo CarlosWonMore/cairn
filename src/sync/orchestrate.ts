@@ -1,7 +1,7 @@
 import { CairnStore } from '../store/open.js';
 import { RemoteStore } from '../jobs/remote.js';
 import { err } from '../core/errors.js';
-import { VaultConfig, loadVaultConfig, saveVaultConfig, ENV } from './vault.js';
+import { VaultConfig, loadVaultConfig, saveVaultConfig, updateVaultConfig, ENV } from './vault.js';
 import { VaultKeys } from './cryptoutil.js';
 import { generateVaultKeys, saveKeys, loadKeys, exportRecoveryMaterial } from './cryptoutil.js';
 import { registerHandler } from '../jobs/worker.js';
@@ -63,18 +63,28 @@ export function syncContext(store: CairnStore): SyncContext | null {
 
 /** 注册 worker 的真实上行 handler（configured 时调用；未配置保持诚实失败 handler）。 */
 export function registerSyncWorker(store: CairnStore, remote: RemoteStore, vault: VaultConfig): void {
-  registerHandler('sync_upstream', (job) => {
-    // worker 已 claim 单个任务；push 以该任务触发批量发布（幂等：已推送修订跳过）
-    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId, payload: job.payload }] });
-  });
+  const pushWith = (job: { id: string; entityId: string; payload: Record<string, unknown>; jobType: string }): void => {
+    // worker 已 claim 单个任务；push 以该任务触发批量发布（按链路由；幂等：已推送修订跳过）
+    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId, payload: job.payload, jobTypeHint: job.jobType }] });
+  };
+  registerHandler('sync_upstream', (job) => pushWith({ ...job, jobType: 'sync_upstream' }));
   // 迁出通知任务走同一条 push 链（add-scope-migration）：生成 scope_exit 控制事件。
-  registerHandler('sync_scope_exit', (job) => {
-    void syncPush(store, remote, vault, { preclaimedJobs: [{ id: job.id, entityId: job.entityId, payload: job.payload }] });
-  });
+  registerHandler('sync_scope_exit', (job) => pushWith({ ...job, jobType: 'sync_scope_exit' }));
+  // 保管链上行任务（add-cloud-preserve-mode）：同一条 push，按链路由到 preserve/<deviceId>。
+  registerHandler('sync_preserve', (job) => pushWith({ ...job, jobType: 'sync_preserve' }));
 }
 
 /** 初始化远端：生成/复用密钥 + 写 vault.json + 确保 personal-global 为 encrypted。 */
-export function initRemote(store: CairnStore, input: { provider: 'obs' | 'syncd'; obs?: { endpoint: string; bucket: string; prefix: string }; syncd?: { baseUrl: string } }): { vault: VaultConfig; recovery: string } {
+export function initRemote(
+  store: CairnStore,
+  input: {
+    provider: 'obs' | 'syncd';
+    obs?: { endpoint: string; bucket: string; prefix: string };
+    syncd?: { baseUrl: string };
+    /** 保管模式（add-cloud-preserve-mode D1）：init 时即可开启，默认关闭。 */
+    preserveDeviceBound?: boolean;
+  },
+): { vault: VaultConfig; recovery: string } {
   store.assertWritable();
   // 同步前提：personal-global 必须是 encrypted（默认预设即如此；被改过则明确失败）
   const scope = store.scopes.resolvePreset('personal-global');
@@ -91,9 +101,23 @@ export function initRemote(store: CairnStore, input: { provider: 'obs' | 'syncd'
   }
   // vault 前缀并入 store prefix（OBS store 的 space/device 必须是单路径段）
   const obs = input.obs ? { endpoint: input.obs.endpoint, bucket: input.obs.bucket, prefix: `${input.obs.prefix}vaults/${keys.vaultId}/` } : undefined;
-  const vault = saveVaultConfig(store.paths.dataDir, { provider: input.provider, obs, syncd: input.syncd, vaultId: keys.vaultId });
-  store.audit.record('sync', 'remote_initialized', { type: 'system', id: vault.vaultId }, { provider: vault.provider });
+  const vault = saveVaultConfig(store.paths.dataDir, {
+    provider: input.provider,
+    obs,
+    syncd: input.syncd,
+    vaultId: keys.vaultId,
+    preserveDeviceBound: input.preserveDeviceBound === true,
+  });
+  store.audit.record('sync', 'remote_initialized', { type: 'system', id: vault.vaultId }, { provider: vault.provider, preserveDeviceBound: input.preserveDeviceBound === true });
   return { vault, recovery: exportRecoveryMaterial(keys) };
+}
+
+/** 切换保管模式（vault config 子命令）。写审计——模式是安全姿态的一部分。 */
+export function setPreserveMode(store: CairnStore, enabled: boolean): VaultConfig {
+  store.assertWritable();
+  const vault = updateVaultConfig(store.paths.dataDir, { preserveDeviceBound: enabled });
+  store.audit.record('sync', 'preserve_mode_changed', { type: 'system', id: vault.vaultId }, { preserveDeviceBound: enabled });
+  return vault;
 }
 
 export { syncPush, syncPull, exportRecoveryMaterial, PERSONAL_SPACE_KEY };

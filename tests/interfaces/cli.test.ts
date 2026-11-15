@@ -355,3 +355,33 @@ test('vault init-remote syncd：参数与环境变量都缺 → 用法退出码 
   assert.ok(r.stdout.includes('CAIRN_SYNCD_URL'), '错误文案要点出环境变量这条路（--json 时错误走 stdout）');
   assert.equal(existsSync(join(home, 'data', 'vault.json')), false, '失败不得留下 vault.json');
 });
+
+test('vault config --preserve-device-bound 真的切换保管模式（add-cloud-preserve-mode flag 白名单回归）', async () => {
+  // 与 promote --scope-preset 同款回归：取值型 flag 不在 VALUE_FLAGS 里时，
+  // parseArgs 把 'on'/'off' 落成位置参数，开关永远解析失败且看起来像用法错误之外的其他故障。
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    assert.equal((await runCli([...base, 'init'])).code, 0);
+    // 未配置远端：config 拒绝（E_VALIDATION），但拒绝理由必须是「vault.json 不存在」而不是用法错
+    const before = await runCli([...base, 'vault', 'config', '--preserve-device-bound', 'on']);
+    const beforeBody = JSON.parse(before.stdout) as { error: { code: string; message: string } };
+    assert.equal(beforeBody.error.code, 'E_VALIDATION');
+    assert.match(beforeBody.error.message, /vault.json 不存在/);
+
+    // 配一个最小 syncd vault（不触网：config 只读写本地 vault.json）
+    writeFileSync(join(home, 'data', 'keys.json'), JSON.stringify({ vaultId: 'vlt_test', vaultKey: 'x'.repeat(64) }), 'utf8');
+    writeFileSync(join(home, 'data', 'vault.json'), JSON.stringify({ vaultId: 'vlt_test', provider: 'syncd', syncd: { baseUrl: 'http://unused.invalid' }, createdAt: new Date().toISOString() }), 'utf8');
+
+    const on = JSON.parse((await runCli([...base, 'vault', 'config', '--preserve-device-bound', 'on'])).stdout) as { preserveDeviceBound: boolean };
+    assert.equal(on.preserveDeviceBound, true, 'on 必须真的开启');
+    const status = JSON.parse((await runCli([...base, 'vault', 'status'])).stdout) as { preserveDeviceBound: boolean };
+    assert.equal(status.preserveDeviceBound, true, 'vault status 如实反映');
+    const off = JSON.parse((await runCli([...base, 'vault', 'config', '--preserve-device-bound', 'off'])).stdout) as { preserveDeviceBound: boolean };
+    assert.equal(off.preserveDeviceBound, false, 'off 必须真的关闭');
+    const bad = await runCli([...base, 'vault', 'config', '--preserve-device-bound', 'maybe']);
+    assert.equal(bad.code, 2, '非 on|off 用法错误（退出码 2）');
+  } finally {
+    execFileSync(process.execPath, ['-e', `require('node:fs').rmSync(${JSON.stringify(home)}, { recursive: true, force: true })`], { encoding: 'utf8' });
+  }
+});

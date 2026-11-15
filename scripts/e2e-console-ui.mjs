@@ -405,6 +405,23 @@ async function main() {
     const many = await run([join(home, 'seed-many.mjs')], env);
     if (many.code !== 0) throw new Error(`灌样本失败: ${many.stderr || many.stdout}`);
 
+    // 来源设备（add-cloud-preserve-mode 0a）：一条「归属未知」的存量形态样本，
+    // 让设备过滤器与「未知」徽章在验收里有真实对象。
+    writeFileSync(
+      join(home, 'seed-legacy-origin.mjs'),
+      [
+        `import { AppService } from ${JSON.stringify(appUrl)};`,
+        `const svc = AppService.open(process.env.CAIRN_HOME);`,
+        `const scope = svc.store.scopes.resolvePreset('personal-global');`,
+        `const m = svc.store.memories.add({ kind: 'fact', content: '归属未知的存量样本：变更前写入的历史记忆。', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, svc.store.identity.deviceId);`,
+        `svc.store.db.run('UPDATE memory SET origin_device_id = NULL WHERE id = ?', m.id);`,
+        `svc.close();`,
+      ].join(String.fromCharCode(10)),
+      'utf8',
+    );
+    const legacy = await run([join(home, 'seed-legacy-origin.mjs')], env);
+    if (legacy.code !== 0) throw new Error(`存量样本写入失败: ${legacy.stderr || legacy.stdout}`);
+
     await page.click('[data-view="memories"]');
     await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
 
@@ -466,7 +483,9 @@ async function main() {
     const rawChips = await readChips();
     check(
       '切到原文后 chip 恢复原始枚举值（且不再挂 title）',
-      rawChips.some((c) => c.t === 'fact') && rawChips.every((c) => c.title == null),
+      // 设备徽章（add-cloud-preserve-mode）的 title 是未截断的设备 id，不是翻译对，
+      // 两种模式下徽章文本本就逐字节一致——豁免之；其余 chip 原文模式一律无 title。
+      rawChips.some((c) => c.t === 'fact') && rawChips.every((c) => c.title == null || /^dev_/.test(c.title)),
       rawChips.slice(0, 6).map((c) => c.t).join(' | '),
     );
 
@@ -688,6 +707,29 @@ async function main() {
       );
       check('静态页本地限定徽章仍写明「仅本机」', staticChips.includes('device-local · 仅本机'), staticChips.filter((t) => /仅本机/.test(t)).join(' | ') || '未找到');
       check('静态页渲染徽章未发起网络请求', netRequests.length === 0, netRequests.slice(0, 2).join(' | '));
+
+      // 来源设备（add-cloud-preserve-mode 0a）：静态页设备过滤零请求 + 徽章渲染
+      const deviceChips = staticChips.filter((t) => /^来源( |未知)/.test(t));
+      check('静态页记忆卡片渲染归属设备徽章（未知如实显示）', deviceChips.length > 1 && deviceChips.includes('来源未知'), deviceChips.slice(0, 3).join(' | ') || '未找到');
+      const devSel = sp.locator('#view select').nth(1); // 工具栏第 2 个下拉 = 来源设备
+      const devOptionLabels = await devSel.locator('option').allTextContents();
+      check('静态页来源设备选项含「未知」并带记忆数', devOptionLabels.some((t) => /未知 · \d+/.test(t)), devOptionLabels.slice(0, 4).join(' | '));
+      const devValue = await devSel.locator('option').evaluateAll((os) => {
+        const o = os.find((x) => x.value === 'unknown');
+        return o ? 'unknown' : '';
+      });
+      const devBefore = (await sp.$$eval('#view div.card', (els) => els.length));
+      await devSel.selectOption(devValue);
+      await sp.waitForTimeout(300);
+      const devAfter = (await sp.$$eval('#view div.card', (els) => els.length));
+      const unknownChips = (await sp.$$eval('#view div.card .chip', (els) => els.map((e) => e.textContent || ''))).filter((t) => t === '来源未知');
+      check(
+        '静态页选「未知」后列表只剩归属未知的记忆（零请求）',
+        devValue === 'unknown' && devAfter > 0 && devAfter <= devBefore && unknownChips.length === devAfter && netRequests.length === 0,
+        `卡片 ${devBefore}→${devAfter}，未知徽章 ${unknownChips.length}，请求 ${netRequests.length}`,
+      );
+      await devSel.selectOption('');
+      await sp.waitForTimeout(300);
 
       // 4.6 静态导出页同样可切换标签语言，且不发起任何网络请求
       const netBefore = netRequests.length;

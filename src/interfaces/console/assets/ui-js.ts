@@ -48,6 +48,8 @@ export const UI_JS = String.raw`
     scope: '',
     status: '',
     kind: '',
+    /** 来源设备过滤（add-cloud-preserve-mode 0a）：设备 id 或 'unknown'（归属未知）。 */
+    device: '',
     mode: 'brief',
     /** 'zh' 中文标签（默认）/ 'raw' 原文，见 add-console-zh-labels。 */
     labelLang: 'zh',
@@ -205,6 +207,7 @@ export const UI_JS = String.raw`
     if (state.scope) p.set('scope', state.scope);
     if (state.status) p.set('status', state.status);
     if (state.kind) p.set('kind', state.kind);
+    if (state.device) p.set('device', state.device);
     p.set('mode', state.mode);
     if (extra) Object.keys(extra).forEach(function (k) { if (extra[k]) p.set(k, extra[k]); });
     return p.toString();
@@ -235,6 +238,11 @@ export const UI_JS = String.raw`
     if (opts && opts.scope) out = out.filter(function (x) { return x.scopeId === opts.scope; });
     if (opts && opts.status) out = out.filter(function (x) { return x.status === opts.status; });
     if (opts && opts.kind) out = out.filter(function (x) { return x.kind === opts.kind; });
+    if (opts && opts.device) {
+      out = out.filter(function (x) {
+        return opts.device === 'unknown' ? x.originDeviceId == null : x.originDeviceId === opts.device;
+      });
+    }
     return out;
   }
 
@@ -248,6 +256,7 @@ export const UI_JS = String.raw`
     state.scope = got.scope || '';
     state.status = got.status || '';
     state.kind = got.kind || '';
+    state.device = got.device || '';
     state.batch = got.batch || '';
     state.plan = got.plan || '';
     state.drawer = got.drawer || '';
@@ -383,6 +392,24 @@ export const UI_JS = String.raw`
       });
       ss.addEventListener('change', function () { state.status = ss.value; writeUrl(false); render(); });
       bar.appendChild(ss);
+    }
+    if (opts && opts.deviceSelect) {
+      // 来源设备过滤（add-cloud-preserve-mode 0a）：选项为库中实际出现的归属设备
+      // （含「未知」），文案带设备标识与记忆数；过滤由服务端执行（工作台）或
+      // 内嵌模型执行（静态页），两种形态同一交互。
+      var ds = el('select', { 'class': 'action' });
+      ds.style.cssText = 'background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;';
+      ds.appendChild(el('option', { value: '' }, '全部来源设备'));
+      (opts.devices || []).forEach(function (d) {
+        var name = d.deviceId == null ? '未知' : d.deviceId;
+        var text = (d.deviceId == null ? '未知' : '设备 ' + short(name, 12)) + ' · ' + d.count;
+        var o = el('option', { value: d.deviceId == null ? 'unknown' : d.deviceId, title: d.deviceId == null ? '归属设备未知的记忆（历史数据或未回填）' : d.deviceId }, text);
+        var val = d.deviceId == null ? 'unknown' : d.deviceId;
+        if (val === state.device) o.setAttribute('selected', 'selected');
+        ds.appendChild(o);
+      });
+      ds.addEventListener('change', function () { state.device = ds.value; writeUrl(false); render(); });
+      bar.appendChild(ds);
     }
     var modeBtn = el('button', { type: 'button', 'class': 'action', 'data-action': 'mode', title: '切换摘要/全文（M）' }, state.mode === 'full' ? '显示摘要' : '显示全文');
     modeBtn.addEventListener('click', toggleMode);
@@ -530,8 +557,8 @@ export const UI_JS = String.raw`
   function renderMemories(host, reuse) {
     if (STATIC) {
       var model = staticModel();
-      toolbar(host, { scopes: model.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
-      var list = localFilter(model.memories, { scope: state.scope, status: state.status });
+      toolbar(host, { scopes: model.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: model.deviceOptions || [], deviceSelect: true });
+      var list = localFilter(model.memories, { scope: state.scope, status: state.status, kind: state.kind, device: state.device });
       paintMemories(host, list, list.length, model.scopes);
       // 地址带 mem = 刷新/分享回来的详情，直接重新打开（静态页不发请求）。
       if (state.mem) openDetail(state.mem);
@@ -551,7 +578,7 @@ export const UI_JS = String.raw`
 
   /** 列表骨架：工具栏 + 卡片。数据已在手时只重绘，不再请求。 */
   function paintMemoriesView(host, data) {
-    toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'] });
+    toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: data.deviceOptions || [], deviceSelect: true });
     paintMemories(host, data.memories, data.total, data.scopes);
   }
 
@@ -581,6 +608,14 @@ export const UI_JS = String.raw`
       else {
         var presetText = label(scope.preset, PRESET_LABEL);
         head.appendChild(chip(presetText + (scopeLocalOnly(scope) ? ' · 仅本机' : ''), scopeLocalOnly(scope) ? 'warn' : 'muted', presetText === scope.preset ? null : scope.preset));
+      }
+      // 归属设备徽章（add-cloud-preserve-mode 0a）：与作用域徽章同一渲染路径
+      // （卡片头部 chip），未知如实显示；仅展示用，不影响授权。
+      if (mem.originDeviceId) {
+        head.appendChild(chip('来源 ' + short(mem.originDeviceId, 12), 'info', mem.originDeviceId));
+      } else {
+        // 不挂 title：未知不是翻译对，说明放详情抽屉的「来源设备」行；原文模式无 title 的不变量保持成立。
+        head.appendChild(chip('来源未知', 'muted'));
       }
       head.appendChild(chipLabel(mem.authority, AUTHORITY_LABEL, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
       if (mem.sensitivity === 'sensitive') head.appendChild(chip('sensitive', 'danger'));
@@ -915,6 +950,7 @@ export const UI_JS = String.raw`
      ['authority', label(d.memory.authority, AUTHORITY_LABEL), d.memory.authority],
      ['sensitivity', d.memory.sensitivity, d.memory.sensitivity],
      ['scope', scopeShown, scopeRaw],
+     ['来源设备', d.memory.originDeviceId || '未知（历史记忆）', d.memory.originDeviceId || null],
      ['createdAt', fmtTime(d.memory.createdAt), null], ['updatedAt', fmtTime(d.memory.updatedAt), null],
      ['contentHash', d.memory.contentHash, null]].forEach(function (pair) {
       var tr = el('tr');
