@@ -1109,3 +1109,7 @@ DSH 的 request/header 只覆盖 call config + 工具 schema；系统提示词�
 ### 真机验证补记（2026-11-15 下午，8.5 完成）
 
 用户授权后真实云端双设备验证**通过**（完整记录：`docs/verify-preserve-mode-2026-11-15.md`）。要点：真实库 v7 迁移无损；backfill 48+27 与事故形状逐条吻合；云端 137/137 事件完整性校验、明文 0 命中；**对端 0.6.1 收 27 条迁出通知，active 33→6、archived 11→38、总数 46 不变**——事故残留收敛闭环。验证中修了三个问题（都已带回归测试）：① backfill 存量迁出补发（27 条事故残留的事件来源缺口）；② markDone 先于 publishChain 的重构回归（发布失败任务卡死 done）；③ 自链重放陈旧修订永远 waited（自游标卡死）。对端升级到 0.6.2 后的自有保管链找回留作发版后可选动作。**变更待归档 + npm 0.6.2 发版。**
+
+### 追加（2026-11-15 深夜）：refine-memory-view-active-default 全闭环
+
+webUI 记忆视图默认活动视图（用户在对端把 38 条已归档误读为同步失败后立的提案，用户预审直接推进）。实现要点：① **记忆视图原本没有状态下拉**（statusSelect: true 从未被传入 toolbar）——本次是接入而非改标签；② `/api/memories` status 语义三态：缺省/空值→活动集（candidate/active/conflicted）、`all`→全部、列表→精确，过滤始终服务端执行；③ 静态页 localFilter 同一映射零请求，`LIVE_VIEW_STATUSES` 单点常量；④ 对端 0.6.2 验证 AI 发现 `cairn export` 只出 active+tombstones——既有导出契约，提示词预期写错而非缺陷。归档后 strict 校验抓到合并需求正文超 500 字符 → 按 2026-11-13 先例拆出「记忆视图默认活动视图」独立需求（14 场景零增减）。门禁 **869/868/0/1 + test:ui 120/120（+5）+ specs 10/10**；npm 0.6.3 已发（E409 staged → npm view 落地确认 + tarball 核验）；git push 已同步（`6518ae8`）。对端升级 0.6.3 后 webUI 才有新默认视图。

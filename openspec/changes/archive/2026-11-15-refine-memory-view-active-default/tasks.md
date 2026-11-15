@@ -20,4 +20,4 @@
 - [x] 4.1 `npm test` 全绿（计数不低于 865 基线）+ typecheck 0 错
 - [x] 4.2 `npm run test:ui` 全绿
 - [x] 4.3 `openspec validate refine-memory-view-active-default --strict` 通过
-- [ ] 4.4 归档 + 提交 + 推送 + npm 0.6.3 发版
+- [x] 4.4 归档（2026-11-15-refine-memory-view-active-default）+ 提交 00529f9/85e2aa5/6518ae8 + 推送 + npm 0.6.3 发版（registry npm-view 确认 + tarball 内容核验）
