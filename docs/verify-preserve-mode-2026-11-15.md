@@ -50,3 +50,9 @@
 ## 6. 门禁（验证后复跑）
 
 `npm test` **865 / 864 / 0 / 1 skip**；typecheck 0 错；`npm run test:e2e` PASS；`npm run test:ui` **115/115**；`openspec validate add-cloud-preserve-mode --strict` 通过。
+
+## 7. 对端 0.6.2 升级后验证（2026-11-15 晚，用户转交对端 AI 报告）
+
+全部 PASS、0 数据偏差：0.6.2 安装确认；v7 自动迁移零数据变化（46 条总数不变，1/6/38/1）；pull 双源幂等（totalApplied 0 ×2）；归属设备三态正确（新写入 = dev_01a1bdfb，存量 = null，样本 id `01a1df7e-2273-7768-8b6c-51d7e6ab1987` 保留）；47 条全部 personal-global、无孤儿 scope 行；webUI 全库审计视图语义向用户解释确认（38 条已归档 = 迁出通知结果，不是同步失败）。
+
+附注：① `cairn export` 既有语义即「活动内容 + 遗忘时间线」，不含 archived/candidate——验证提示词里的预期写错，非工具缺陷，对端 AI 以只读 SELECT（readOnly: true，仅 SELECT）完成断言；② 对端验证期间 sync push / forget / rescope / 删除类操作全程未触碰。
