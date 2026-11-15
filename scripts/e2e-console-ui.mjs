@@ -422,6 +422,21 @@ async function main() {
     const legacy = await run([join(home, 'seed-legacy-origin.mjs')], env);
     if (legacy.code !== 0) throw new Error(`存量样本写入失败: ${legacy.stderr || legacy.stdout}`);
 
+    // 默认活动视图（refine-memory-view-active-default）：一条已归档记忆作为验收对象
+    writeFileSync(
+      join(home, 'seed-archived.mjs'),
+      [
+        `import { AppService } from ${JSON.stringify(appUrl)};`,
+        `const svc = AppService.open(process.env.CAIRN_HOME);`,
+        `const m = svc.addMemory({ content: '默认活动视图的已归档样本 ARCHIVEDVIEW。' }).memory;`,
+        `svc.store.memories.archive(m.id);`,
+        `svc.close();`,
+      ].join(String.fromCharCode(10)),
+      'utf8',
+    );
+    const archived = await run([join(home, 'seed-archived.mjs')], env);
+    if (archived.code !== 0) throw new Error(`已归档样本写入失败: ${archived.stderr || archived.stdout}`);
+
     await page.click('[data-view="memories"]');
     await page.waitForSelector(`input[data-pick="${memId}"]`, { timeout: 8000 });
 
@@ -455,6 +470,32 @@ async function main() {
       scopeBody.join(' | '),
     );
     check('作用域过滤选项标出同步策略与记忆数', scopeBody.some((o) => /仅本机/.test(o)) && scopeBody.every((o) => / · \d+$/.test(o)), scopeBody.join(' | '));
+
+    // 默认活动视图（refine-memory-view-active-default）：已归档样本不在默认列表，
+    // 状态下拉选「全部状态」（第二项）后出现，地址写回 status=all。
+    const liveCards = await page.$$eval('#view div.card', (els) => els.map((e) => e.textContent || ''));
+    check(
+      '默认活动视图隐藏已归档记忆',
+      liveCards.every((t) => !t.includes('ARCHIVEDVIEW')),
+      liveCards.some((t) => t.includes('ARCHIVEDVIEW')) ? '已归档样本出现在默认视图' : `${liveCards.length} 张卡均不含已归档样本`,
+    );
+    const statusSel = page.locator('#view select.action').nth(1); // 工具栏第 2 个下拉 = 状态
+    const statusOpts = await statusSel.locator('option').allInnerTexts();
+    check(
+      '状态下拉首两项为活动视图与全部状态',
+      statusOpts.length >= 7 && statusOpts[0] === '活动视图（默认）' && statusOpts[1] === '全部状态',
+      statusOpts.slice(0, 3).join(' | '),
+    );
+    await statusSel.selectOption('all');
+    await page.waitForTimeout(400);
+    const allCards = await page.$$eval('#view div.card', (els) => els.map((e) => e.textContent || ''));
+    check(
+      '选「全部状态」后已归档记忆出现且地址回写 status=all',
+      allCards.some((t) => t.includes('ARCHIVEDVIEW')) && /[?&]status=all/.test(page.url()),
+      `${allCards.length} 张卡，url=${page.url().split('?')[1] ?? ''}`,
+    );
+    await statusSel.selectOption('');
+    await page.waitForTimeout(400);
 
     // ---------------------------------------------------------- G.0 标签语言可切换（add-console-zh-labels）
     // 4.4 中↔原文互切、4.5 title 保留原值；并实测 5.4：切换不重查列表（design D5）。
@@ -708,10 +749,30 @@ async function main() {
       check('静态页本地限定徽章仍写明「仅本机」', staticChips.includes('device-local · 仅本机'), staticChips.filter((t) => /仅本机/.test(t)).join(' | ') || '未找到');
       check('静态页渲染徽章未发起网络请求', netRequests.length === 0, netRequests.slice(0, 2).join(' | '));
 
+      // 默认活动视图（refine-memory-view-active-default）：静态页同构——已归档默认隐藏、
+      // 「全部状态」显出，全程零请求。
+      const staticBefore = await sp.$$eval('#view div.card', (els) => els.map((e) => e.textContent || ''));
+      check(
+        '静态页默认活动视图隐藏已归档记忆',
+        staticBefore.every((t) => !t.includes('ARCHIVEDVIEW')),
+        staticBefore.some((t) => t.includes('ARCHIVEDVIEW')) ? '已归档样本出现在静态默认视图' : `${staticBefore.length} 张卡`,
+      );
+      const spStatusSel = sp.locator('#view select').nth(1);
+      await spStatusSel.selectOption('all');
+      await sp.waitForTimeout(300);
+      const staticAll = await sp.$$eval('#view div.card', (els) => els.map((e) => e.textContent || ''));
+      check(
+        '静态页选「全部状态」后已归档记忆出现（零请求）',
+        staticAll.some((t) => t.includes('ARCHIVEDVIEW')) && staticAll.length > staticBefore.length && netRequests.length === 0,
+        `卡片 ${staticBefore.length}→${staticAll.length}，请求 ${netRequests.length}`,
+      );
+      await spStatusSel.selectOption('');
+      await sp.waitForTimeout(300);
+
       // 来源设备（add-cloud-preserve-mode 0a）：静态页设备过滤零请求 + 徽章渲染
       const deviceChips = staticChips.filter((t) => /^来源( |未知)/.test(t));
       check('静态页记忆卡片渲染归属设备徽章（未知如实显示）', deviceChips.length > 1 && deviceChips.includes('来源未知'), deviceChips.slice(0, 3).join(' | ') || '未找到');
-      const devSel = sp.locator('#view select').nth(1); // 工具栏第 2 个下拉 = 来源设备
+      const devSel = sp.locator('#view select').nth(2); // 工具栏第 3 个下拉 = 来源设备（状态接 入后顺延）
       const devOptionLabels = await devSel.locator('option').allTextContents();
       check('静态页来源设备选项含「未知」并带记忆数', devOptionLabels.some((t) => /未知 · \d+/.test(t)), devOptionLabels.slice(0, 4).join(' | '));
       const devValue = await devSel.locator('option').evaluateAll((os) => {

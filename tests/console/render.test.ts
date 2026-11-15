@@ -411,3 +411,20 @@ test('label() 未知值原样返回：新枚举最坏是回到原文，不是空
   assert.equal(labelRaw('fact', { fact: '事实' }), 'fact', '原文模式必须逐字节等于库里的取值');
 });
 
+
+// ---------------------------------------------------------------------------
+// 默认活动视图（refine-memory-view-active-default）
+// ---------------------------------------------------------------------------
+
+test('UI_JS：状态下拉首两项为活动视图与全部状态，个体状态其后', () => {
+  assert.ok(UI_JS.includes("el('option', { value: '' }, '活动视图（默认）')"), '缺省选项必须是活动视图');
+  assert.ok(UI_JS.includes("el('option', { value: 'all' }, '全部状态')"), '全部状态必须显式可选（status=all）');
+  assert.match(UI_JS, /state\.status === 'all'\) ss\.selectedIndex = 1/, 'all 值必须真实选中第二项');
+});
+
+test('UI_JS：静态页 localFilter 与服务端同一状态语义（活动集/全部/精确）', () => {
+  assert.match(UI_JS, /var LIVE_STATUSES = \['candidate', 'active', 'conflicted'\];/, '活动集单点定义');
+  assert.match(UI_JS, /st === 'all'\) \{ \/\* 全部状态：不过滤 \*\/ \}/, 'all 不得过滤');
+  assert.match(UI_JS, /LIVE_STATUSES\.indexOf\(x\.status\) >= 0/, '缺省按活动集过滤');
+  assert.doesNotMatch(UI_JS, /opts\.status \) out = out\.filter\(function \(x\) \{ return x\.status === opts\.status/, '旧的"有值即精确、无值即全部"语义必须移除');
+});

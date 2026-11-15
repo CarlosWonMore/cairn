@@ -226,6 +226,9 @@ export const UI_JS = String.raw`
     return state.model;
   }
 
+  /** 活动视图状态集（refine-memory-view-active-default D1）：与 services 端 LIVE_VIEW_STATUSES 同一语义。 */
+  var LIVE_STATUSES = ['candidate', 'active', 'conflicted'];
+
   function localFilter(list, opts) {
     var out = list.slice();
     if (state.q) {
@@ -236,7 +239,11 @@ export const UI_JS = String.raw`
       });
     }
     if (opts && opts.scope) out = out.filter(function (x) { return x.scopeId === opts.scope; });
-    if (opts && opts.status) out = out.filter(function (x) { return x.status === opts.status; });
+    // 状态映射与工作台 /api/memories 同一语义：'' = 活动视图（默认）；'all' = 全部；显式值 = 精确。
+    var st = opts && opts.status;
+    if (st === 'all') { /* 全部状态：不过滤 */ }
+    else if (st) out = out.filter(function (x) { return x.status === st; });
+    else out = out.filter(function (x) { return LIVE_STATUSES.indexOf(x.status) >= 0; });
     if (opts && opts.kind) out = out.filter(function (x) { return x.kind === opts.kind; });
     if (opts && opts.device) {
       out = out.filter(function (x) {
@@ -381,15 +388,20 @@ export const UI_JS = String.raw`
       bar.appendChild(sel);
     }
     if (opts && opts.statusSelect) {
+      // 默认活动视图（refine-memory-view-active-default）：首两项为活动视图与全部状态，
+      // 其后是个体状态。'' = 活动视图（缺省，不写地址参数）；'all' = 全部状态（status=all）。
       var ss = el('select', { 'class': 'action' });
       ss.style.cssText = sel ? sel.style.cssText : '';
-      ss.appendChild(el('option', { value: '' }, '全部状态'));
+      ss.appendChild(el('option', { value: '' }, '活动视图（默认）'));
+      ss.appendChild(el('option', { value: 'all' }, '全部状态'));
       (opts.statuses || []).forEach(function (v) {
         var t = label(v, STATUS_LABEL);
         var o = el('option', { value: v, title: t === v ? null : v }, t);
         if (v === state.status) o.setAttribute('selected', 'selected');
         ss.appendChild(o);
       });
+      if (state.status === '' || state.status == null) ss.selectedIndex = 0;
+      if (state.status === 'all') ss.selectedIndex = 1;
       ss.addEventListener('change', function () { state.status = ss.value; writeUrl(false); render(); });
       bar.appendChild(ss);
     }
@@ -557,7 +569,7 @@ export const UI_JS = String.raw`
   function renderMemories(host, reuse) {
     if (STATIC) {
       var model = staticModel();
-      toolbar(host, { scopes: model.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: model.deviceOptions || [], deviceSelect: true });
+      toolbar(host, { scopes: model.scopes, scopeSelect: true, statusSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: model.deviceOptions || [], deviceSelect: true });
       var list = localFilter(model.memories, { scope: state.scope, status: state.status, kind: state.kind, device: state.device });
       paintMemories(host, list, list.length, model.scopes);
       // 地址带 mem = 刷新/分享回来的详情，直接重新打开（静态页不发请求）。
@@ -578,7 +590,7 @@ export const UI_JS = String.raw`
 
   /** 列表骨架：工具栏 + 卡片。数据已在手时只重绘，不再请求。 */
   function paintMemoriesView(host, data) {
-    toolbar(host, { scopes: data.scopes, scopeSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: data.deviceOptions || [], deviceSelect: true });
+    toolbar(host, { scopes: data.scopes, scopeSelect: true, statusSelect: true, statuses: ['active', 'candidate', 'conflicted', 'archived', 'tombstoned'], devices: data.deviceOptions || [], deviceSelect: true });
     paintMemories(host, data.memories, data.total, data.scopes);
   }
 

@@ -294,6 +294,14 @@ const SKIPPED_SQL = promotedPredicate('%ALIAS%').skippedExists;
 const HANDLED_SQL = promotedPredicate('%ALIAS%').handledExists;
 const NOT_HANDLED_SQL = promotedPredicate('%ALIAS%').handledNotExists;
 
+/**
+ * 记忆视图的默认「活动视图」状态集（refine-memory-view-active-default D1）：
+ * 候选待审查、生效在使用中、冲突待解决——三者都需要关注；
+ * archived / tombstoned / superseded 是审计状态，退出默认视图但仍可显式选出。
+ * 服务端路由与静态页 localFilter 共用这一常量（同一判断不写两份）。
+ */
+export const LIVE_VIEW_STATUSES = ['candidate', 'active', 'conflicted'] as const;
+
 export function buildModel(store: CairnStore, opts: ModelOptions = {}): ConsoleModel {
   const mode: ViewMode = opts.mode ?? 'brief';
   const redact = opts.redact ?? true;

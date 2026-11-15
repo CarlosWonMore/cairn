@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { AppService } from '../app-service.js';
 import { defaultHome, openStore, CairnStore, resolvePaths } from '../../store/open.js';
 import { CairnError, err, exitCodeFor, isCairnError } from '../../core/errors.js';
-import { buildModel, buildImportRows, listArchiveItems, memoryDetail, ViewMode } from './model.js';
+import { buildModel, buildImportRows, listArchiveItems, memoryDetail, ViewMode, LIVE_VIEW_STATUSES } from './model.js';
 import { baseHeaders, guardRequest, newToken } from './security.js';
 import { renderShell } from './assets/page.js';
 import { computeInbox, computeSuggestions } from './suggestions.js';
@@ -157,12 +157,22 @@ export async function startConsoleServer(opts: ConsoleServerOptions = {}): Promi
         return buildModel(store, { mode: 'brief', redact }).scopes;
       }
       if (path === '/api/memories') {
+        // status 语义（refine-memory-view-active-default D2/D3）：缺省/空值 → 活动视图
+        // （candidate/active/conflicted）；`all` → 全部状态；逗号列表 → 精确匹配。
+        // 过滤始终由本查询执行（spec：MUST NOT 用前端过滤伪造结果集）。
+        const rawStatus = q.get('status');
+        const statusList = listParam(rawStatus);
+        const statuses = rawStatus == null || rawStatus.trim() === ''
+          ? [...LIVE_VIEW_STATUSES]
+          : statusList.includes('all')
+            ? []
+            : statusList;
         const model = buildModel(store, {
           mode,
           redact,
           q: q.get('q') ?? undefined,
           scopeIds: listParam(q.get('scope')),
-          statuses: listParam(q.get('status')),
+          statuses,
           kinds: listParam(q.get('kind')),
           devices: listParam(q.get('device')),
         });

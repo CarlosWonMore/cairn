@@ -676,3 +676,47 @@ test('POST /api/onboarding/revoke：缺 policyId → 400', async () => {
     ctx.cleanup();
   }
 });
+
+test('记忆视图默认活动视图：/api/memories status 三态语义（refine-memory-view-active-default）', async () => {
+  // 独立 setup：active / candidate / archived / tombstoned 各一条（同一个人的库，状态是唯一变量）
+  const home = makeTestHome('cairn-server-live-');
+  const writable = openStore({ home });
+  const scope = writable.scopes.resolvePreset('personal-global', {});
+  writable.memories.add({ kind: 'fact', content: '活动视图样本-生效', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local');
+  const cand = writable.memories.add({ kind: 'fact', content: '活动视图样本-候选', scopeId: scope.id, authority: 'agent_inferred', createdBy: 'cli' }, 'dev_local');
+  const arch = writable.memories.add({ kind: 'fact', content: '活动视图样本-已归档', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local');
+  writable.memories.archive(arch.id);
+  const dead = writable.memories.add({ kind: 'fact', content: '活动视图样本-已遗忘', scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' }, 'dev_local');
+  writable.memories.forget(dead.id, '验证清理', 'cli');
+  assert.equal(cand.status, 'candidate');
+  writable.close();
+  const readOnly = openStore({ home, readOnly: true });
+  const srv = await startConsoleServer({ home, port: 0, token: TOKEN });
+  try {
+    const statuses = async (p: string) => ((await (await api(srv, p)).json()) as {
+      data: { memories: Array<{ status: string }> };
+    }).data.memories.map((m) => m.status).sort();
+
+    // 缺省 → 活动集（candidate + active，无 archived/tombstoned）
+    assert.deepEqual(await statuses('/api/memories'), ['active', 'candidate']);
+    // 空值 → 活动集
+    assert.deepEqual(await statuses('/api/memories?status='), ['active', 'candidate']);
+    // all → 全部状态
+    assert.deepEqual(await statuses('/api/memories?status=all'), ['active', 'archived', 'candidate', 'tombstoned']);
+    // 显式个体 → 精确
+    assert.deepEqual(await statuses('/api/memories?status=archived'), ['archived']);
+    // 逗号列表 → 精确组合
+    assert.deepEqual(await statuses('/api/memories?status=active,tombstoned'), ['active', 'tombstoned']);
+
+    // 概览计数保持全库口径（不随活动视图收窄）
+    const st = (await (await api(srv, '/api/status')).json()) as { data: { counts: { memoriesByStatus: Record<string, number> } } };
+    assert.equal(st.data.counts.memoriesByStatus['archived'], 1);
+    assert.equal(st.data.counts.memoriesByStatus['tombstoned'], 1);
+    assert.equal(st.data.counts.memoriesByStatus['active'], 1);
+    assert.equal(st.data.counts.memoriesByStatus['candidate'], 1);
+  } finally {
+    await srv.close();
+    readOnly.close();
+    cleanupTestHome(home);
+  }
+});

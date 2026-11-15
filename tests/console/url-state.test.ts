@@ -127,3 +127,10 @@ test('空值参数不写入（避免出现 scope= 这种空过滤）', () => {
   assert.equal(got.status, undefined);
   assert.equal(got.mode, 'full');
 });
+
+test('status=all 与显式状态值原样往返（refine-memory-view-active-default）', () => {
+  assert.equal(codec.decodeState('?' + codec.encodeState({ view: 'memories', status: 'all', mode: 'brief' }), null).status, 'all');
+  assert.equal(codec.decodeState('?' + codec.encodeState({ view: 'memories', status: 'archived', mode: 'brief' }), null).status, 'archived');
+  // 缺省（无参数）= 活动视图：decode 后 status 为 undefined → UI 落到 ''（活动）
+  assert.equal(codec.decodeState('?view=memories&mode=brief', null).status, undefined);
+});
