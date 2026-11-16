@@ -16,6 +16,7 @@ import {
 import { err, isCairnError, CairnError, ExitCode } from '../core/errors.js';
 import { readAuditConfig, AuditConfig, AuditDetail } from '../store/audit.js';
 import { contentHash } from '../core/hash.js';
+import { isUuid } from '../core/ids.js';
 import { scopeAllowsUpstream, scopeAllowsRead } from '../core/scope.js';
 import { searchMemories, SearchInput, SearchOutput } from '../retrieval/search.js';
 import { exportData, ExportInput, ExportOutput } from '../retrieval/export.js';
@@ -237,6 +238,11 @@ export class AppService {
         return store.scopes.resolvePreset('personal-global', { overrides });
       case 'project-global': {
         if (!sel?.projectId) throw err('E_VALIDATION', 'project-global 需要 --project');
+        // 项目身份只能是登记过的 UUID：路径原样当 id 会造出永不命中、永不同步的孤儿作用域。
+        // 收口在这一处，CLI/MCP/晋升/迁移等所有写入口共用。
+        if (!isUuid(sel.projectId)) {
+          throw err('E_VALIDATION', '项目身份必须是 UUID；路径请先经 project_resolve 登记', { project: sel.projectId });
+        }
         return store.scopes.resolvePreset('project-global', {
           projectId: sel.projectId,
           projectName: sel.projectName ?? sel.projectId,
@@ -245,6 +251,9 @@ export class AppService {
       }
       case 'project-device': {
         if (!sel?.projectId) throw err('E_VALIDATION', 'project-device 需要 --project');
+        if (!isUuid(sel.projectId)) {
+          throw err('E_VALIDATION', '项目身份必须是 UUID；路径请先经 project_resolve 登记', { project: sel.projectId });
+        }
         return store.scopes.resolvePreset('project-device', {
           projectId: sel.projectId,
           projectName: sel.projectName ?? sel.projectId,

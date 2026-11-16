@@ -15,6 +15,7 @@ import { ANNOTATION_STATUSES, DISPOSITIONS, RESOLVE_STATUSES } from '../console/
 import { parseJudgement } from '../../onboarding/judgement.js';
 import { runAutoOnboarding } from '../../onboarding/auto.js';
 import { findProjectByAlias, listProjects, resolveProject } from '../../store/projects.js';
+import { isUuid } from '../../core/ids.js';
 
 /**
  * Cairn MCP stdio 服务器（任务 5.2）：
@@ -387,17 +388,15 @@ export function createServer(home?: string): Server {
   return server;
 }
 
-const PROJECT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /**
  * 项目身份参数解析（add-project-scope-recall D1）：UUID 直接使用（不存在时沿用既有
  * 静默空结果语义）；路径/URL 归一化后**只查不建**，未登记报错并指引 project_resolve。
- * 检索保持读语义纯度：登记只发生在 project_resolve（显式动作）。
+ * 检索与写入共用本函数：登记只发生在 project_resolve（显式动作）。
  */
 function resolveProjectArg(service: AppService, raw: unknown): string | null {
   if (raw == null || raw === '') return null;
   const value = String(raw);
-  if (PROJECT_UUID_RE.test(value)) return value;
+  if (isUuid(value)) return value;
   const found = findProjectByAlias(service.store.db, value);
   if (!found) {
     throw err('E_NOT_FOUND', `项目别名未登记，请先经 project_resolve 登记: ${value}`, { project: value, hint: 'project_resolve' });
@@ -463,7 +462,7 @@ async function handleTool(service: AppService, name: string, args: Record<string
           sensitivity: args['sensitive'] === true ? 'sensitive' : 'normal',
           scope: {
             preset: args['scope_preset'] as never,
-            projectId: args['project_id'] as string | undefined,
+            projectId: resolveProjectArg(service, args['project_id']) ?? undefined,
           },
         },
         { judgement },
@@ -499,7 +498,7 @@ async function handleTool(service: AppService, name: string, args: Record<string
     case 'memory_promote': {
       const r = service.promoteCandidate(String(args['id'] ?? ''), {
         scopePreset: args['scope_preset'] as never,
-        projectId: args['project_id'] as string | undefined,
+        projectId: resolveProjectArg(service, args['project_id']) ?? undefined,
       });
       return {
         id: r.memory.id,

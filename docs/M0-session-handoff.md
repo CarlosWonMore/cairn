@@ -1219,4 +1219,19 @@ webUI 记忆视图默认活动视图（用户在对端把 38 条已归档误读�
 
 **留下的一个开放项（未修，已确认低风险）**：对端 `sync backfill` 的 `scopeExits.candidates` 仍显示 **24**。`enqueued=0`，不是写动作，也不影响 `upstreamGap`。成因推测：那 24 条曾是个人链内容、对端自己也推过修订（因而写下了 `sync_pushed:personal-global`），迁入项目后无 `sync_scope_exit` 任务 ⇒ 命中 `findScopeExitGap` 的旧口径。语义上**重复通知**（迁出通知已由本机发出），故无害；但数字会长期误导运维。**风险提示：不要在对端跑 `backfill --apply` 去"清掉"它**——那会真的补发 24 条迁出通知。是否给该函数加一条"已由来源端通知过"的判据，留待后续变更决定（需先确认对端那 24 条是否真有 `sync_pushed:personal-global`，本机无法代查）。
 
-**变更可归档**（tasks 33/33 实质完成；仅上述开放项不在本变更范围内）。
+**变更已归档**（`openspec archive add-cross-device-project-sync`：+6 需求 / ~4 修改；归档后 `validate --specs --strict` 首轮 9/10，因「冷启动对账」正文 770 字符超 500 上限——按 2026-11-13 先例拆出「上行缺口的判定口径」独立需求，语义零增减，复跑 10/10）。
+
+### 追加（2026-11-16 收尾）：归档 + 提交 + 一个自家人踩出来的 bug
+
+**提交** `c40b8f8`（38 文件 / +3020 −142），工作树干净。
+
+**收尾时踩到并修掉的第九批 bug（`memory_add` 项目别名不解析）**：
+归档后我写那条教训记忆时，用 `memory_add` 传了 `project_id: "D:/Project/AI MemoryGLM"`（路径别名）。它**原样透传**成了 `projectId`，于是创建了 `project_id` 为路径字符串的**孤儿 scope + space**——该记忆既不会被项目作用域检索命中，也**不会被项目链同步**（链键是 `project/<uuid>`）。同一工具面的 `memory_search` 却会经 `resolveProjectArg()` 正确解析 ⇒ **同一语义两个入口口径不同**。
+
+处置：先 `cairn rescope <id> --scope-project <uuid> --force` 把那条记忆挪到正确作用域（已核实 `project_id` = `01a1daf8-a232…`、全库孤儿 scope 为 0），再派第九批修根因（123 turns）：写入与检索共用 `resolveProjectArg`（只查不建）；`resolveScope` 的 project 分支加 `isUuid` 结构防线（MCP 只是入口之一，CLI `--project` / `rescope` / `promoteCandidate` 全部经此收口）。变异两条（去掉写入解析、去掉 UUID 防线）均先红后绿。
+
+**另一处值得记的工具陷阱**：`ops_edit_file` **保留文件 mtime**，当替换内容与原内容**等长**时（如 `0.6.3`→`0.6.6`，同为 5 字符），git 的 stat 缓存会因「大小相同 + mtime 相同」**判定文件未改**——`git status` 和 `git diff` 双双为空，提交就会静默漏掉该文件。本轮 `package.json` 的版本号正是这样被漏的，靠「HEAD blob 哈希 ≠ 工作区哈希 但 `git diff` 为空」的矛盾才查出来，`touch` 后立刻正常。**凡用该工具做等长替换后要提交，先 `touch` 该文件再 `git status` 核对。**
+
+**门禁（全部主会话独立复跑）**：`npm test` **906 / 905 pass / 0 fail / 1 skip**；`test:ui` 120/120；typecheck 0 错；`validate --specs --strict` **10/10**；无活动变更。
+
+**剩余开放项**：① 对端 `scopeExits.candidates=24`（无害但误导，切勿 `backfill --apply` 清它——会真补发 24 条迁出通知）；② `AddMemoryInput.scope.projectName` 经别名解析后仍回落为 UUID 作为空间显示名（仅显示层，第九批未修，已记录）。

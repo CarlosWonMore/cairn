@@ -2,6 +2,10 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+### Fixed
+- **项目身份在写入路径不解析别名**：`memory_add` / `memory_promote` 的 `project_id` 此前把入参**原样透传**，传路径别名（如 `D:/Project/xxx`）会创建 `project_id` 为路径字符串的**孤儿 scope/space**——该记忆既不会被项目作用域检索命中，也不会被项目链同步（链键是 `project/<uuid>`）。而同一个工具面的 `memory_search` 会经 `resolveProjectArg()` 正确解析。现在写入与检索共用同一入口（只查不建，未登记报 `E_NOT_FOUND` 并指引 `project_resolve`）。
+- **作用域解析收口做 UUID 形态校验**：`resolveScope` 的 `project-global` / `project-device` 分支，`projectId` 非 UUID 一律 `E_VALIDATION`（提示先经 `project_resolve` 登记）。MCP 只是入口之一，CLI `--project`、`rescope`、`promoteCandidate` 全部经此收口——避免在每个入口各堵一次。
+
 ## [0.6.6] - 2026-11-16
 
 三轮对端真机验证闭环（0.6.4 → 0.6.5 → 0.6.6）。每个缺陷都是真实两设备环境才暴露的，本地 fixture 无法发现。
