@@ -1,70 +1,101 @@
-# 对端重验提示词（0.6.6）
+# 对端增量验证提示词（v3：一条新记忆 + 0.6.7 升级）
 
-> 复制整段给对端 agent。**你这次的诊断完全正确**——`27 → 24` 的拆解、revive 副本「两头证据都缺」的根因、以及「修法二选一」的建议，全部准确。我按你的第二条建议（回填 origin）实现，并额外补了存量迁移，因为光改代码救不了已经存在的 24 条。
+> 复制整段给对端 agent。**这次任务很小**——只有 1 条新记忆要拉，外加升级到 0.6.7 确认一个修复。
 
 ---
 
-## 你这轮指出的问题，我的处理
+## 先说清楚：同步链路本身已经验收完毕
 
-你说得对：0.6.5 只堵了两个盲区（发布方有 `sync_pushed`、外源有 origin），**唯独「pull 原地 revive 的副本」两头都缺**。
+你的三轮报告（0.6.4 收敛 / 0.6.5 定位缺口 / 0.6.6 缺口归零）已经把**项目链跨设备同步**验证闭环，变更已归档并发布。**你不需要再做全量重验。**
 
-- **修「将来」**：三条 revive 路径（`scope_reheld` / `project_reheld` / `preserve_reheld`）现在都会在恢复活动时回填 `origin_device_id = 事件发布方`，**仅当原值为 NULL**（已有值不覆盖）。三处共用同一个 helper，没有复制三份。
-- **修「已存在的 24 条」**：**schema v8 迁移**。你库里已经有的那 24 条不会重放事件，所以用你库里本来就有的证据回填——`audit_event` 表中 `project_reheld` 等动作的 `detail.$.from` 记录了事件发布方。迁移只补 NULL、绝不覆盖。
-  → 你升级后**第一次运行任何 cairn 命令**就会自动应用 v8（`user_version` → 8）。
+本次有两件独立的小事：
 
-我没有给缺口判据再加条件去"绕开"这 24 条——那是掩盖数据缺失。
+1. **拉一条新记忆**：主设备今天 16:39 左右发布了一条项目记忆（教训类，关于多设备同步的三个盲区），cairn 项目链 headSeq **4 → 5**。你现在的游标停在 4，所以有 1 条待拉。
+2. **升级到 0.6.7**：修了一个**项目作用域写入**的 bug（与同步链路无关，`src/sync/` 一行未动）。如果你会用 MCP 的 `memory_add` 往项目作用域写记忆，这个很关键；如果不用，升级只是保持版本一致。
 
-## 本次任务（0.6.6）
+---
 
-### 铁律
+## 铁律
+
 只允许 `sync pull` 这一写本地动作；不 push、不 `backfill --apply`、不 forget、不 rescope、不手工改库。
-**升级前先 `cairn backup` 并记下路径**——本次会跑 schema 迁移（v7→v8），虽只更新一列，仍要留退路。
+升级前先 `cairn backup`。
 
-### 第 0 步：升级 + 迁移确认
-```bash
-cairn backup                    # 先备份！记下 path 与 sha256
-npm i -g @carloswon/cairn-memory@0.6.6
-cairn --version                 # 期望 0.6.6
-cairn doctor                    # 会触发 v8 迁移
-```
-报告：`--version` 值、`doctor` 的 `schemaVersion`（**期望 8**）、迁移前后记忆总数是否一致。
+---
 
-### 第 1 步：核心验证——`upstreamGap` 是否归零（pull 之前！）
-```bash
-cairn doctor | grep -i upstreamGap
-cairn sync backfill             # 默认只读，不要 --apply
-```
-**期望：`upstreamGap = 0`，backfill 候选 personal / project / preserve 三段全 0。**
-
-这是本轮的核心判据。如果仍是 24，说明迁移没应用或那 24 条的审计里没有 `from`——把下面这段的输出贴回来：
+### 第 0 步：升级到 0.6.7
 
 ```bash
-# 只读：查看 origin 分布 + 有多少条能从 reheld 审计恢复
-node -e "const s=require('node:sqlite');const db=new s.DatabaseSync(process.env.USERPROFILE+'/.cairn/data/cairn.db',{readOnly:true});console.log('origin:',JSON.stringify(db.prepare('select coalesce(origin_device_id,\'NULL\') o,count(*) n from memory group by 1').all()));console.log('reheld audit:',JSON.stringify(db.prepare(\"select action,count(*) n from audit_event where action in ('scope_reheld','project_reheld','preserve_reheld') group by 1\").all()))"
+cairn backup                          # 记下 path 与 sha256
+npm i -g @carloswon/cairn-memory@0.6.7
+cairn --version                       # 期望 0.6.7
+cairn doctor                          # schemaVersion 应仍为 8（本版无迁移）
 ```
 
-### 第 2 步：pull 幂等
+### 第 1 步：pull 拉那条新记忆
+
 ```bash
 cairn sync pull
-cairn status
 ```
-期望 `totalApplied=0`、各链游标仍在 head、状态数字一条不变（总数 50 / project 27 / personal 7 / archived 14 / 3 条项目链）。
-本轮应该仍然看不到 `revived` 字段（没有事件落地，`outcome=null` 是正常的早退分支）——**不要据此判失败**。
 
-### 第 3 步：报告
+**期望**：
+- cairn 项目链（`project/…a232`）出现 `headSeq=5`、`applied=1`（这次不再是早退分支，`outcome` 会真实出现）
+- 其余链仍 `appliedBefore=0`、`outcome=null`（已到头）
+- `totalApplied=1`
+
+**这是本轮唯一的关键数字**：`applied=1`。
+
+### 第 2 步：确认新记忆落地
+
+```bash
+cairn search "双设备同步的三个盲区"
 ```
-升级：cairn --version = <值>；schemaVersion = <值>；总数迁移前后 <a> -> <b>
-核心：upstreamGap = <n>（期望 0）；backfill 候选 personal=<n> project=<n> preserve=<n>（期望全 0）
-pull：totalApplied=<n>；状态对比 总数=<n> project=<n> personal=<n> archived=<n> 链=<n>
+或按内容检索"发射端/接收端不对称"。期望：命中一条 `project-global · cairn`、status `active` 的记忆，正文开头含「**双设备同步的三个盲区**」。
+
+### 第 3 步：确认状态没有被意外改动
+
+```bash
+cairn status
+cairn doctor
+```
+期望（相对你上一轮）：总数 **50 → 51**（+1 新记忆）、project-global active **27 → 28**、archived 仍 14、personal-global 仍 7、`upstreamGap` 仍 0。
+
+其余计数一项都不该变。
+
+### 第 4 步（可选，只有你会用 MCP 写项目记忆时才做）
+
+验证 0.6.7 的修复。**如果你平时不通过 MCP 往项目作用域写记忆，这步可以跳过并告诉我"不适用"。**
+
+用 MCP 工具 `memory_add`，传**已登记的项目别名**（不是 UUID）：
+```
+content: "0.6.7 别名解析验证（对端临时，可忽略）"
+kind: "fact"
+scope_preset: "project-global"
+project_id: "<你本机已登记的某个项目路径别名，例如 D:/... >"
+```
+
+**期望**：写入成功，且该记忆的 `scope.project_id` 是 **UUID**（不是路径字符串）。
+验证后**不要删除**（避免额外的写动作），在报告里注明它的 id 即可，我会在本机侧核对项目链是否收到它。
+
+> 如果你更愿意只读核对，也可以跳过这步——不重要。
+
+### 第 5 步：报告
+
+```
+升级：cairn --version = <值>；schemaVersion = <值>
+pull：totalApplied = <n>（期望 1）
+  project/…a232(cairn) headSeq=<n> applied=<n> skipped=<n> revived=<n>
+  其余链 <spaceKey> appliedBefore=<n> outcome=<null 或结构>
+落地核查：search 命中 <有/无>；作用域=<preset·项目名>；status=<值>；正文开头=<20 字>
+状态对比：总数 <a>-><b>；project active=<n>；personal active=<n>；archived=<n>；upstreamGap=<n>
+第 4 步：<已验证 / 不适用 / 跳过>
 异常与未验证项：<如实写>
 ```
 
 ### 判定
-- **核心**：`upstreamGap` 从 24 变 **0** ⇒ 修复成功。
-- 若变成 0 且 pull 后数字不变 ⇒ 全部通过。
-- 若仍 >0，贴第 1 步那条只读命令的输出，我按数据判断。
 
-不符就贴原始输出，**不要自己修**（尤其是不要 `backfill --apply` 去"清掉"缺口——那会真的把副本再推一遍）。
+- `pull` 的 `applied=1` 且 search 能命中 ⇒ 增量同步正常，本轮通过。
+- 若 `applied=0` 且 cairn 链仍 `headSeq=4` ⇒ 说明上游没发布成功，告诉我，我回头查。
+- 若总数不是 51 ⇒ 贴 `cairn status` 原始输出。
 
 ### 回滚
-本次有 schema 迁移。若出错：用第 0 步的备份文件覆盖 `~/.cairn/data/cairn.db`（先关掉其他 cairn 进程），v8 只更新一列 `memory.origin_device_id`，数据本身无风险。
+本次只拉 1 条新记忆，不删任何数据。需要回退用第 0 步的备份。
