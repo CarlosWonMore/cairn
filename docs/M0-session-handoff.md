@@ -1235,3 +1235,17 @@ webUI 记忆视图默认活动视图（用户在对端把 38 条已归档误读�
 **门禁（全部主会话独立复跑）**：`npm test` **906 / 905 pass / 0 fail / 1 skip**；`test:ui` 120/120；typecheck 0 错；`validate --specs --strict` **10/10**；无活动变更。
 
 **剩余开放项**：① 对端 `scopeExits.candidates=24`（无害但误导，切勿 `backfill --apply` 清它——会真补发 24 条迁出通知）；② `AddMemoryInput.scope.projectName` 经别名解析后仍回落为 UUID 作为空间显示名（仅显示层，第九批未修，已记录）。
+
+### 追加（2026-11-16 傍晚）：对端增量验证通过 + 第十批（CLI --project 文档缺陷）
+
+对端 0.6.7 增量验证 **通过**：`sync pull` `totalApplied=1`、cairn 项目链 headSeq 4→5 `applied=1`、**`revived` 字段首次在真实 outcome 中出现（值 0）**——补完了 0.6.5 轮遗留的验证点。落地核查：新记忆 `project-global·cairn` active、`origin_device_id` = 发布方；状态 50→51 且只有 project active 27→28，其余一项未变。
+
+**它提的检索问题，结论要修正**：
+- 「默认不召回 project-global」→ **规格要求**（`scoped-retrieval`「全通道作用域隔离」明写「未携带项目身份时，项目作用域记忆 MUST 保持不可见」；实现是 `scopeAllowsRead` 的 `projectId` 严格相等）。不是缺陷，未改。
+- 「建议 CLI search 加 `--project`」→ **它一直存在**，`case 'search'` 就读 `str(flags,'project')`。真因是 `--help` 只写了 `[--status] [--scope-id] [--include-expired]`——**能力被文档隐藏**，对端据此误判为新需求。
+
+**第十批（0.6.8）**修两处：① `--help` 给 `search` / `export` 补 `[--project <id|alias>]`；② CLI 的 `--project` 此前**不接受别名**（传路径静默 0 命中，MCP 却能解析）——抽成共用 `resolveProjectAlias()`（`store/projects.ts`），未登记别名明确 `E_NOT_FOUND` 并指引 `cairn project resolve`。变异两条（去掉别名解析、改静默空）均先红后绿。
+
+> 实施者报告的一条操作陷阱值得记：**CLI 测试跑的是构建产物**（经 `tests/spawn-target.ts`）。改 `src/` 后不 `npm run build`，变异不会生效——它第一次变异全绿就是这个原因（stale dist），重建后才如实变红。**凡 CLI 层变异对照，改完源码必须先 build。**
+
+**门禁**：`npm test` **908 / 907 pass / 0 fail / 1 skip**；`test:ui` 120/120；typecheck 0 错；specs 10/10。0.6.8 已发布。
