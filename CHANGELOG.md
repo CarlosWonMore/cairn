@@ -2,6 +2,15 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.6.10] - 2026-11-17
+
+### Fixed
+- **项目身份形态不变式（存储层双闸 + doctor 检出）**：`project` 表此前可被直写以路径字符串作主键的孤儿行（2026-11-16 真实库事故：旧构建会话写入路径键孤儿，`sync pull` 枚举到 `project/<路径>` 畸形链键被 syncd 整体 400 拒绝，doctor 对根因失明）。0.6.7 / 0.6.9 已在 MCP / CLI 入口层收口，本版把不变式下沉到存储层：
+  - `validateScopeSpec`：project 作用域的 `projectId` 必须是 UUID 形态，否则 `E_SCOPE_INVALID` 并提示先 `cairn project resolve` 取得稳定 id；
+  - `ensureProject`：第二道闸，绕过预设解析的直写路径同样拒绝。实施期实锤两条真实绕过路径——`sync/apply`（远端事件描述符的 projectId 直通）与 `onboarding/auto`（治理计划选择直通），store 层闸是这两条的唯一防线；
+  - `doctor`：新增只读检出 `project` / `space` / `scope` 三表畸形身份行，进 `problems`（与外键违规同列），只报不修。
+  - 测试夹具契约同步收紧（4 个测试文件的伪项目 id 改 `uuidv7`）；形态校验复用既有 `isUuid`（单一出处），不限定 UUID 版本。
+
 ## [0.6.9] - 2026-11-16
 
 ### Fixed
