@@ -1249,3 +1249,15 @@ webUI 记忆视图默认活动视图（用户在对端把 38 条已归档误读�
 > 实施者报告的一条操作陷阱值得记：**CLI 测试跑的是构建产物**（经 `tests/spawn-target.ts`）。改 `src/` 后不 `npm run build`，变异不会生效——它第一次变异全绿就是这个原因（stale dist），重建后才如实变红。**凡 CLI 层变异对照，改完源码必须先 build。**
 
 **门禁**：`npm test` **908 / 907 pass / 0 fail / 1 skip**；`test:ui` 120/120；typecheck 0 错；specs 10/10。0.6.8 已发布。
+
+## 2026-11-17 追加：sync pull 400 事故修复 + `fix-project-id-uuid-invariant` 实施
+
+**事故（2026-11-16 晚）**：`sync pull` 返回 `E_IO syncd_remote_error(400)`，doctor 却 `ok:true / problems:[]`——诊断体系对根因失明。根因：`project` 表孤儿行**主键=原始路径** `D:/Project/AI MemoryGLM`（当天 16:29 由旧构建 MCP 会话写穿，正是 0.6.7 修掉的缺陷，但该会话 dist 未重建），连带 `space`/`scope` 各一行；`pull` 枚举链时拿含 `:`/空格的 spaceKey 请求 syncd 被整体拒绝，push 无感知（localSeq 0、无任务）。手修：`cairn backup`（`cairn-backup-1794843460191.db`）→ node:sqlite 事务内按 scope→space→project 删三行（删前证 0 记忆引用/0 outbox 任务）→ pull 恢复 `totalApplied 0`。同晚完成 git/npm/DSH 三链核查（git 曾领先 8 提交，直连 push 被 reset，走 127.0.0.1:7890 一次性代理推成）。
+
+**变更 `fix-project-id-uuid-invariant`（提案 2026-11-16、实施 2026-11-17）**：闸 1 `validateScopeSpec`（`core/scope.ts`）project 分支加 `isUuid` 形态校验（走既有 `problems[]` 聚合与 `E_SCOPE_INVALID`）；闸 2 `ensureProject`（`store/scopes.ts`）同断言兜底，命中前先校验；doctor 新增畸形行只读检出（`findMalformedProjectRows`，`store/projects.ts`），进 **problems** 不进 notes——与外键违规同列（数据完整性问题，不可自愈），只报不修。**实施期发现两条真实绕过路径，比设计预期更承重**：`sync/apply.ts:120`（远端事件描述符的 projectId 直通 store 层）与 `onboarding/auto.ts:118`（治理计划选择直通）——store 层闸是这两条路径的唯一防线，不只是防旧构建进程。形态校验复用既有 `isUuid`（`core/ids.ts:37`），未新增 `isUuidShape`（避免同一判断两处实现）。
+
+**变异三轮结论（诚实记录）**：单独去闸 1 **不回红**——`ensureProjectScope` 第一步就调 `ensureProject`（闸 2），拒绝行为与零新增完全不可区分，这是纵深防御的实证而非测试失效；去闸 2 → 闸 2 直调测试回红且**闸 1 测试保持绿**（证明两闸各自独立承重）；去 doctor 扫描 → doctor 测试回红。与 0.6.7/0.6.9 的本质差异：入口层闸挡的是「经入口的写入」，store 层闸挡的是**一切到达数据库的写入**。
+
+**夹具契约收紧（风险 1 的预期落地）**：4 个测试文件用伪项目 id（`proj-a`/`proj-alpha`/`proj-empty`）直调 `resolvePreset`，被新闸如实拒绝——统一改 `uuidv7()`（`export.test.ts` / `search.test.ts` / `scope.test.ts` / `render.test.ts` / `scope-authz.test.ts`；`scope.test.ts:82/84` 为纯内存 `scopeAllowsRead` 对象不落库，保留）。
+
+**门禁（全部主会话独立复跑）**：`npm test` **922 / 921 pass / 0 fail / 1 skip**（较 0.6.8 基线 +14：0.6.9 提交自带 8 + 本变更 6）；`test:e2e` PASS（items 533 / distinctContents 336 / maxPerContent 1）；typecheck 0 错；真实库 doctor `ok:true / problems:[] / 畸形项 0`（证据 `artifacts/project-uuid-doctor-2026-11-17.json`）。

@@ -5,6 +5,7 @@ import { searchMemories, SearchOutput } from '../../src/retrieval/search.js';
 import { AddMemoryInput } from '../../src/core/types.js';
 import { isCairnError } from '../../src/core/errors.js';
 import { isoPlusMs, nowIso } from '../../src/core/time.js';
+import { uuidv7 } from '../../src/core/ids.js';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
 
 // ---------------------------------------------------------------------------
@@ -51,8 +52,10 @@ function setupSearchStore(): SearchCtx {
   const store = openStore({ home });
   const dev = store.identity.deviceId;
   const personal = store.scopes.resolvePreset('personal-global');
-  const projA = store.scopes.resolvePreset('project-global', { projectId: 'proj-a', projectName: '项目A' });
-  const projB = store.scopes.resolvePreset('project-global', { projectId: 'proj-b', projectName: '项目B' });
+  const projAId = uuidv7();
+  const projBId = uuidv7();
+  const projA = store.scopes.resolvePreset('project-global', { projectId: projAId, projectName: '项目A' });
+  const projB = store.scopes.resolvePreset('project-global', { projectId: projBId, projectName: '项目B' });
   const agentA = store.scopes.resolvePreset('agent-private', { agentId: 'agent-alpha' });
   const agentB = store.scopes.resolvePreset('agent-private', { agentId: 'agent-beta' });
   const dev1 = store.scopes.resolvePreset('device-local', { deviceId: 'device-1' });
@@ -84,8 +87,8 @@ function setupSearchStore(): SearchCtx {
   const revised = store.memories.revise(confRec.id, '线上数据库连接串改用 IPv4', { author: 'test' }, dev);
   store.conflicts.record({ memoryId: confRec.id, revisionAId: rev1, revisionBId: revised.revision.id });
 
-  const qa = { deviceId: 'device-x', agentId: 'agent-x', projectId: 'proj-a' };
-  const qb = { deviceId: 'device-x', agentId: 'agent-x', projectId: 'proj-b' };
+  const qa = { deviceId: 'device-x', agentId: 'agent-x', projectId: projAId };
+  const qb = { deviceId: 'device-x', agentId: 'agent-x', projectId: projBId };
   const qp = { deviceId: dev, agentId: 'agent-any' };
   const qAgentA = { deviceId: 'device-x', agentId: 'agent-alpha' };
   const qAgentB = { deviceId: 'device-x', agentId: 'agent-beta' };

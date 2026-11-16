@@ -11,6 +11,7 @@ import { UI_JS } from '../../src/interfaces/console/assets/ui-js.js';
 import { computeInbox } from '../../src/interfaces/console/suggestions.js';
 import { AUTHORITIES, MEMORY_KINDS, MEMORY_STATUSES } from '../../src/core/types.js';
 import { SCOPE_PRESETS } from '../../src/core/scope.js';
+import { uuidv7 } from '../../src/core/ids.js';
 
 /**
  * 预览视图的数据面（任务 4.2 / 4.3）。
@@ -40,7 +41,7 @@ async function setup(): Promise<Ctx> {
   const scope = store.scopes.resolvePreset('personal-global', {});
   const local = store.scopes.resolvePreset('device-local', { deviceId: store.identity.deviceId });
   // 故意建一个永远为空的层级：页面要能把"这层什么都还没记"显示出来，而不是整行消失。
-  store.scopes.resolvePreset('project-global', { projectId: 'proj-empty', projectName: '空层级项目' });
+  store.scopes.resolvePreset('project-global', { projectId: uuidv7(), projectName: '空层级项目' });
   store.memories.add(
     { kind: 'fact', content: NORMAL_TEXT, scopeId: scope.id, authority: 'user_explicit', createdBy: 'cli' },
     store.identity.deviceId,

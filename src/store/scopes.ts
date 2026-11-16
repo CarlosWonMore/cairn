@@ -11,7 +11,7 @@ import {
 } from '../core/scope.js';
 import { err } from '../core/errors.js';
 import { WriteGuardMixin } from './write-guard.js';
-import { uuidv7 } from '../core/ids.js';
+import { isUuid, uuidv7 } from '../core/ids.js';
 import { nowIso } from '../core/time.js';
 
 /**
@@ -43,6 +43,14 @@ export class ScopeRepository extends WriteGuardMixin {
   }
 
   ensureProject(projectId: string, name: string): void {
+    // 第二道闸（fix-project-id-uuid-invariant）：防未来调用方绕过 validateScopeSpec
+    // 直写项目行——路径/别名原文不能落 project 表（2026-11-16 真实库事故）。
+    if (!isUuid(projectId)) {
+      throw err(
+        'E_SCOPE_INVALID',
+        `projectId 必须是 UUID 形态（收到 ${JSON.stringify(projectId)}）；先 cairn project resolve <路径或URL> 取得稳定 id（别名会自动解析）`,
+      );
+    }
     const row = this.db.get('SELECT id FROM project WHERE id = ?', projectId);
     if (row) return;
     this.db.run('INSERT INTO project (id, name, created_at) VALUES (?, ?, ?)', projectId, name, nowIso());

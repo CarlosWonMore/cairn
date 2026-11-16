@@ -5,6 +5,7 @@
  */
 
 import { err } from './errors.js';
+import { isUuid } from './ids.js';
 
 export type SyncPolicy = 'local_only' | 'encrypted';
 export type ReadPolicy = 'all_agents' | 'allowlist';
@@ -188,8 +189,16 @@ const CUSTOM_SPACE_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N} ._-]{0,63}$/u;
 
 export function validateScopeSpec(spec: ScopeSpec): void {
   const problems: string[] = [];
-  if (spec.scopeKind === 'project' && !spec.projectId) {
-    problems.push('project 作用域必须绑定 projectId');
+  if (spec.scopeKind === 'project') {
+    if (!spec.projectId) {
+      problems.push('project 作用域必须绑定 projectId');
+    } else if (!isUuid(spec.projectId)) {
+      // 项目身份形态不变式（fix-project-id-uuid-invariant）：路径/别名原文不能作主键，
+      // 否则会产出 `project/<路径>` 畸形同步链键（2026-11-16 真实库事故：pull 整体 400）。
+      problems.push(
+        `projectId 必须是 UUID 形态（收到 ${JSON.stringify(spec.projectId)}）；先 cairn project resolve <路径或URL> 取得稳定 id`,
+      );
+    }
   }
   if (spec.scopeKind === 'custom') {
     if (!CUSTOM_SPACE_NAME_RE.test(spec.spaceName)) {

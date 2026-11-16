@@ -118,7 +118,7 @@ cairn add "内容" [--kind fact] [--scope personal-global] [--project <id>] [--s
 | --- | --- |
 | `--kind` | `instruction` / `preference` / `fact` / `decision` / `episode` / `procedure` / `environment`，默认 `fact` |
 | `--scope` | 作用域预设，见下表，默认 `personal-global` |
-| `--project <id>` | `project-global` / `project-device` 必填（配合 `--scope`） |
+| `--project <id>` | `project-global` / `project-device` 必填（配合 `--scope`）。**必须是 `cairn project resolve` 登记的 UUID 或已登记别名**——路径/自由文本会被作用域层拒绝（退出码 2）；别名经 `resolveProjectAlias` 自动解析 |
 | `--project-name <名称>` | 项目展示名（可选，缺省用 id） |
 | `--agent <id>` | `agent-private` 必填 |
 | `--scope-id <id>` | 直接引用既有作用域（与 `--scope` 二选一） |

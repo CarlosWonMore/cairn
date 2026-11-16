@@ -17,6 +17,7 @@ import { err, isCairnError, CairnError, ExitCode } from '../core/errors.js';
 import { readAuditConfig, AuditConfig, AuditDetail } from '../store/audit.js';
 import { contentHash } from '../core/hash.js';
 import { isUuid } from '../core/ids.js';
+import { findMalformedProjectRows } from '../store/projects.js';
 import { scopeAllowsUpstream, scopeAllowsRead } from '../core/scope.js';
 import { searchMemories, SearchInput, SearchOutput } from '../retrieval/search.js';
 import { exportData, ExportInput, ExportOutput } from '../retrieval/export.js';
@@ -974,6 +975,17 @@ export class AppService {
     }
     const fkViolations = store.db.foreignKeyCheck().length;
     if (fkViolations > 0) problems.push(`外键违规 ${fkViolations} 处`);
+
+    // 畸形项目身份行（fix-project-id-uuid-invariant）：与外键违规同类——是数据完整
+    // 性问题而非可自愈状态，进 problems（会如实破坏"健康即 0"）；只报不修。
+    // 2026-11-16 真实事故里这类行曾让 sync pull 整体 400 而 doctor 失明。
+    for (const bad of findMalformedProjectRows(store.db)) {
+      problems.push(
+        bad.projectId !== undefined
+          ? `项目身份形态异常：${bad.table} 表行 ${JSON.stringify(bad.id)} 的 project_id=${JSON.stringify(bad.projectId)} 非 UUID`
+          : `项目身份形态异常：${bad.table} 表行 ${JSON.stringify(bad.id)} 非 UUID`,
+      );
+    }
 
     let ftsOk = false;
     let ftsNote = '';

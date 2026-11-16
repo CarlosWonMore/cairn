@@ -5,6 +5,7 @@ import { exportData, ExportDoc, ExportOutput } from '../../src/retrieval/export.
 import { AddMemoryInput } from '../../src/core/types.js';
 import { isCairnError } from '../../src/core/errors.js';
 import { sha256Hex } from '../../src/core/hash.js';
+import { uuidv7 } from '../../src/core/ids.js';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
 
 // ---------------------------------------------------------------------------
@@ -39,8 +40,10 @@ function setupExportStore(): ExportCtx {
   const store = openStore({ home });
   const dev = store.identity.deviceId;
   const personal = store.scopes.resolvePreset('personal-global');
-  const projA = store.scopes.resolvePreset('project-global', { projectId: 'proj-a', projectName: '项目A' });
-  const projB = store.scopes.resolvePreset('project-global', { projectId: 'proj-b', projectName: '项目B' });
+  const projAId = uuidv7();
+  const projBId = uuidv7();
+  const projA = store.scopes.resolvePreset('project-global', { projectId: projAId, projectName: '项目A' });
+  const projB = store.scopes.resolvePreset('project-global', { projectId: projBId, projectName: '项目B' });
   const dev1 = store.scopes.resolvePreset('device-local', { deviceId: 'device-1' });
 
   const add = (scopeId: string, content: string, opts: Partial<AddMemoryInput> = {}): string =>
@@ -83,8 +86,8 @@ function setupExportStore(): ExportCtx {
       m1, m2, projAMem, projBMem, dev1Mem, cand, forgotten: forgottenRec.id, superseded,
     },
     qp: { deviceId: dev, agentId: 'agent-any' },
-    qa: { deviceId: 'device-x', agentId: 'agent-x', projectId: 'proj-a' },
-    qb: { deviceId: 'device-x', agentId: 'agent-x', projectId: 'proj-b' },
+    qa: { deviceId: 'device-x', agentId: 'agent-x', projectId: projAId },
+    qb: { deviceId: 'device-x', agentId: 'agent-x', projectId: projBId },
     qDev1: { deviceId: 'device-1', agentId: 'agent-any' },
     cleanup: () => {
       store.close();

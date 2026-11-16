@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { openStore, CairnStore } from '../../src/store/open.js';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
 import { customSpace, validateScopeSpec, deviceLocal, scopeAllowsRead } from '../../src/core/scope.js';
+import { uuidv7 } from '../../src/core/ids.js';
 
 async function withStore(fn: (store: CairnStore, home: string) => Promise<void> | void): Promise<void> {
   const home = makeTestHome();
@@ -30,9 +31,10 @@ test('作用域：预设 find-or-create 与指纹复用', async () => {
 
     assert.throws(() => store.scopes.resolvePreset('device-local'), /deviceId/);
 
-    const proj = store.scopes.resolvePreset('project-global', { projectId: 'proj-A', projectName: '项目A' });
-    assert.equal(proj.projectId, 'proj-A');
-    const proj2 = store.scopes.resolvePreset('project-global', { projectId: 'proj-A' });
+    const projAId = uuidv7();
+    const proj = store.scopes.resolvePreset('project-global', { projectId: projAId, projectName: '项目A' });
+    assert.equal(proj.projectId, projAId);
+    const proj2 = store.scopes.resolvePreset('project-global', { projectId: projAId });
     assert.equal(proj.id, proj2.id);
 
     const ag = store.scopes.resolvePreset('agent-private', { agentId: 'claude-main' });

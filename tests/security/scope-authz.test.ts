@@ -26,6 +26,11 @@ import { exportData } from '../../src/retrieval/export.js';
 import { customSpace } from '../../src/core/scope.js';
 import { proposePlan } from '../../src/governance/index.js';
 import { scanText } from '../../src/core/secrets.js';
+import { uuidv7 } from '../../src/core/ids.js';
+
+// 项目身份夹具：uuidv7 形态（fix-project-id-uuid-invariant 起 projectId 必须是 UUID）
+const PROJ_ALPHA = uuidv7();
+const PROJ_BETA = uuidv7();
 
 function withStore(fn: (store: CairnStore) => void): void {
   const home = makeTestHome();
@@ -44,8 +49,8 @@ function withStore(fn: (store: CairnStore) => void): void {
 
 test('对抗-3a 项目 A 身份经 searchMemories / exportData 检索项目 B 记忆 → 零结果零计数且不泄漏正文', () => {
   withStore((store) => {
-    const alpha = store.scopes.resolvePreset('project-global', { projectId: 'proj-alpha', projectName: 'Alpha' });
-    store.scopes.resolvePreset('project-global', { projectId: 'proj-beta', projectName: 'Beta' });
+    const alpha = store.scopes.resolvePreset('project-global', { projectId: PROJ_ALPHA, projectName: 'Alpha' });
+    store.scopes.resolvePreset('project-global', { projectId: PROJ_BETA, projectName: 'Beta' });
     const secret = '阿尔法项目独有的部署流水线记录';
     store.memories.add(
       { kind: 'fact', content: secret, scopeId: alpha.id, authority: 'user_explicit', createdBy: 'cli' },
@@ -56,20 +61,20 @@ test('对抗-3a 项目 A 身份经 searchMemories / exportData 检索项目 B �
     // 对照组：同项目身份可见
     const own = searchMemories(store, {
       text: '部署流水线',
-      query: { deviceId: device, agentId: 'agent-a', projectId: 'proj-alpha' },
+      query: { deviceId: device, agentId: 'agent-a', projectId: PROJ_ALPHA },
     });
     assert.equal(own.results.length, 1);
 
     // 项目 B 身份：检索零结果
     const r = searchMemories(store, {
       text: '部署流水线',
-      query: { deviceId: device, agentId: 'agent-b', projectId: 'proj-beta' },
+      query: { deviceId: device, agentId: 'agent-b', projectId: PROJ_BETA },
     });
     assert.equal(r.results.length, 0, '跨项目检索零结果');
     assert.equal(r.results.length, 0, '零计数');
 
     // 项目 B 身份：导出零计数且 payload 不含越权正文
-    const exp = exportData(store, { format: 'json', query: { deviceId: device, agentId: 'agent-b', projectId: 'proj-beta' } });
+    const exp = exportData(store, { format: 'json', query: { deviceId: device, agentId: 'agent-b', projectId: PROJ_BETA } });
     assert.equal(exp.counts.memories, 0, '跨项目导出零计数');
     assert.ok(!exp.payload.includes(secret), '导出 payload 不含项目 A 正文');
     // 不带 projectId 的身份同样不可见（project 作用域只对同一逻辑项目开放）
@@ -131,7 +136,7 @@ test('对抗-3d showMemory 作用域过滤：user 通道（CLI 主权者）全�
   const service = AppService.open(home);
   try {
     const store = service.store;
-    const alpha = store.scopes.resolvePreset('project-global', { projectId: 'proj-alpha', projectName: 'Alpha' });
+    const alpha = store.scopes.resolvePreset('project-global', { projectId: PROJ_ALPHA, projectName: 'Alpha' });
     const m = store.memories.add(
       { kind: 'fact', content: '阿尔法项目独有事实', scopeId: alpha.id, authority: 'user_explicit', createdBy: 'cli' },
       store.identity.deviceId,
@@ -139,14 +144,14 @@ test('对抗-3d showMemory 作用域过滤：user 通道（CLI 主权者）全�
     // 检索/导出边界仍然成立
     const r = searchMemories(store, {
       text: '阿尔法项目独有事实',
-      query: { deviceId: store.identity.deviceId, agentId: 'agent-b', projectId: 'proj-beta' },
+      query: { deviceId: store.identity.deviceId, agentId: 'agent-b', projectId: PROJ_BETA },
     });
     assert.equal(r.results.length, 0, 'search 边界成立');
     // user 通道（CLI 主权者）：可读全部
     const detail = service.showMemory(m.id);
     assert.equal(detail.memory.id, m.id);
     assert.equal(detail.memory.content, '阿尔法项目独有事实');
-    assert.equal(detail.scope.projectId, 'proj-alpha');
+    assert.equal(detail.scope.projectId, PROJ_ALPHA);
   } finally {
     service.close();
     cleanupTestHome(home);
@@ -157,11 +162,11 @@ test('对抗-3e 【agent 通道】showMemory 拒绝跨项目读取（CAIRN_CHANN
   const home = makeTestHome();
   process.env['CAIRN_CHANNEL'] = 'agent';
   process.env['CAIRN_AGENT_ID'] = 'agent-b';
-  process.env['CAIRN_PROJECT_ID'] = 'proj-beta';
+  process.env['CAIRN_PROJECT_ID'] = PROJ_BETA;
   const service = AppService.open(home);
   try {
     const store = service.store;
-    const alpha = store.scopes.resolvePreset('project-global', { projectId: 'proj-alpha', projectName: 'Alpha' });
+    const alpha = store.scopes.resolvePreset('project-global', { projectId: PROJ_ALPHA, projectName: 'Alpha' });
     const m = store.memories.add(
       { kind: 'fact', content: '阿尔法项目独有事实', scopeId: alpha.id, authority: 'user_explicit', createdBy: 'cli' },
       store.identity.deviceId,

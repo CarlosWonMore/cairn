@@ -125,6 +125,37 @@ export function resolveProjectAlias(db: CairnDb, raw: string | null | undefined,
   return found;
 }
 
+export interface MalformedProjectRow {
+  table: 'project' | 'space' | 'scope';
+  /** 行主键（project 表的畸形值本身；space/scope 表为该行合法 id）。 */
+  id: string;
+  /** space/scope 表行上非 UUID 形态的 project_id（project 表无此字段）。 */
+  projectId?: string;
+}
+
+/**
+ * 畸形项目身份行检出（fix-project-id-uuid-invariant）：三表中主键或 project_id
+ * 非 UUID 形态的行。这类行会产出 `project/<路径>` 畸形同步链键——2026-11-16
+ * 真实库事故中 sync pull 对其整体 400 且 doctor 失明。只读扫描，只报不修；
+ * 修复属治理动作（备份后人工删除），不得由体检自动执行。
+ */
+export function findMalformedProjectRows(db: CairnDb): MalformedProjectRow[] {
+  const out: MalformedProjectRow[] = [];
+  for (const r of db.all('SELECT id FROM project')) {
+    const id = String(r['id']);
+    if (!isUuid(id)) out.push({ table: 'project', id });
+  }
+  for (const r of db.all("SELECT id, project_id FROM space WHERE space_kind = 'project'")) {
+    const projectId = String(r['project_id'] ?? '');
+    if (!isUuid(projectId)) out.push({ table: 'space', id: String(r['id']), projectId });
+  }
+  for (const r of db.all("SELECT id, project_id FROM scope WHERE scope_kind = 'project'")) {
+    const projectId = String(r['project_id'] ?? '');
+    if (!isUuid(projectId)) out.push({ table: 'scope', id: String(r['id']), projectId });
+  }
+  return out;
+}
+
 function mapProject(r: Record<string, unknown>): ProjectSummary {
   return {
     projectId: r.id as string,
