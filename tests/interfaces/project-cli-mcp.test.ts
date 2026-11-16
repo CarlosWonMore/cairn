@@ -149,3 +149,41 @@ test('CLI project alias add：跨项目冲突退出码 4，且不写入', async 
   assert.deepEqual(after.items.find((i) => i.projectId === p1.projectId)!.aliases, ['https://github.com/o/one', 'D:/work/one']);
   assert.deepEqual(after.items.find((i) => i.projectId === p2.projectId)!.aliases, ['https://github.com/o/two']);
 });
+
+/**
+ * CLI 读路径的 project 口径（与 MCP 对齐）：UUID 与已登记别名等价；
+ * 未登记别名必须报 E_NOT_FOUND 而不是静默 0 命中；缺省仍不可见项目内容。
+ */
+test('CLI search --project：UUID 与已登记别名同效，未登记别名报错，缺省不可见', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  const alias = 'https://github.com/o/proj.git';
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', alias])).stdout) as { projectId: string };
+    const added = await runCli([...base, 'add', 'PROJECT_ALPHA_TOKEN rotates monthly', '--scope', 'project-global', '--project', proj.projectId]);
+    assert.equal(added.code, 0, added.stderr);
+
+    const byId = JSON.parse((await runCli([...base, 'search', 'PROJECT_ALPHA_TOKEN', '--project', proj.projectId])).stdout) as { results: unknown[] };
+    assert.equal(byId.results.length, 1, 'UUID 必须命中项目作用域记忆');
+
+    const byAlias = JSON.parse((await runCli([...base, 'search', 'PROJECT_ALPHA_TOKEN', '--project', alias])).stdout) as { results: unknown[] };
+    assert.equal(byAlias.results.length, 1, '已登记别名必须与 UUID 等价（修复前这里 0 命中）');
+
+    const bad = await runCli([...base, 'search', 'PROJECT_ALPHA_TOKEN', '--project', 'D:/never/registered']);
+    assert.notEqual(bad.code, 0, '未登记别名不得静默成功');
+    const body = JSON.parse(bad.stdout) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, 'E_NOT_FOUND');
+    assert.match(body.error.message, /project resolve/);
+
+    const noProject = JSON.parse((await runCli([...base, 'search', 'PROJECT_ALPHA_TOKEN'])).stdout) as { results: unknown[] };
+    assert.equal(noProject.results.length, 0, '未携带项目身份时项目作用域内容必须不可见');
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI --help 暴露 search/export 的 --project', async () => {
+  const r = await runCli(['--help']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /--project <id\|alias>/);
+});

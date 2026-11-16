@@ -14,7 +14,7 @@ import {
 import { backupDatabase, restoreFromBackup } from '../../store/backup.js';
 import { scopeAllowsUpstream } from '../../core/scope.js';
 import { openStore } from '../../store/open.js';
-import { addAlias, listProjects, resolveProject } from '../../store/projects.js';
+import { addAlias, listProjects, resolveProject, resolveProjectAlias } from '../../store/projects.js';
 import { startConsoleServer } from '../console/server.js';
 import { exportConsoleHtml, normalizePersonalName } from '../console/export.js';
 import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
@@ -220,9 +220,10 @@ async function main(): Promise<void> {
         const includeExpired = flags['include-expired'] === true;
         const statuses = str(flags, 'status') ? [str(flags, 'status') as never] : undefined;
         const scopeId = str(flags, 'scope-id');
+        const projectId = resolveProjectAlias(service.store.db, str(flags, 'project'), 'cairn project resolve');
         const r = service.search({
           text,
-          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId: str(flags, 'project') ?? null },
+          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId },
           scopeIds: scopeId ? [scopeId] : undefined,
           statuses,
           includeExpired,
@@ -587,7 +588,11 @@ async function main(): Promise<void> {
 
       case 'export': {
         const r = service.export({
-          query: { deviceId: service.caller.deviceId, agentId: service.caller.agentId, projectId: str(flags, 'project') ?? null },
+          query: {
+            deviceId: service.caller.deviceId,
+            agentId: service.caller.agentId,
+            projectId: resolveProjectAlias(service.store.db, str(flags, 'project'), 'cairn project resolve'),
+          },
           scopeIds: str(flags, 'scope-id') ? [str(flags, 'scope-id')!] : undefined,
           format: (str(flags, 'format') as 'json' | 'markdown') ?? 'json',
           includeArchives: flags['include-archives'] === true,
@@ -1236,6 +1241,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   add "内容"                    显式新增记忆 [--kind] [--scope] [--project] [--sensitive]
                                 [--judgement keep|skip|merge_into:<id> --confidence --rationale]
   search "关键词"               作用域约束检索 [--status] [--scope-id] [--include-expired]
+                                [--project <id|alias>]（项目作用域内容须携带项目身份）
   show <id>                     记忆详情（修订/证据/冲突）
   update <id> "新内容"          用户更正（新修订，历史保留）
   forget <id>                   遗忘（可审计 tombstone） [--reason]
@@ -1247,6 +1253,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
                                 list [--status pending|applied|rejected|stale|all]；apply <id>|--all；reject <id> "理由"
   archive <id>                  归档
   export                        导出 [--format json|markdown] [--out FILE] [--include-archives]
+                                [--project <id|alias>]（同上：项目作用域内容须携带项目身份）
   plan create|show|list         治理计划（create 需 --items-file，零写入）
   approve <plan-id>             本地签发一次性审批（绑定 plan_hash，30 分钟有效）
   apply <plan-id> --approval X  消费审批并幂等应用计划

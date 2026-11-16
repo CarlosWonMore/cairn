@@ -14,8 +14,7 @@ import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review
 import { ANNOTATION_STATUSES, DISPOSITIONS, RESOLVE_STATUSES } from '../console/annotations.js';
 import { parseJudgement } from '../../onboarding/judgement.js';
 import { runAutoOnboarding } from '../../onboarding/auto.js';
-import { findProjectByAlias, listProjects, resolveProject } from '../../store/projects.js';
-import { isUuid } from '../../core/ids.js';
+import { listProjects, resolveProject, resolveProjectAlias } from '../../store/projects.js';
 
 /**
  * Cairn MCP stdio 服务器（任务 5.2）：
@@ -394,14 +393,7 @@ export function createServer(home?: string): Server {
  * 检索与写入共用本函数：登记只发生在 project_resolve（显式动作）。
  */
 function resolveProjectArg(service: AppService, raw: unknown): string | null {
-  if (raw == null || raw === '') return null;
-  const value = String(raw);
-  if (isUuid(value)) return value;
-  const found = findProjectByAlias(service.store.db, value);
-  if (!found) {
-    throw err('E_NOT_FOUND', `项目别名未登记，请先经 project_resolve 登记: ${value}`, { project: value, hint: 'project_resolve' });
-  }
-  return found;
+  return resolveProjectAlias(service.store.db, raw as string | null | undefined, 'project_resolve');
 }
 
 async function handleTool(service: AppService, name: string, args: Record<string, unknown>): Promise<unknown> {

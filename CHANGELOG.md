@@ -2,7 +2,12 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.6.7] - 2026-11-16
+
 ### Fixed
+- **CLI `--project` 在帮助文本里缺失**：`cairn search` 一直支持 `--project`，但 `--help` 只列了 `[--status] [--scope-id] [--include-expired]`。对端真机验证时因此不知道有这个参数，误判为「项目作用域记忆无法召回」——**能力被文档隐藏**；同时补上 `export` 的 `--project`。
+- **CLI `--project` 不接受项目别名**（MCP 接受）：传路径别名时**静默 0 命中**，而 MCP 会解析并报 `E_NOT_FOUND`。现抽成共用 `resolveProjectAlias()`，CLI 与 MCP 同源；未登记别名明确报错并指引 `cairn project resolve`。
+  > `scopeAllowsRead` 要求 `scope.projectId` 与查询严格相等，**未携带项目身份时项目作用域内容不可见——这是规格要求**（`scoped-retrieval`「全通道作用域隔离」），不是缺陷。
 - **项目身份在写入路径不解析别名**：`memory_add` / `memory_promote` 的 `project_id` 此前把入参**原样透传**，传路径别名（如 `D:/Project/xxx`）会创建 `project_id` 为路径字符串的**孤儿 scope/space**——该记忆既不会被项目作用域检索命中，也不会被项目链同步（链键是 `project/<uuid>`）。而同一个工具面的 `memory_search` 会经 `resolveProjectArg()` 正确解析。现在写入与检索共用同一入口（只查不建，未登记报 `E_NOT_FOUND` 并指引 `project_resolve`）。
 - **作用域解析收口做 UUID 形态校验**：`resolveScope` 的 `project-global` / `project-device` 分支，`projectId` 非 UUID 一律 `E_VALIDATION`（提示先经 `project_resolve` 登记）。MCP 只是入口之一，CLI `--project`、`rescope`、`promoteCandidate` 全部经此收口——避免在每个入口各堵一次。
 

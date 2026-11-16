@@ -1,7 +1,7 @@
 import { CairnDb } from './db.js';
 import { AuditLog } from './audit.js';
 import { normalizeAlias } from './project-alias.js';
-import { uuidv7 } from '../core/ids.js';
+import { isUuid, uuidv7 } from '../core/ids.js';
 import { nowIso } from '../core/time.js';
 import { err } from '../core/errors.js';
 
@@ -106,6 +106,23 @@ function findOwner(db: CairnDb, value: string): ProjectSummary | null {
 export function findProjectByAlias(db: CairnDb, raw: string): string | null {
   const alias = normalizeAlias(raw);
   return findOwner(db, alias.value)?.projectId ?? null;
+}
+
+/**
+ * CLI / MCP 共用的「project 参数」解析（只查不建）：UUID 原样返回（不存在时沿用
+ * 既有静默空结果语义）；路径/URL 归一化后查登记，未登记报 E_NOT_FOUND 并指引
+ * 登记入口。两个入口共用本函数，避免同一语义各写一份再次分叉。
+ * hint 只影响报错文案（MCP 工具名 / CLI 命令），不改变判定。
+ */
+export function resolveProjectAlias(db: CairnDb, raw: string | null | undefined, hint: string): string | null {
+  if (raw == null || raw === '') return null;
+  const value = String(raw);
+  if (isUuid(value)) return value;
+  const found = findProjectByAlias(db, value);
+  if (!found) {
+    throw err('E_NOT_FOUND', `项目别名未登记，请先经 ${hint} 登记: ${value}`, { project: value, hint });
+  }
+  return found;
 }
 
 function mapProject(r: Record<string, unknown>): ProjectSummary {
