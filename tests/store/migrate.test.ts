@@ -116,3 +116,86 @@ test('适配层：undefined 参数映射为 null，布尔映射为 0/1', () => {
   assert.equal(Number(row.b), 1);
   db.close();
 });
+
+// ---------------------------------------------------------------------------
+// v8：用 reheld 审计回填 origin_device_id（真机对端 24 条 revived 副本）
+// ---------------------------------------------------------------------------
+
+const V7_AT = '2026-11-10T00:00:00.000Z';
+
+/** 造一份 v7 库（只跑到 7），库里有本项目域与一条可直接对账的记忆行。 */
+function openV7(home: string): CairnDb {
+  const db = CairnDb.open(dbPath(home));
+  runMigrations(db, MIGRATIONS.filter((m) => m.version <= 7));
+  assert.equal(schemaVersion(db), 7, '前置：停在 v7（此时 origin 还未回填）');
+  db.run('INSERT INTO space (id, name, space_kind, created_at) VALUES (?,?,?,?)', 'sp_personal', 'personal', 'personal', V7_AT);
+  db.run(
+    `INSERT INTO scope (id, space_id, preset, scope_kind, sync_policy, read_policy, retention_policy, projection_policy, created_at)
+     VALUES ('scp_personal','sp_personal','personal-global','personal','encrypted','all_agents','permanent','none', ?)`,
+    V7_AT,
+  );
+  return db;
+}
+
+function legacyMemory(db: CairnDb, id: string, originDeviceId: string | null): void {
+  db.run(
+    `INSERT INTO memory (id, owner_id, kind, content, normalized_content, scope_id, status, authority,
+       observed_at, content_hash, origin_device_id, created_by, created_at, updated_at)
+     VALUES (?, 'local-user', 'fact', ?, ?, 'scp_personal', 'active', 'user_explicit', ?, ?, ?, 'cli', ?, ?)`,
+    id,
+    `正文 ${id}`,
+    `正文 ${id}`,
+    V7_AT,
+    `hash_${id}`,
+    originDeviceId,
+    V7_AT,
+    V7_AT,
+  );
+}
+
+function reheldAudit(db: CairnDb, id: string, memoryId: string, from: string): void {
+  db.run(
+    `INSERT INTO audit_event (id, at, category, action, subject_type, subject_id, detail)
+     VALUES (?, ?, 'sync', 'project_reheld', 'memory', ?, ?)`,
+    id,
+    V7_AT,
+    memoryId,
+    JSON.stringify({ from, seq: 7 }),
+  );
+}
+
+test('v8 存量回填：origin 未知的 revive 副本按 reheld 审计的 from 补归属', () => {
+  const home = makeTestHome();
+  try {
+    const db = openV7(home);
+    legacyMemory(db, 'mem_retro', null);
+    reheldAudit(db, 'audit_retro', 'mem_retro', 'dev_publisher');
+
+    const r = runMigrations(db);
+
+    assert.deepEqual(r.applied, [8]);
+    assert.equal(r.currentVersion, 8);
+    assert.equal(String(db.get('SELECT origin_device_id AS d FROM memory WHERE id = ?', 'mem_retro')?.d), 'dev_publisher');
+    db.close();
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('v8 迁移不误伤：没有 reheld 审计的保持 NULL，已有归属不被审计覆盖', () => {
+  const home = makeTestHome();
+  try {
+    const db = openV7(home);
+    legacyMemory(db, 'mem_clean', null); // 无审计
+    legacyMemory(db, 'mem_keep', 'dev_existing'); // 已有归属 + 别人的 reheld 审计
+    reheldAudit(db, 'audit_keep', 'mem_keep', 'dev_other');
+
+    runMigrations(db);
+
+    assert.equal(db.get('SELECT origin_device_id AS d FROM memory WHERE id = ?', 'mem_clean')?.d ?? null, null, '无证据不猜');
+    assert.equal(String(db.get('SELECT origin_device_id AS d FROM memory WHERE id = ?', 'mem_keep')?.d), 'dev_existing', '归属是溯源事实，不被覆盖');
+    db.close();
+  } finally {
+    cleanupTestHome(home);
+  }
+});

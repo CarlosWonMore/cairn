@@ -2,6 +2,26 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.6.6] - 2026-11-16
+
+三轮对端真机验证闭环（0.6.4 → 0.6.5 → 0.6.6）。每个缺陷都是真实两设备环境才暴露的，本地 fixture 无法发现。
+
+### Added
+- **项目链 `project/<projectId>`：项目作用域内容跨设备同步**。此前 `project-global` 在保管模式下只进本机保管链，他机永不拉取；现在它按项目分链密文上行，**所有设备列举并拉取**，落点是同名项目作用域（不是个人全局），且与保管模式开关无关。`project-device` 仍绑设备走本机保管链，`device-local` 仍不跨设备复制。旧版本设备（≤0.6.3）看不到项目链——不报错、不卡链，需升级。
+- **`sync_scope_exit` 携带终态作用域**：迁出通知新增可选 `terminalScope`，接收端写入 `meta` 键 `terminal_scope:<id>`（不新增表列）。`cairn show` 与 MCP `memory_get` 返回 `terminalScope` 字段（`null` = 未知/旧事件）。
+- **`cairn --version` / `-V`**：此前未实现，调用打印用法帮助。
+
+### Fixed
+- **项目链 upsert 解除「不再持有」标记**：接收端对某记忆有 `scope_exit` 标记时，项目链 upsert 必须解除它（清标记 + archived→active + 按描述符迁移），否则那批内容会被「迁出后的迟到修订」判定挡住，表现为**推送成功但对端看不到**。个人链的 `shadowed` 分支逐字未动——那是「迁出后不被个人链拉回」的安全语义。
+- **上行缺口把接收方副本误判为缺口**（0.6.5）：`sync_pushed:<space>:<id>` 只由 push 写，pull 落地不写，导致**每台接收方设备**的项目记忆恒被判缺口且永不自消解（发布方有该元数据所以看不出来）。三段判据增加 `origin_device_id IS NULL OR = 本机`；NULL 保留为「可能由本机创建」，不了一刀切排除。
+- **revive 路径不回填 `origin_device_id`**（0.6.6）：三条 revive 路径只清标记+恢复活动，而新落地走 `memories.add` 会回填——两条路径不一致，造成 revived 副本「`sync_pushed` 与 `origin` 两头证据都缺」。改为共用 `adoptOriginIfUnknown()`，仅当原值 NULL 时回填事件发布方。
+- **schema v8 存量回填**：已存在的 revived 副本不会重放事件，用 `audit_event` 中三类 reheld 动作的 `detail.$.from`（事件发布方）回填 origin，只补 NULL、绝不覆盖，并加 `json_valid()` 兜底（坏 JSON 会让整条迁移失败、库卡在 v7）。
+
+### Changed
+- `ApplyOutcome` 追加 `revived` 计数：解除「不再持有」并恢复活动的条数单列。此前它们被算进 `skipped`，`applied=3` 掩盖了 24 条最重要的写入效果。纯追加维度，既有 `applied`/`skipped` 语义不变。
+- `doctor` / `status` 按链分列（个人 / 每条项目 / 保管），各自 localSeq、拉取游标、待办、缺口。
+- `sync backfill` 报告按链分列，新增 `chains.project`。
+
 ## [0.6.1] - 2026-11-14
 
 ### Fixed

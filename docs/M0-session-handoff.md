@@ -1113,3 +1113,110 @@ DSH 的 request/header 只覆盖 call config + 工具 schema；系统提示词�
 ### 追加（2026-11-15 深夜）：refine-memory-view-active-default 全闭环
 
 webUI 记忆视图默认活动视图（用户在对端把 38 条已归档误读为同步失败后立的提案，用户预审直接推进）。实现要点：① **记忆视图原本没有状态下拉**（statusSelect: true 从未被传入 toolbar）——本次是接入而非改标签；② `/api/memories` status 语义三态：缺省/空值→活动集（candidate/active/conflicted）、`all`→全部、列表→精确，过滤始终服务端执行；③ 静态页 localFilter 同一映射零请求，`LIVE_VIEW_STATUSES` 单点常量；④ 对端 0.6.2 验证 AI 发现 `cairn export` 只出 active+tombstones——既有导出契约，提示词预期写错而非缺陷。归档后 strict 校验抓到合并需求正文超 500 字符 → 按 2026-11-13 先例拆出「记忆视图默认活动视图」独立需求（14 场景零增减）。门禁 **869/868/0/1 + test:ui 120/120（+5）+ specs 10/10**；npm 0.6.3 已发（E409 staged → npm view 落地确认 + tarball 核验）；git push 已同步（`6518ae8`）。对端升级 0.6.3 后 webUI 才有新默认视图。
+
+### 追加（2026-11-16）：云端对账结论 + 跨设备项目作用域（立项前）
+
+用户报"云端记忆被对端覆盖"，要求以本机记忆为主对账。**只读排查结论：没有覆盖、没有丢数据、没有积压**——详见 `docs/verify-cloud-reconcile-2026-11-16.md`。要点：
+
+1. **链按设备分段、只追加**：本机段 `personal-global/devices/dev_01a18002` 仍是 87 事件 / headSeq 87，与 `status.sync.chains.localSeq = 87`、`gap = 0` 一致；对端段 `dev_01a1bdfb` 是独立的 43 事件段。两段并存，谁也没覆盖谁。
+2. **本机是内容超集**：云端 59 个内容哈希 ⊆ 本机 65 个，`cloudOnly = 0`；本机独有 6 个全非生效内容。`outbox` 168 done / 0 pending / 0 failed，`upstreamGap = 0`，`sync backfill` 候选 0。
+3. **对端 agent 的两处误判**：所谓"云端少一条"其实是**对端自己 outbox 的 pending 任务**（`01a1df7e-2276-…`，attempts 0，worker 未跑）；它引用的样本记忆 `01a1df7e-2273-…` **在我们的云端根本不存在**。
+4. **同内容不同作用域 = 36 条**：26 条本机已迁 project-global（hdrs6 22 / cairn 3 / fsmp 1），10 条迁 device-local，全部被本机发出的 **38 条 `scope_exit`** 覆盖（`sync_pushed:personal-global:` 元数据也是 38 条：27 project + 11 device-local，无漏项）。对端 2026-11-15 已实测收敛 27 条。
+5. **必须区分"数据正确"与"能力缺失"**：数据无需修改；但项目作用域内容在 `preserveDeviceBound` 下**任何配置都不会跨设备**——`syncableChains` 只含个人链 + 本机保管链，`pull` 对他人 `preserve/` 完全不列举（`tests/sync/preserve-mode.test.ts`「他人保管链不拉取」是固化断言）。
+
+**用户决策（2026-11-16）**：personal-global 必须跨设备（拉取/作用/展示）；剩余 36 条要参照本机治理结果同步到云端，对端也要收到**作用域治理结果**而不是都归 personal-global。故需协议层扩展——计划与四个待确认项见 `docs/cloud-reconcile-plan-2026-11-16.md`，拟立项 `add-cross-device-project-sync`：新增 `project/<projectId>` 链；project-global 走项目链跨设备、project-device 仍走本机保管链、device-local 保持不跨设备。**最大陷阱**：apply 侧必须在 project 角色下复用 `preserve_reheld` 的「解除 `scope_exit` 标记」分支，否则那 26 条会被迟到修订判定挡住，表现为「推了但对端看不到」——该测试必须先红后绿。
+
+下一入口（当时）：等用户确认计划 §6 四问 → `/opsx:propose add-cross-device-project-sync`。
+
+## 2026-11-16 追加：`add-cross-device-project-sync` 第三批（终态作用域 / backfill 三链 / 可观测 / 控制台 / 文档）
+
+前两批已完成链键/路由/push 与 pull 发现/apply 物化/标记解除。本批收口第 4–7 节：
+
+1. **终态作用域（4.x）**：`scope_exit` 载荷的 `terminalScope` 写入 `meta` 键 `terminal_scope:<memoryId>`（`canonicalJson`，**不加 memory 列、不改 schema**）；旧事件缺省不写；`clearScopeExitMarker`（重新持有）与 `memories.forget`（转墓碑）都会删除该键，避免活动记忆挂着过期「终态」。
+2. **backfill 三链（5.x）**：`findUpstreamGap` 增加 project 段——`project-global` + 有项目身份 + 无任何 `sync_upstream` 任务；保管链段缩回 `device-local` / `project-device`（另含缺项目身份的孤儿 project-global，route 会把它降级到保管链）。报告新增 `chains.project`。`doctor` / `status` 改为共用私有 `syncChainViews()`：个人链 + 每条项目链 + 保管链，各自 localSeq / 拉取游标 / pending / gap；pending 按「job_type + 任务作用域」归属，项目任务不再算进个人链。
+3. **控制台（6.x）**：`MemoryView.terminalScope`（列表与详情同一字段，SQL 子查询读 meta；静态导出复用 `buildModel`，天然同构零请求）；卡片与详情复用既有 chip / label 路径，显示「终态 …」「本机不再持有」，可翻译文案不挂 title。
+4. **第二批弱断言已恢复为强断言**：`tests/sync/preserve-mode.test.ts` 的「应用后缺口归零」现在断言 `remaining.candidates === 0`、`memoryIds` 为空、`findUpstreamGap` 为 0，并额外断言项目任务 `sync_upstream` 与保管任务 `sync_preserve` 在同一份报告里分列（`chains.project` / `chains.preserve`）。
+
+**验证数字**：`npm run build` 零错；`tsc --noEmit` 零错；目标套件 `project-chain + backfill + preserve-mode + console/*` 共 **207/207**；新增 `tests/console/terminal-scope.test.ts` 2/2；`upstream-enqueue + push-gap-guard` 8/8。
+
+**未做（不因本批消失）**：`test:ui` 未跑（Playwright 留用户）；`npm test` 全量未跑；`openspec validate --strict` 未跑；真机 8.6（backfill --apply → push → 云端对象/明文扫描）与对端 8.7（升级 → pull → 26 条 project-global / 10 条终态标签）仍需用户授权。
+
+**下一入口（已被下面这次门禁取代）**：真机 8.6/8.7 → 归档。
+
+## 2026-11-16 门禁收口：主会话独立验收（不采信 CLI 自述）
+
+第三批之后又派了**第四批**（64 turns / 198s），只补一个测试覆盖缺口——起因是负对照零红：
+
+- **8.3 变异对照（通过）**：把 `apply.ts` 的 `if (role === 'project' && marked)` 改恒假 → 2 条红（「项目链 upsert 解除不再持有」「终态作用域随遗忘与重新持有清理」），还原后 16/16 绿。
+- **8.4 负对照（首轮零红，已用补测排除）**：把 `push.ts` 的 project 物理排除改恒假 → **16/16 仍然全绿**。根因不是靶集窄，而是**该守卫在正常路径不可达**：`routeJob` 与 `buildEventsForChain` 用同一个 `memScope`，必然一致。真正的触发窗口是 `pushClaimed` 里「先路由全部 job → 再逐链构建」之间的每条链发布 `await`（`push.ts:338-361`）。批 4 用 `HookedRemote`（在个人链首个 `getManifest` 处改记忆作用域）复现该窗口，两条新用例在变异态下变红（`only 1 unroutable` → actual 0）、还原后 16/16 绿。原两条用例同时充当正靶（同批合法项目记忆照常发布），排除「靠什么都不发通过」。
+- **留待后续（第三次同型问题）**：该守卫与 `routeJob` 是同一判断的两份写法——继 `promotedPredicate`、`firstLine` 之后第三次。正解是让 `routeJob` 复用同一判定函数，否则它永远只能靠并发窗口测。
+
+**最终门禁（主会话全部独立复跑）**：`npm test` **889 / 888 pass / 0 fail / 1 skip**（基线 869，+20）；`npm run test:ui` **120/120**（`artifacts/console-ui-2026-11-16.json`）；`tsc --noEmit` exit 0；`validate --specs --strict` **10/10** + change `--strict` 通过。tasks 完成 29/31，仅剩 8.6（真机）与 8.7（对端）。
+
+### 真机执行（2026-11-16 用户授权后，8.6 完成）
+
+**执行前发现并修复两个真 bug（第五批，145 turns）**——这是本次最有价值的产出，两个都只有真机才暴露：
+
+1. **backfill 项目段判据失效**：原口径「不存在任何 `sync_upstream` 任务」把「当年在个人链时代产生、且因不可路由而 `done` 的历史任务」误判成「已上行」——27 条项目记忆全部被当成已覆盖，**候选 0**。改判据为「**无本链推送证据**（`meta` 无 `sync_pushed:project/<pid>:<id>`）+ 无在途任务（pending/running/retry）」，与 `findScopeExitGap` 同一套证据口径；个人链与保管链判据不动（实测本就正确）。
+2. **幂等键冲突**：这 27 条的 `memory:<id>` 早已被个人链时代任务永久占用（唯一约束 done 后仍生效），项目链复用同键会被去重成 `existing`，任务根本入不了队。项目链改用本链独立键 `memory:<id>:project:<projectId>`。
+
+变异对照：把项目段改回旧判据 → 3 条红（含「从个人链迁入项目的记忆仍算项目链缺口」正是真机症状）。规格（两条 Requirement 判据措辞 + 一条真实形状场景）与 design D7 已同步修正。
+
+**真机数字（全部主会话独立复跑）**：
+- `sync backfill` 预演：project 候选 **27**（personal 0 / preserve 0）
+- `--apply`：新增 27 / 已存在 0 / 排除 0；再预演候选 **0**（幂等）
+- `sync push`：三条项目链 hdrs6 **22** / cairn **4** / fsmp **1**，`unroutable 0`
+- 云端对象 **16 → 22（+6）**，project 前缀下 3 条链
+- 解密审计（`artifacts/audit-project-chains.cjs`）：**27 条 upsert / 内容哈希 27 全对 / 0 解密失败 / 明文命中 0 / 描述符 27 条全带 projectId**
+- 本机自拉取：**totalApplied 0**（27 条全 `skipped`，无重复建行）
+- `status`：四条链（个人 + 三条项目 + 保管）gap 全 0；`doctor`：integrity ok、`upstreamGap 0`
+- 全量 `npm test` **892 / 891 pass / 0 fail / 1 skip**；`test:ui` **120/120**
+
+**8.7 对端首轮验证（2026-11-16，对端 0.6.3）→ 命中版本闸门，非数据问题**
+
+对端报告准确且给了代码级证据：其 `dist/src/sync/vault.js` 的 `syncableChains(vault, deviceId)` 是封闭集合（只有 personal-global + 本机 preserve），`pull.js` 直接消费它 ⇒ **`project/` 链从未进入 pull 范围**。云端三条项目链实测存在（manifest + chunk 各 1），本地 `totalApplied=0`、库逐表未变。⇒ 这是设计边界（旧版本看不到项目链，规格已明写），不是缺陷。
+
+对端同时如实反馈**两个真缺口**（已核实并修复，第六批 89 turns）：
+1. `cairn --version` / `-V` 未实现，打印的是用法帮助（`grep` 确认 CLI 无该分支）。
+2. `terminalScope` 只在控制台模型里消费，`AppService.showMemory()` 返回值没有该字段 ⇒ `cairn show` / MCP `memory_get` 看不到终态。修法复用 `model.ts` 的 `parseTerminalScope`（改为 export），**没有第二份解析**——避免第四次「同一判断写两份」。`originDeviceId` 未动（对端那条样本为 null 是正确行为）。
+
+**0.6.4 已发布**（`npm view` 实测落到 0.6.4）：`package.json` 0.6.3→0.6.4；发版门禁 `npm test` **894 / 893 pass / 0 fail / 1 skip**、`test:ui` **120/120**、typecheck 0 错、OpenSpec strict 10/10 + change 通过、`npm pack` 249 files / 495 kB。真机只读确认 `node dist/.../main.js --version` = 0.6.4、`cairn show` 输出含 `"terminalScope": null`（字段存在、值为空，符合未迁出副本的预期）。
+
+> 一次门禁抖动记录：某轮 `npm test` 出现 2 红（`integration/concurrency` 与 `interfaces/push-gap-guard`）。两者**单独跑均绿**、重跑全量转绿（894/893/0/1），且与本批改动无交集（本批只动 CLI 参数解析与 `showMemory` 返回字段）⇒ 判为并发运行抖动，非回归。记录在此以免下次重跑时误判。
+
+**8.7 对端二轮验证（0.6.4）→ 收敛成功，暴露两个计数口径 bug**
+
+对端（`dev_01a1bdfb`）实测：`totalApplied=3`，但 **archived 38 → 14、project-global active 27（hdrs6 22 / cairn 4 / fsmp 1）、personal-global active 7（含它自己的验证样本）、新增 device-local 0、project 链 3 条且游标到 head**。核心目标全达成：**没有任何「不再持有」副本留在 archived，也没有任何项目内容落在 personal-global**——它用「pull 前后同一 id 对照」取证，方法是正确的。总数 47→50 的 +3 是三链条上本机从未有过的净新增，自洽。
+
+它报的两个问题，**症状都对、根因一个对一个错**：
+
+1. **`upstreamGap=27`（真 bug，已修）**。它归因为「headSeq − localSeq 未对 pull-only 链豁免」——**不成立**：`syncView.gap` 直接取 `findUpstreamGapChains()`，与 headSeq/localSeq 无关。真因是：`sync_pushed:<space>:<id>` **只在 push.ts 写**，pull 落地不写，而缺口判据要求「无本链推送证据」⇒ **每台接收方设备的项目记忆恒被判缺口、永不自消解**。发布方（本机）有该 meta 所以显示 0 ⇒ 这是只有多设备才暴露的盲区。修法：三段判据都加 `origin_device_id IS NULL OR = 本机 deviceId`（NULL 保留，不了一刀切排除）；`findScopeExitGap` 经核对**无此问题**（它要求 `sync_pushed:personal-global:` 作「曾推」证据，接收方本就没有该键）。
+2. **`totalApplied` 把「解除不再持有+迁移」计为 skipped（口径误导，已修）**。它的判断完全正确：24 条最重要的写入效果在 `applied=3` 里几乎不可见。修法：`ApplyOutcome` 追加 `revived`（reheld 分支计数），**不改变既有 applied/skipped 语义**，纯追加维度。
+
+**0.6.5 已发布**（`dist-tags.latest` 实测）。第七批 139 turns；变异对照两条（去掉 origin 条件 → 复现真机症状的用例红；去掉 `revived++` → 计数用例红），还原后 32/32 绿。门禁：`npm test` **898 / 897 pass / 0 fail / 1 skip**、`test:ui` **120/120**、typecheck 0 错、`validate --specs --strict` 10/10 + change valid。**本机自测未误伤**：修复后 `doctor.upstreamGap` 仍为 0、backfill 候选 0（本机 27 条项目记忆 `origin_device_id` 全为 NULL 但都有 `sync_pushed`，两条证据任一成立即不算缺口）。
+
+**8.7 对端三轮（0.6.5）→ 上一轮修法被证伪一半，暴露第三个盲区**
+
+对端实测：`upstreamGap` **27 → 24**（不是 0）。它把差异拆得很准：降的 3 条是净新增（origin=发布方，被 origin 条件正确排除），**剩 24 条全是 revive 原地恢复的副本，`origin_device_id` 是 NULL**。`revived` 字段代码级确认已实现（本轮 `outcome=null` 是游标到头早退，非缺失）；pull 零写入、状态逐项不变。
+
+**它的归因这次完全正确**：三条 revive 路径（`scope_reheld`/`project_reheld`/`preserve_reheld`）只做「清标记 + archived→active + migrateScope」，**从不回填 origin**；而新落地走 `memories.add(..., ev.deviceId)` 是会回填的——两条路径不一致。加上接收端从不写 `sync_pushed`，revived 副本「两头证据都缺」，判据永远命中。这是 0.6.5 修法的盲区，不是判据本身错。
+
+**0.6.6 修法（两部分，缺一不可）**：
+1. **修将来**：三条 revive 路径共用私有 helper `adoptOriginIfUnknown()`，恢复活动时回填 `origin_device_id = ev.deviceId`，**仅当原值 NULL**（归属是溯源事实，已有值不覆盖）。三处共用一份，没有再复制。
+2. **修存量**：**schema v8 迁移**——已存在的副本不会重放事件，故用库里已有证据回填：`audit_event` 中三类 reheld 动作的 `detail.$.from` 就是事件发布方。迁移只补 NULL、绝不覆盖；并加 `json_valid()` 兜底（坏 JSON 会整条迁移失败、库卡在 v7，这个条件把它降级成跳过该行）。
+
+**实现偏离我初稿的两处，均已核实成立**：① 去掉 `EXISTS` 子句——`WHERE origin_device_id IS NULL` 已限定待改行，无匹配审计时子查询返回 NULL 写回 NULL 乃空操作；② 加 `json_valid()`（理由如上）。另外它指出仓库**不存在** `SCHEMA_VERSION` 常量（全 `src/` grep 确认），生效版本由 `MIGRATIONS` 末项 + `PRAGMA user_version` 决定——这条是我指令写错了，不是它漏做。
+
+**0.6.6 已发布**。第八批：两条变异（迁移 `WHERE` 改 `1=1` → 不误伤用例红；helper 改空操作 → revive 回填用例红），还原后全绿。门禁 `npm test` **902 / 901 pass / 0 fail / 1 skip**、`test:ui` **120/120**、typecheck 0 错、specs 10/10。
+
+**真机迁移已在本机执行并核实**（迁移前已备份 `cairn-backup-1794816358693.db`）：`schemaVersion` 7→**8**；`origin_device_id` 从「57 条全 NULL」变为「**38 条 = 本机 id，19 条仍 NULL**」；记忆总数与状态分布不变（54 active + 3 tombstoned）；`upstreamGap` 仍 0。那 19 条无 reheld 审计、本就不是从别处恢复来的副本，保持 NULL 是正确行为。
+
+**8.7 对端四轮（0.6.6）→ 全部通过，项目链跨设备同步验证闭环**
+
+对端实测：`cairn --version = 0.6.6`、`schemaVersion = 8`、迁移前后总数 50→50 不变；**`upstreamGap` 24 → 0（pull 之前即已归零）**、backfill 三段候选全 0、`sync pull` `totalApplied=0` 且状态逐项不变（50 / 27 / 7 / 14 / 3 链）。对端自证迁移机制：`project_reheld` 审计 24 条、27 条 project 记忆 origin 现全为发布方、全库 origin 分布自洽（NULL 22 / 本机 27 / 对端 1）。
+
+三轮迭代的形状值得记下来：**0.6.4 完成收敛 → 0.6.5 定位「缺口为何不归零」→ 0.6.6 补齐第三盲区**。每一轮的缺陷都不是靠猜，而是由对端在真实库上用只读 SQL 取到（origin 分布、reheld 审计计数、pull 前后逐项对照），再回传主设备修。**这条路径比任何 fixture 都有效**——三个盲区（发布方有 meta / 外源有 origin / revive 副本两头都缺）没有一个是本地单机能暴露的。
+
+**留下的一个开放项（未修，已确认低风险）**：对端 `sync backfill` 的 `scopeExits.candidates` 仍显示 **24**。`enqueued=0`，不是写动作，也不影响 `upstreamGap`。成因推测：那 24 条曾是个人链内容、对端自己也推过修订（因而写下了 `sync_pushed:personal-global`），迁入项目后无 `sync_scope_exit` 任务 ⇒ 命中 `findScopeExitGap` 的旧口径。语义上**重复通知**（迁出通知已由本机发出），故无害；但数字会长期误导运维。**风险提示：不要在对端跑 `backfill --apply` 去"清掉"它**——那会真的补发 24 条迁出通知。是否给该函数加一条"已由来源端通知过"的判据，留待后续变更决定（需先确认对端那 24 条是否真有 `sync_pushed:personal-global`，本机无法代查）。
+
+**变更可归档**（tasks 33/33 实质完成；仅上述开放项不在本变更范围内）。

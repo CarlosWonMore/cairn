@@ -103,6 +103,27 @@ export function isPreserveSpaceKey(spaceKey: string): boolean {
   return spaceKey.startsWith(PRESERVE_CHAIN_PREFIX);
 }
 
+/**
+ * 项目链前缀（add-cross-device-project-sync D1）：一个项目一条链，`project/<projectId>`。
+ * projectId 是跨设备稳定 UUID；所有设备都列举并拉取（与保管链相反）。
+ */
+export const PROJECT_CHAIN_PREFIX = 'project/';
+
+export function projectSpaceKey(projectId: string): string {
+  return `${PROJECT_CHAIN_PREFIX}${projectId}`;
+}
+
+export function isProjectSpaceKey(spaceKey: string): boolean {
+  return spaceKey.startsWith(PROJECT_CHAIN_PREFIX);
+}
+
+/** 反解项目链的空间键；非项目链或空 id 返回 null（不猜、不抛）。 */
+export function projectIdFromSpaceKey(spaceKey: string): string | null {
+  if (!isProjectSpaceKey(spaceKey)) return null;
+  const id = spaceKey.slice(PROJECT_CHAIN_PREFIX.length);
+  return id.length > 0 ? id : null;
+}
+
 /** 保管链承载的作用域预设（spec「保管链与物化过滤」：设备限定与项目内容）。 */
 export const PRESERVE_SCOPE_PRESETS = ['device-local', 'project-global', 'project-device'] as const;
 
@@ -111,11 +132,15 @@ export function isPreserveScopePreset(preset: string): boolean {
 }
 
 /**
- * 本设备会消费的链（tasks 1.3）：个人链恒在；保管模式开启时加本设备保管链。
+ * 本设备会消费的链（tasks 1.3）：个人链恒在；项目链按调用方传入的列表展开
+ * （本函数不读 DB、不触网——发现与登记是调用方的事）；保管模式开启时加本设备保管链。
  * pull 范围 = 这条列表——他人保管链对象完全不被下载（D2）。
  */
-export function syncableChains(vault: VaultConfig, deviceId: string): string[] {
+export function syncableChains(vault: VaultConfig, deviceId: string, projectIds: readonly string[] = []): string[] {
   const chains = [PERSONAL_SPACE_KEY];
+  for (const projectId of projectIds) {
+    if (projectId) chains.push(projectSpaceKey(projectId));
+  }
   if (vault.preserveDeviceBound === true) chains.push(preserveSpaceKey(deviceId));
   return chains;
 }

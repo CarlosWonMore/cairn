@@ -294,6 +294,8 @@ export class MemoryRepository extends WriteGuardMixin {
         mem.contentHash,
       );
       this.db.run("UPDATE memory SET status = 'tombstoned', updated_at = ? WHERE id = ?", at, id);
+      // 终态作用域只服务于「不再持有副本」的展示，遗忘后一并清理（add-cross-device-project-sync 4.2）。
+      this.db.run('DELETE FROM meta WHERE key = ?', `terminal_scope:${id}`);
     });
     return this.require(id);
   }

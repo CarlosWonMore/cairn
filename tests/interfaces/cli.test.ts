@@ -36,6 +36,15 @@ function runCli(args: string[], env?: Record<string, string>): Promise<RunResult
   });
 }
 
+test('CLI：--version / -V 打印 package.json 的版本号（不硬编码）', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version: string };
+  for (const flag of ['--version', '-V']) {
+    const r = await runCli([flag]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout.trim(), pkg.version, `${flag} 输出应与 package.json 一致`);
+  }
+});
+
 test('CLI：init → add → search → doctor 机器可读输出与退出码 0', async () => {
   const home = makeTestHome();
   const base = ['--home', home, '--json'];

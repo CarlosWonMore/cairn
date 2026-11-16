@@ -44,6 +44,7 @@
 - 不读取真实个人记忆，除非用户明确指定来源并授权；发现阶段只看元数据。
 - 记忆导入、MCP 配置、原生记忆修改是三个独立授权步骤。
 - `local_only` 和设备限定内容默认在上行任务生成前物理排除；用户对 vault 显式开启保管模式后（`vault config --preserve-device-bound on`，2026-11 已确认推翻「唯一物理排除」语义），此类内容以密文上行到本设备保管链（`preserve/<deviceId>`），他机不拉取、云端对象无明文；`agent-private` 与 `session-ephemeral` 任何模式都不上云。
+- **项目作用域分两类（2026-11 `add-cross-device-project-sync`）**：`project-global` 经项目链 `project/<projectId>` 密文上行，**所有设备列举并拉取**，落点是该项目作用域（不是个人全局），与保管模式开关无关；`project-device` 仍绑设备、走本机保管链；`device-local` 仍不跨设备复制。对端对「不再持有」副本只展示**终态作用域与归属设备**（`meta` 键 `terminal_scope:<memoryId>`，canonical JSON），该信息只用于展示、**不参与授权**，遗忘或重新持有时删除。旧版本设备（≤0.6.3）看不到项目链，需升级。
 - 模型只生成候选；`plan_hash + approval_id`、目标修订和一次性有效期由确定性代码校验。
 - 调用方声明 `user_confirmed` 不代表真实批准；秘密和注入文本不得进入日志、投影或上行内容。
 - 默认只用合成 HOME、合成记忆和 fake backend；真实 Agent 配置或云端资源需要另行明确授权。

@@ -25,6 +25,7 @@ import { ENV } from '../../sync/vault.js';
 import { syncContext } from '../../sync/orchestrate.js';
 import { uploadRemoteBackup, listRemoteBackups, restoreRemoteBackup } from '../../sync/backup-store.js';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 
 /**
  * Cairn CLI（任务 5.1）：本地初始化、显式记忆管理、检索、导出、
@@ -34,6 +35,22 @@ import { join } from 'node:path';
 
 interface Flags {
   [k: string]: string | boolean | undefined;
+}
+
+/**
+ * 版本号只从 package.json 读，不硬编码（并发版容易忘改）。
+ * tsx 直跑（src/…）与构建产物（dist/src/…）到仓库根的层级不同，两处都试。
+ */
+function packageVersion(): string {
+  for (const rel of ['../../../package.json', '../../../../package.json']) {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL(rel, import.meta.url), 'utf8')) as { version?: string };
+      if (pkg.version) return pkg.version;
+    } catch {
+      // 该层级没有 package.json，换下一个
+    }
+  }
+  return 'unknown';
 }
 
 /** 取值型标志；其余 --flag 一律按布尔处理，避免吞掉位置参数。 */
@@ -127,6 +144,11 @@ const AGENT_KINDS = Object.keys(HOST_ADAPTERS) as AgentKind[];
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const { flags, positional } = parseArgs(argv);
+  // 版本号在命令分发之前处理：只有输出，不打开 store。
+  if (argv.includes('--version') || argv.includes('-V')) {
+    console.log(packageVersion());
+    return;
+  }
   const command = positional[0] ?? 'help';
   const args = positional.slice(1);
   const home = str(flags, 'home');
@@ -1254,6 +1276,7 @@ const HELP = `Cairn — 个人、多设备、多 Agent 的本地优先记忆主�
   --home <dir>                  数据目录（默认 ~/.cairn；测试用 CAIRN_HOME）
   --json                        机器可读输出（stdout 仅结果；诊断走 stderr）
   --agent-id <id>               调用方 Agent 身份（默认 cli）
+  -V, --version                 打印版本号
 
 退出码: 0 成功; 1 故障; 2 用法/校验; 3 被治理拒绝; 4 状态冲突; 5 环境不可用`;
 

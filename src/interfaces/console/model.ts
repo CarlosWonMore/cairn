@@ -7,6 +7,7 @@ import { nowIso } from '../../core/time.js';
 import { loadVaultConfig } from '../../sync/vault.js';
 import { ContentView, contentView, sanitizeLabel } from './security.js';
 import { promotedPredicate } from '../../onboarding/batches.js';
+import type { SyncScopeDescriptor } from '../../sync/events.js';
 
 /**
  * 只读装配层（design D1/D9）。
@@ -76,6 +77,11 @@ export interface MemoryView {
   contentHash: string;
   /** 归属设备（add-cloud-preserve-mode D7）：null = 未知（存量记忆如实展示）。 */
   originDeviceId: string | null;
+  /**
+   * 终态作用域（add-cross-device-project-sync 4.3）：仅「本机不再持有」的副本有值，
+   * 描述发出端把记忆迁往的作用域；null = 未知（旧事件）。纯展示，不参与授权。
+   */
+  terminalScope: SyncScopeDescriptor | null;
   sourceAgent: string | null;
   createdBy: string;
   createdAt: string;
@@ -469,7 +475,8 @@ function loadMemories(
       (SELECT COUNT(*) FROM memory_revision r WHERE r.memory_id = m.id) AS revision_count,
       (SELECT COUNT(*) FROM evidence e WHERE e.memory_id = m.id) AS evidence_count,
       (SELECT COUNT(*) FROM conflict c WHERE c.memory_id = m.id AND c.status = 'open') AS open_conflicts,
-      (SELECT COUNT(*) FROM tombstone t WHERE t.memory_id = m.id) AS tombstone_count
+      (SELECT COUNT(*) FROM tombstone t WHERE t.memory_id = m.id) AS tombstone_count,
+      (SELECT tm.value FROM meta tm WHERE tm.key = 'terminal_scope:' || m.id) AS terminal_scope
     FROM memory m
     ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY m.updated_at DESC, m.id`;
@@ -491,6 +498,7 @@ function loadMemories(
       }),
       contentHash: String(r['content_hash']),
       originDeviceId: (r['origin_device_id'] as string | null) ?? null,
+      terminalScope: parseTerminalScope(r['terminal_scope']),
       sourceAgent: (r['source_agent'] as string | null) ?? null,
       createdBy: String(r['created_by']),
       createdAt: String(r['created_at']),
@@ -1002,6 +1010,9 @@ export function memoryDetail(
     }),
     contentHash: String(row['content_hash']),
     originDeviceId: (row['origin_device_id'] as string | null) ?? null,
+    terminalScope: parseTerminalScope(
+      store.db.get('SELECT value FROM meta WHERE key = ?', `terminal_scope:${id}`)?.['value'],
+    ),
     sourceAgent: (row['source_agent'] as string | null) ?? null,
     createdBy: String(row['created_by']),
     createdAt: String(row['created_at']),
@@ -1104,6 +1115,19 @@ function aggregateItems(store: CairnStore): {
     skipped: Number(row?.['skipped'] ?? 0),
     remaining: Number(row?.['remaining'] ?? 0),
   };
+}
+
+/** 终态作用域 meta 值 → 视图字段；缺失或坏数据一律 null（展示「未知」，不让装配失败）。 */
+export function parseTerminalScope(raw: unknown): SyncScopeDescriptor | null {
+  if (raw == null) return null;
+  try {
+    const v = JSON.parse(String(raw)) as unknown;
+    return v != null && typeof v === 'object' && typeof (v as { preset?: unknown }).preset === 'string'
+      ? (v as SyncScopeDescriptor)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function countBy(store: CairnStore, sql: string): Record<string, number> {

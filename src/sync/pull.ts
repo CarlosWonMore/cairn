@@ -9,12 +9,13 @@ import {
   unpackChunk,
 } from './events.js';
 import { deriveSpaceKey, loadKeys, decryptObject } from './cryptoutil.js';
-import { VaultConfig, PERSONAL_SPACE_KEY, isPreserveSpaceKey, syncableChains } from './vault.js';
+import { VaultConfig, PERSONAL_SPACE_KEY, PROJECT_CHAIN_PREFIX, isPreserveSpaceKey, syncableChains } from './vault.js';
 import { applyEvents, ApplyOutcome } from './apply.js';
 
 /**
  * 同步拉取（design D4 + add-cloud-preserve-mode D2/tasks 3.1）：
- * 拉取范围 = syncableChains()——个人链恒在；保管模式开启时加本设备保管链。
+ * 拉取范围 = syncableChains()——个人链恒在；项目链 = 本地已知 ∪ 远端发现；
+ * 保管模式开启时加本设备保管链。
  * 他人保管链对象完全不被下载（前缀隔离：`preserve/<别的设备>/` 不在任何列举范围内）。
  * 每条链：列举其他设备 → 读 manifest（密文）→ 按 headSeq 对本地游标取差量 chunk
  * → 解密 → 按事件序幂等应用 → 推进游标（单事务）。中断可重入：游标只在一个
@@ -92,10 +93,24 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
   if (!keys) throw err('E_VALIDATION', '未找到 vault 密钥（keys.json）；请先 cairn vault init-remote 或导入恢复材料');
   const myDevice = store.identity.deviceId;
 
+  // 项目链发现（tasks 3.1 / design D3）：本地已知 ∪ 远端列举。
+  // 新设备冷启动时本地零项目行，只靠本地登记发现不了链；反过来远端列举失败
+  // 也不能丢掉本地已知链。失败降级为「本次不新增链 + 审计」，绝不阻断个人链。
+  const localProjectIds = store.db.all('SELECT id FROM project').map((r) => String(r.id));
+  let remoteProjectIds: string[] = [];
+  try {
+    remoteProjectIds = await listProjectChains(remote);
+  } catch (e) {
+    store.audit.record('sync', 'project_chain_list_failed', { type: 'system', id: PROJECT_CHAIN_PREFIX }, {
+      error: (e as Error).message.slice(0, 200),
+    });
+  }
+  const projectIds = [...new Set([...localProjectIds, ...remoteProjectIds])];
+
   const results: PullDeviceResult[] = [];
   let totalApplied = 0;
-  for (const spaceKey of syncableChains(vault, myDevice)) {
-    // 个人链：消费链上全部设备的 manifest（含自己——找回场景）；
+  for (const spaceKey of syncableChains(vault, myDevice, projectIds)) {
+    // 个人链与项目链：消费链上全部设备的 manifest（含自己——找回场景）；
     // 保管链：单写者，只有自己的 manifest。
     const sourceDeviceIds = isPreserveSpaceKey(spaceKey) ? [myDevice] : await listRemoteDevices(remote, spaceKey, myDevice);
     for (const deviceId of sourceDeviceIds) {
@@ -108,6 +123,23 @@ export async function syncPull(store: CairnStore, remote: RemoteStore, vault: Va
   }
   void manifestKey;
   return { devices: results, totalApplied };
+}
+
+/**
+ * 发现远端项目链（tasks 3.1）：列举 `project/` 前缀，从 `project/<projectId>/...`
+ * 抽出 projectId 并去重。只读；失败由调用方决定降级（不在这里吞错）。
+ */
+async function listProjectChains(remote: RemoteStore): Promise<string[]> {
+  const listing = await remote.list(PROJECT_CHAIN_PREFIX);
+  const ids = new Set<string>();
+  for (const k of listing.keys) {
+    if (!k.startsWith(PROJECT_CHAIN_PREFIX)) continue;
+    const rel = k.slice(PROJECT_CHAIN_PREFIX.length);
+    const slash = rel.indexOf('/');
+    const id = slash === -1 ? rel : rel.slice(0, slash);
+    if (id) ids.add(id);
+  }
+  return [...ids];
 }
 
 /**

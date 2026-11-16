@@ -668,3 +668,33 @@ END;
 -- （应用层纪律：revise/migrate/promote 不碰这一列）。
 ALTER TABLE memory ADD COLUMN origin_device_id TEXT;
 `;
+
+/**
+ * 008：用已有审计证据回填归属设备（2026-11-16 真机对端 24 条）。
+ *
+ * 现象：revive（scope_reheld / project_reheld / preserve_reheld）只做「清标记 +
+ * archived→active + migrateScope」，从不回填 origin_device_id；而新落地走
+ * `memories.add(..., deviceId, ev.deviceId)` 是会回填的——两条路径不一致，revived
+ * 副本于是「两头证据都缺」：origin 为 NULL、又没有 sync_pushed，缺口判据永远命中。
+ *
+ * 对端游标已到 head，不会重放那些事件，所以代码修好也只对将来生效；存量只能靠
+ * 已有证据：这三类审计的 detail 都带 `{"from":"<发布方 deviceId>","seq":N}`。
+ *
+ * 只补 NULL：归属是溯源事实，已有值绝不被审计覆盖（与 D7「一经写入不改写」一致）。
+ * 有多个 reheld 审计时取最新一条（`at` 是 ISO，字典序即时间序）。
+ * 不加 EXISTS 保护：没有审计的行子查询返回 NULL，而它本来就要求是 NULL——写回 NULL 无变化。
+ */
+export const MIGRATION_008_ORIGIN_BACKFILL = /* sql */ `
+UPDATE memory SET origin_device_id = (
+  SELECT json_extract(a.detail, '$.from')
+    FROM audit_event a
+   WHERE a.subject_type = 'memory'
+     AND a.subject_id = memory.id
+     AND a.action IN ('scope_reheld','project_reheld','preserve_reheld')
+     AND json_valid(a.detail)
+     AND json_extract(a.detail, '$.from') IS NOT NULL
+   ORDER BY a.at DESC
+   LIMIT 1
+)
+WHERE origin_device_id IS NULL;
+`;

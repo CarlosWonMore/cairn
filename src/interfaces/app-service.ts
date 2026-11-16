@@ -28,7 +28,7 @@ import { nowIso } from '../core/time.js';
 import { syncContext, initRemote, setPreserveMode, syncPush, syncPull, registerSyncWorker, buildRemoteStore, SyncContext, PERSONAL_SPACE_KEY } from '../sync/orchestrate.js';
 import { findUpstreamGap, findUpstreamGapChains, findScopeExitGap, backfillUpstream, BackfillReport } from '../sync/backfill.js';
 import { enqueueMemorySync, enqueueScopeExit, enqueuePreserveResync, isPersonalChainScope } from '../sync/route.js';
-import { preserveSpaceKey } from '../sync/vault.js';
+import { preserveSpaceKey, projectSpaceKey } from '../sync/vault.js';
 import {
   proposeRevision,
   readRevisionProposals,
@@ -60,6 +60,8 @@ import { applyPlan, ApplyReport } from '../governance/apply.js';
 import { discoverSources, SourceCandidate } from '../onboarding/discover.js';
 import { PlanRecord } from '../store/plans.js';
 import { ImportSourceKind } from '../store/archives.js';
+import { parseTerminalScope } from './console/model.js';
+import type { SyncScopeDescriptor } from '../sync/events.js';
 
 /**
  * CLI 与 MCP 共用的应用服务（design D1）：记忆规则只在这里实现一次。
@@ -116,6 +118,11 @@ export interface MemoryDetail {
   openConflicts: { id: string; revisionAId: string; revisionBId: string; detectedAt: string }[];
   tombstone: { reason: string | null; forgottenBy: string; forgottenAt: string } | null;
   scope: ScopeRow;
+  /**
+   * 本机不再持有副本时的终态作用域（add-cross-device-project-sync）。
+   * 只是展示补充：`scope` 仍如实反映本地作用域，两者不可互相推导。
+   */
+  terminalScope: SyncScopeDescriptor | null;
 }
 
 export interface DoctorReport {
@@ -140,7 +147,7 @@ export interface DoctorReport {
     preserveDeviceBound: boolean;
     chains: {
       spaceKey: string;
-      role: 'personal' | 'preserve';
+      role: 'personal' | 'project' | 'preserve';
       /** 本机已发布到的序号（meta sync_seq）；从未 push 过为 0。 */
       localSeq: number;
       /** 对各远端设备的拉取游标。 */
@@ -779,6 +786,10 @@ export class AppService {
       })),
       tombstone: store.memories.getTombstone(id),
       scope,
+      // 与控制台模型同一解析（parseTerminalScope）：同一判断不写第二份。
+      terminalScope: parseTerminalScope(
+        store.db.get('SELECT value FROM meta WHERE key = ?', `terminal_scope:${id}`)?.['value'],
+      ),
     };
   }
 
@@ -864,6 +875,82 @@ export class AppService {
   // 健康检查（任务 5.4：诚实分级，无模型无云端核心可用）
   // -------------------------------------------------------------------------
 
+  /**
+   * 各链快照（add-cross-device-project-sync 5.3）：链清单 = 个人链 + 本地已知项目链
+   * + 本设备保管链（模式开启时）。doctor 与 status 共用这一份装配，缺口口径来自
+   * `findUpstreamGapChains`（不在可观测层另写一份 SQL）。
+   *
+   * pending 必须按「任务类型 + 任务所属作用域」归属：sync_upstream 同时承载个人链与
+   * 项目链，只按 job_type 分会让项目任务被算进个人链。
+   */
+  private syncChainViews(preserveOn: boolean): {
+    spaceKey: string;
+    role: 'personal' | 'project' | 'preserve';
+    localSeq: number;
+    pullCursors: Record<string, number>;
+    pendingJobs: number;
+    gap: number;
+  }[] {
+    const store = this.store;
+    const gapChains = findUpstreamGapChains(store);
+    const projectIds = store.db.all('SELECT id FROM project ORDER BY id').map((r) => String(r['id']));
+    const specs: { spaceKey: string; role: 'personal' | 'project' | 'preserve'; gap: number; projectId?: string }[] = [
+      { spaceKey: PERSONAL_SPACE_KEY, role: 'personal', gap: gapChains.personal },
+      ...projectIds.map((id) => ({
+        spaceKey: projectSpaceKey(id),
+        role: 'project' as const,
+        gap: gapChains.project[id] ?? 0,
+        projectId: id,
+      })),
+      ...(preserveOn
+        ? [{ spaceKey: preserveSpaceKey(store.identity.deviceId), role: 'preserve' as const, gap: gapChains.preserve }]
+        : []),
+    ];
+    return specs.map((c) => {
+      const seqRow = store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${c.spaceKey}`);
+      const cursors: Record<string, number> = {};
+      for (const r of store.db.all('SELECT key, value FROM meta WHERE key LIKE ?', `sync_pull:${c.spaceKey}:%`)) {
+        const remoteDevice = String(r['key']).slice(`sync_pull:${c.spaceKey}:`.length);
+        cursors[remoteDevice] = Number(r['value']);
+      }
+      let pending: number;
+      if (c.role === 'preserve') {
+        pending = Number(
+          store.db.scalar(
+            "SELECT COUNT(*) AS n FROM outbox_job WHERE status IN ('pending','retry','running') AND job_type = 'sync_preserve'",
+          ) ?? 0,
+        );
+      } else if (c.role === 'project') {
+        pending = Number(
+          store.db.scalar(
+            `SELECT COUNT(*) AS n FROM outbox_job j JOIN scope s ON s.id = j.scope_id
+              WHERE j.status IN ('pending','retry','running') AND j.job_type = 'sync_upstream'
+                AND s.preset = 'project-global' AND s.project_id = ?`,
+            c.projectId ?? '',
+          ) ?? 0,
+        );
+      } else {
+        pending = Number(
+          store.db.scalar(
+            `SELECT COUNT(*) AS n FROM outbox_job j LEFT JOIN scope s ON s.id = j.scope_id
+              WHERE j.status IN ('pending','retry','running')
+                AND (j.job_type = 'sync_scope_exit'
+                     OR (j.job_type = 'sync_upstream'
+                         AND (s.preset IS NULL OR s.preset <> 'project-global' OR s.project_id IS NULL)))`,
+          ) ?? 0,
+        );
+      }
+      return {
+        spaceKey: c.spaceKey,
+        role: c.role,
+        localSeq: Number(seqRow?.value ?? 0),
+        pullCursors: cursors,
+        pendingJobs: pending,
+        gap: c.gap,
+      };
+    });
+  }
+
   doctor(): DoctorReport {
     const store = this.store;
     const problems: string[] = [];
@@ -946,39 +1033,9 @@ export class AppService {
       }
     }
 
-    // 各链状态（tasks 5.1）：全部来自本地 meta 与 outbox，不触网——doctor 保持离线可用。
+    // 各链状态（tasks 5.1 / 5.3）：全部来自本地 meta / outbox / project 行，不触网——doctor 保持离线可用。
     const preserveOn = vault?.preserveDeviceBound === true;
-    const gapChains = findUpstreamGapChains(store);
-    const chainSpecs: { spaceKey: string; role: 'personal' | 'preserve'; gap: number }[] = [
-      { spaceKey: PERSONAL_SPACE_KEY, role: 'personal', gap: gapChains.personal },
-      ...(preserveOn ? [{ spaceKey: preserveSpaceKey(store.identity.deviceId), role: 'preserve' as const, gap: gapChains.preserve }] : []),
-    ];
-    const syncChains = chainSpecs.map((c) => {
-      const seqRow = store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${c.spaceKey}`);
-      const cursors: Record<string, number> = {};
-      for (const r of store.db.all('SELECT key, value FROM meta WHERE key LIKE ?', `sync_pull:${c.spaceKey}:%`)) {
-        const remoteDevice = String(r['key']).slice(`sync_pull:${c.spaceKey}:`.length);
-        cursors[remoteDevice] = Number(r['value']);
-      }
-      // pending 按任务类型归属链：sync_preserve 只会发布到保管链；
-      // sync_upstream / sync_scope_exit 发布到个人链（不可路由的会在 push 时完成并审计）。
-      const pendingTypes = c.role === 'preserve' ? ['sync_preserve'] : ['sync_upstream', 'sync_scope_exit'];
-      const placeholders = pendingTypes.map(() => '?').join(',');
-      const pending = Number(
-        store.db.scalar(
-          `SELECT COUNT(*) AS n FROM outbox_job WHERE status IN ('pending','retry','running') AND job_type IN (${placeholders})`,
-          ...pendingTypes,
-        ) ?? 0,
-      );
-      return {
-        spaceKey: c.spaceKey,
-        role: c.role,
-        localSeq: Number(seqRow?.value ?? 0),
-        pullCursors: cursors,
-        pendingJobs: pending,
-        gap: c.gap,
-      };
-    });
+    const syncChains = this.syncChainViews(preserveOn);
     if (remote === 'not_configured') {
       notes.push('模型未配置（本变更无模型路径）；云端未配置（remote=not_configured）。核心功能不依赖二者。');
     }
@@ -1089,21 +1146,12 @@ export class AppService {
   status(): Record<string, unknown> {
     const store = this.store;
     const outbox = store.outbox.counts();
-    const gapChains = findUpstreamGapChains(store);
     const vault = loadVaultConfig(store.paths.dataDir);
     const preserveOn = vault?.preserveDeviceBound === true;
-    const chains: Record<string, { localSeq: number; gap: number }> = {
-      [PERSONAL_SPACE_KEY]: {
-        localSeq: Number(store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${PERSONAL_SPACE_KEY}`)?.value ?? 0),
-        gap: gapChains.personal,
-      },
-    };
-    if (preserveOn) {
-      const key = preserveSpaceKey(store.identity.deviceId);
-      chains[key] = {
-        localSeq: Number(store.db.get('SELECT value FROM meta WHERE key = ?', `sync_seq:${key}`)?.value ?? 0),
-        gap: gapChains.preserve,
-      };
+    // 与 doctor 同一份链装配（含每条项目链的 localSeq / 游标 / pending / gap）。
+    const chains: Record<string, { localSeq: number; pullCursors: Record<string, number>; pendingJobs: number; gap: number }> = {};
+    for (const c of this.syncChainViews(preserveOn)) {
+      chains[c.spaceKey] = { localSeq: c.localSeq, pullCursors: c.pullCursors, pendingJobs: c.pendingJobs, gap: c.gap };
     }
     return {
       device: store.identity.deviceId,

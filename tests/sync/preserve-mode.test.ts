@@ -4,9 +4,10 @@ import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RemoteStore } from '../../src/jobs/remote.js';
 import { generateVaultKeys, exportRecoveryMaterial, importRecoveryMaterial, saveKeys } from '../../src/sync/cryptoutil.js';
-import { VaultConfig, loadVaultConfig, updateVaultConfig, preserveSpaceKey, syncableChains, isPreserveSpaceKey } from '../../src/sync/vault.js';
+import { VaultConfig, loadVaultConfig, updateVaultConfig, preserveSpaceKey, projectSpaceKey, syncableChains, isPreserveSpaceKey } from '../../src/sync/vault.js';
 import { syncPush, syncPull } from '../../src/sync/orchestrate.js';
 import { applyEvent } from '../../src/sync/apply.js';
+import { enqueueMemorySync } from '../../src/sync/route.js';
 import type { SyncScopeDescriptor } from '../../src/sync/events.js';
 import { findUpstreamGap, backfillUpstream } from '../../src/sync/backfill.js';
 import { AppService } from '../../src/interfaces/app-service.js';
@@ -178,27 +179,68 @@ test('迁出完整性（模式无关）：离开个人链必入队 scope_exit �
   }
 });
 
-test('关闭模式：设备限定不入队；project 任务完成 + 审计 + 零远端事件（消灭静默完成）', async () => {
+test('关闭模式：设备限定与 project-device 不入队；项目内容仍上项目链；缺项目身份的孤儿任务不可路由（消灭静默完成）', async () => {
   const a = newDevice(); // 未开启保管模式
   try {
     const remote = new MemRemote();
     const vault = vaultFor(a.keys);
+    const projectId = '22222222-2222-4222-8222-222222222222';
 
-    // device-local 写入：outbox 无任何行（spec「关闭模式下设备限定写入不入队」）
+    // device-local / project-device 写入：关闭模式下 outbox 无任何行
     const dl = a.service.addMemory({ content: '仅本机的口令提示', kind: 'fact', scope: { preset: 'device-local' } });
     assert.equal(a.service.store.db.all('SELECT id FROM outbox_job WHERE entity_id = ?', dl.memory!.id).length, 0);
+    const pd = a.service.addMemory({
+      content: '项目设备限定的本机内容',
+      kind: 'fact',
+      scope: { preset: 'project-device', projectId, projectName: 'p2' },
+    });
+    assert.equal(a.service.store.db.all('SELECT id FROM outbox_job WHERE entity_id = ?', pd.memory!.id).length, 0, '关闭模式 project-device 不可路由：零任务');
 
-    // project-global 写入：sync_upstream 保留入队（既有语义），push 完成、写审计、无远端事件
-    const pg = a.service.addMemory({ content: '项目内容 OFF 时代的黑任务', kind: 'fact', scope: { preset: 'project-global', projectId: '22222222-2222-4222-8222-222222222222', projectName: 'p2' } });
-    const before = remote.objects.size;
+    // project-global 写入：与保管模式无关，仍上项目链（本变更的新语义）
+    const pg = a.service.addMemory({
+      content: '项目内容 OFF 时代上项目链',
+      kind: 'fact',
+      scope: { preset: 'project-global', projectId, projectName: 'p2' },
+    });
     const r = await syncPush(a.service.store, remote, vault);
     assert.ok(r);
-    assert.equal(r!.unroutable >= 1, true, '不可路由任务必须计数');
-    const job = a.service.store.db.get("SELECT status FROM outbox_job WHERE entity_id = ? AND job_type = 'sync_upstream'", pg.memory!.id);
-    assert.equal(job?.status, 'done', '不可路由任务必须完成（不是永远 pending）');
+    assert.equal(r!.unroutable, 0, '项目内容可路由（不再是静默完成的黑任务）');
+    assert.equal(
+      a.service.store.db.get("SELECT status FROM outbox_job WHERE entity_id = ? AND job_type = 'sync_upstream'", pg.memory!.id)?.status,
+      'done',
+    );
+    assert.equal(r!.chains.find((c) => c.spaceKey === projectSpaceKey(projectId))?.eventCount, 1, '关闭模式下项目内容仍上项目链');
+    assert.equal(r!.chains.some((c) => isPreserveSpaceKey(c.spaceKey)), false, 'OFF 模式无保管链发布');
+
+    // 缺 projectId 的 project-global（历史/异常行形态）：保留入队，但 push 侧不可路由 →
+    // 完成 + 审计 + 零远端事件。原用例的「消灭静默完成」覆盖保留在这个形态上。
+    const spaceId = a.service.store.scopes.requireById(pg.memory!.scopeId).spaceId;
+    const orphanScopeId = 'scp_orphan_project_global_off';
+    a.service.store.db.run(
+      `INSERT INTO scope (id, space_id, preset, scope_kind, project_id, device_id, agent_id, read_allowlist,
+         sync_policy, read_policy, retention_policy, projection_policy, sensitivity, ttl_days, builtin, created_at)
+       VALUES (?, ?, 'project-global', 'custom', NULL, 'all', 'all', '[]', 'encrypted', 'all_agents',
+               'permanent', 'none', 'normal', NULL, 0, ?)`,
+      orphanScopeId,
+      spaceId,
+      new Date().toISOString(),
+    );
+    const orphan = a.service.store.memories.add(
+      { kind: 'fact', content: '缺项目身份的孤儿项目内容', scopeId: orphanScopeId, authority: 'user_explicit', createdBy: 'cli' },
+      a.deviceId,
+    );
+    enqueueMemorySync(a.service.store, { memoryId: orphan.id, scopeId: orphanScopeId, op: 'memory_upsert', idempotencyKey: 'orphan-off' });
+    const before = remote.objects.size;
+    const r2 = await syncPush(a.service.store, remote, vault);
+    assert.ok(r2);
+    assert.equal(r2!.unroutable >= 1, true, '不可路由任务必须计数');
+    assert.equal(
+      a.service.store.db.get("SELECT status FROM outbox_job WHERE entity_id = ? AND job_type = 'sync_upstream'", orphan.id)?.status,
+      'done',
+      '不可路由任务必须完成（不是永远 pending）',
+    );
     assert.equal(a.service.store.db.all("SELECT id FROM audit_event WHERE action = 'sync_job_unroutable'").length >= 1, true);
     assert.equal(remote.objects.size, before, '不可路由任务不得产生远端对象');
-    assert.equal(r!.chains.some((c) => isPreserveSpaceKey(c.spaceKey)), false, 'OFF 模式无保管链发布');
   } finally {
     closeAll(a);
   }
@@ -279,7 +321,7 @@ test('双设备全场景：迁移 27 条 → push → B 收迁出通知 → A �
       '拉取不产生上行任务',
     );
 
-    // A 迁移 27 条到项目作用域并 push：个人链 scope_exit ×27 + 保管链 upsert ×28
+    // A 迁移 27 条到项目作用域并 push：个人链 scope_exit ×27 + 项目链 upsert ×27
     const projectId = '33333333-3333-4333-8333-333333333333';
     for (const t of migratedTexts) {
       const mem = byContent(a.service.store, t)!;
@@ -287,14 +329,18 @@ test('双设备全场景：迁移 27 条 → push → B 收迁出通知 → A �
     }
     const push2 = await syncPush(a.service.store, remote, vaultFor(a.keys, true));
     assert.ok(push2);
-    const preserveChain = push2!.chains.find((c) => isPreserveSpaceKey(c.spaceKey));
-    assert.ok(preserveChain && preserveChain.eventCount >= 27, `保管链应承载 27 条项目内容（设备限定那条已在首次 push 发布；实际 ${preserveChain?.eventCount ?? 0}）`);
+    const projectChain = push2!.chains.find((c) => c.role === 'project');
+    assert.ok(projectChain && projectChain.eventCount >= 27, `项目链应承载 27 条项目内容（实际 ${projectChain?.eventCount ?? 0}）`);
+    assert.equal(push2!.chains.some((c) => isPreserveSpaceKey(c.spaceKey)), false, '项目内容不再进保管链');
 
-    // B（旧版本语义，只拉个人链）收到迁出通知：27 条转「不再持有」
-    await syncPull(b.service.store, remote, vaultFor(b.keys, false));
+    // B 拉取：个人链迁出先标记「不再持有」，项目链 upsert 随即解除并落在项目作用域
+    const pulledB = await syncPull(b.service.store, remote, vaultFor(b.keys, false));
+    assert.ok(pulledB.devices.some((d) => d.spaceKey === projectSpaceKey(projectId)), 'B 通过 project/ 前缀发现项目链');
     for (const t of migratedTexts) {
       const mem = byContent(b.service.store, t)!;
-      assert.equal(mem.status, 'archived', 'B 的残缺副本自动转不再持有');
+      assert.equal(mem.status, 'active', '项目链 upsert 解除「不再持有」');
+      assert.equal(scopePresetOf(b.service.store, mem.id), 'project-global', '落点是项目作用域');
+      assert.equal(b.service.store.db.get('SELECT value FROM meta WHERE key = ?', `scope_exit:${mem.id}`), undefined, '标记已清除');
       assert.equal(b.service.store.memories.getTombstone(mem.id), null, '迁出不是遗忘：无墓碑');
     }
     assert.equal(byContent(b.service.store, localText), null, '设备限定内容不在 B 落地');
@@ -313,10 +359,14 @@ test('双设备全场景：迁移 27 条 → push → B 收迁出通知 → A �
     const service2 = AppService.open(a.home);
     try {
       assert.equal(service2.store.identity.deviceId, a.deviceId, 'deviceId 不变');
-      // 重建后 pull：个人链 + 保管链全量重放（无游标）
+      // 重建后 pull：个人链 + 项目链 + 保管链全量重放（无游标）
       const pulled = await syncPull(service2.store, remote, loadVaultConfig(dataDir)!);
+      assert.ok(pulled.devices.some((d) => d.spaceKey === projectSpaceKey(projectId)), '项目链也被发现并拉取');
       const total = pulled.devices.reduce((n, d) => n + d.appliedBefore, 0);
-      assert.ok(total >= 55, `个人链（28 upsert + 27 迁出）+ 保管链（28）恢复（实际 ${total}）`);
+      assert.ok(
+        total >= 55,
+        `个人链（28 upsert + 27 迁出）+ 保管链（1 条设备限定；项目链重放命中本地历史修订不计 applied）恢复（实际 ${total}）`,
+      );
 
       const keep = byContent(service2.store, personalText)!;
       assert.equal(keep.status, 'active', '个人链内容找回');
@@ -402,20 +452,30 @@ test('backfill 多链：关闭模式非个人全局不进候选；开启模式�
     // 关闭模式：两条都不进候选（spec「被排除内容不计入缺口」）
     const off = backfillUpstream(store, { apply: false });
     assert.equal(off.chains.preserve.candidates, 0);
-    assert.equal(off.memoryIds.includes(pg.id), false);
+    assert.equal(off.chains.project.candidates, 1, 'project-global 始终计入项目链（与保管模式无关）');
+    assert.equal(off.memoryIds.includes(pg.id), true);
     assert.equal(off.memoryIds.includes(dl.id), false);
 
-    // 开启模式：两条都进保管链候选；apply 后归零、幂等
+    // 开启模式：两条都进候选；项目内容走项目链（sync_upstream），设备限定走保管链（sync_preserve）
     updateVaultConfig(dataDir, { preserveDeviceBound: true });
     const on = backfillUpstream(store, { apply: true });
-    assert.equal(on.chains.preserve.candidates, 2);
-    assert.equal(on.chains.preserve.enqueued, 2);
+    assert.equal(on.chains.project.candidates, 1, '项目内容计入项目链');
+    assert.equal(on.chains.project.enqueued, 1);
+    assert.equal(on.chains.preserve.candidates, 1, '保管链只承载设备限定内容');
+    assert.equal(on.chains.preserve.enqueued, 1);
     const jobTypes = store.db.all('SELECT job_type FROM outbox_job WHERE entity_id IN (?, ?)', pg.id, dl.id).map((r) => String(r.job_type)).sort();
-    assert.deepEqual(jobTypes, ['sync_preserve', 'sync_preserve']);
+    assert.deepEqual(jobTypes, ['sync_preserve', 'sync_upstream'], 'project-global 走项目链，device-local 走保管链');
     const again = backfillUpstream(store, { apply: true });
     assert.equal(again.enqueued, 0, '重复应用幂等');
-    assert.equal(backfillUpstream(store, { apply: false }).candidates, 0, '应用后缺口归零');
-    assert.equal(findUpstreamGap(store).filter((g) => g.chain === 'preserve').length, 0);
+    // 强断言（第二批遗留缺口的收口）：三链口径全归零，项目任务与保管任务分列。
+    const remaining = backfillUpstream(store, { apply: false });
+    assert.equal(remaining.candidates, 0, '三链口径全归零');
+    assert.deepEqual(remaining.memoryIds, [], 'dry-run 不再有候选');
+    assert.equal(remaining.chains.project.candidates, 0);
+    assert.equal(remaining.chains.preserve.candidates, 0);
+    assert.equal(findUpstreamGap(store).length, 0);
+    assert.equal(String(store.db.get('SELECT job_type FROM outbox_job WHERE entity_id = ?', pg.id)?.job_type), 'sync_upstream');
+    assert.equal(String(store.db.get('SELECT job_type FROM outbox_job WHERE entity_id = ?', dl.id)?.job_type), 'sync_preserve');
   } finally {
     closeAll(a);
   }
@@ -482,7 +542,7 @@ test('自链重放的陈旧修订跳过且游标推进（个人链同样适用�
   }
 });
 
-test('存量迁出通知补发：0.6.x 时代的迁移由对账收敛，对端残缺副本自动 archived', async () => {
+test('存量迁出通知补发：0.6.x 时代的迁移由对账收敛，对端副本按项目作用域重新持有', async () => {
   const a = newDevice();
   const b = newDevice(a);
   try {
@@ -509,11 +569,18 @@ test('存量迁出通知补发：0.6.x 时代的迁移由对账收敛，对端�
     const exitJob = a.service.store.db.get("SELECT payload FROM outbox_job WHERE job_type = 'sync_scope_exit' LIMIT 1");
     assert.equal(JSON.parse(String(exitJob!.payload)).fromSpace, 'personal-global', '补发的通知同样固化 fromSpace');
 
-    // 4) 推送后对端自动收敛；重复对账不重发
+    // 4) 推送后对端收敛：迁出通知让它放开残缺的个人链副本，项目链上行又让它按新作用域重新持有。
+    //    项目链存在（2026-11-16 项目链缺口判据修正）后「归档」不再是终态：对端确实应当持有
+    //    这条项目内容，缺的只是「不在个人链」这一条事实，由 scope_exit + 项目落点共同表达。
     await syncPush(a.service.store, remote, vaultFor(a.keys));
     await syncPull(b.service.store, remote, vaultFor(b.keys));
     const peerCopy = byContent(b.service.store, text)!;
-    assert.equal(peerCopy.status, 'archived', '对端残缺副本转不再持有');
+    assert.equal(peerCopy.status, 'active', '对端按项目链重新持有');
+    assert.equal(
+      peerCopy.scopeId,
+      b.service.resolveScope({ preset: 'project-global', projectId, projectName: 'legacy' }).id,
+      '落点是项目作用域，不再留在个人链',
+    );
     assert.equal(a.service.store.db.all("SELECT id FROM outbox_job WHERE job_type = 'sync_scope_exit'").length, 1);
     const redry = backfillUpstream(a.service.store, { apply: false });
     assert.equal(redry.scopeExits.candidates, 0, '已有过迁出任务（不论状态）不重复补发');

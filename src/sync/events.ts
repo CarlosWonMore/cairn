@@ -69,6 +69,12 @@ export interface SyncScopeExitPayload {
   lastContentHash: string;
   /** 推送端已知的全部修订内容哈希——与 tombstone 同一血统对齐机制。 */
   knownHashes: string[];
+  /**
+   * 终态作用域（add-cross-device-project-sync D5）：迁出后记忆所在的作用域。
+   * 接收端据此更新本地留存副本的展示作用域与标签（仍不复制内容、不产生墓碑）。
+   * 新增可选字段而非新事件类型：旧版本忽略未知字段，语义不退化。记忆已不存在时省略。
+   */
+  terminalScope?: SyncScopeDescriptor;
 }
 
 export interface SyncEvent {

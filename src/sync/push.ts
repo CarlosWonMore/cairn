@@ -21,6 +21,8 @@ import {
   PERSONAL_SPACE_KEY,
   isPreserveSpaceKey,
   preserveSpaceKey,
+  projectSpaceKey,
+  projectIdFromSpaceKey,
   isPreserveScopePreset,
 } from './vault.js';
 import { ScopeRow } from '../core/scope.js';
@@ -30,9 +32,10 @@ import { ScopeRow } from '../core/scope.js';
  * outbox 的 sync_upstream / sync_preserve / sync_scope_exit 任务 → 事件 → chunk（加密）
  * → manifest（单写者，headSeq 防回退）。事件按内容哈希链组织。
  *
- * 按链分组发布（tasks 2.4）：个人链（personal-global）与保管链（preserve/<deviceId>）
- * 各自 chunk / manifest / 代次。路由判定：
+ * 按链分组发布（tasks 2.4）：个人链（personal-global）、项目链（project/<projectId>）
+ * 与保管链（preserve/<deviceId>）各自 chunk / manifest / 代次。路由判定：
  * - sync_upstream + personal-global 记忆 → 个人链；
+ * - 记忆作用域为 project-global（带 projectId）→ 项目链（与保管模式无关）；
  * - sync_preserve + 保管链承载作用域 → 保管链；
  * - 其余一律「完成 + 审计 sync_job_unroutable」——静默完成分支已消灭（tasks 2.3）：
  *   不可路由任务 MUST 完成并写审计，MUST NOT 产生远端事件。
@@ -55,8 +58,8 @@ function pushedRevisionKey(spaceKey: string, memoryId: string): string {
 
 export interface ChainPushResult {
   spaceKey: string;
-  /** personal = 个人链；preserve = 本设备保管链。 */
-  role: 'personal' | 'preserve';
+  /** personal = 个人链；preserve = 本设备保管链；project = 项目链。 */
+  role: 'personal' | 'preserve' | 'project';
   publishedChunks: ChunkMeta[];
   headSeq: number;
   eventCount: number;
@@ -89,13 +92,18 @@ interface PendingJob {
   jobTypeHint?: string;
 }
 
-/** 从作用域行构造事件的作用域描述符（D3）。项目名从 space 表取（物化端重建项目行用）。 */
+/**
+ * 从作用域行构造事件的作用域描述符（D3）。项目名取 project.name（显示名的权威出处），
+ * 项目行缺失时回落 space.name（物化端重建项目行用）。
+ */
 function scopeDescriptor(store: CairnStore, scope: ScopeRow): SyncScopeDescriptor {
   const d: SyncScopeDescriptor = { preset: scope.preset };
   if (scope.projectId) {
     d.projectId = scope.projectId;
-    const spaceRow = store.db.get('SELECT name FROM space WHERE id = ?', scope.spaceId);
-    if (spaceRow?.name) d.spaceName = String(spaceRow.name);
+    const projectRow = store.db.get('SELECT name FROM project WHERE id = ?', scope.projectId);
+    const spaceRow = projectRow ? null : store.db.get('SELECT name FROM space WHERE id = ?', scope.spaceId);
+    const name = projectRow?.name ?? spaceRow?.name;
+    if (name) d.spaceName = String(name);
   }
   if (scope.deviceId && scope.deviceId !== 'all') d.deviceId = scope.deviceId;
   return d;
@@ -111,7 +119,7 @@ function buildEventsForChain(
   store: CairnStore,
   device: string,
   spaceKey: string,
-  role: 'personal' | 'preserve',
+  role: 'personal' | 'preserve' | 'project',
   jobs: PendingJob[],
   auditUnroutable: (job: PendingJob, reason: string) => void,
 ): ChainEvents {
@@ -121,6 +129,7 @@ function buildEventsForChain(
   if (role === 'personal' && personalScope.syncPolicy !== 'encrypted') {
     throw err('E_FORBIDDEN', 'personal-global 作用域不是 encrypted；拒绝上行（物理排除语义）');
   }
+  const chainProjectId = role === 'project' ? projectIdFromSpaceKey(spaceKey) : null;
   for (const job of jobs) {
     // 迁出通知任务（add-scope-migration）：独立的 sync_scope_exit jobType，
     // 生成控制事件而非修订内容。fromSpace 固化于入队时（D4）：只发到来源链。
@@ -142,6 +151,12 @@ function buildEventsForChain(
         lastHash = lastHash ?? t?.contentHash ?? '';
       }
       const payload: SyncScopeExitPayload = { lastContentHash: lastHash ?? '', knownHashes };
+      // 终态作用域（tasks 2.3 / D5）：取记忆【当前】作用域——迁移后即目的地。
+      // 记忆已不存在（纯墓碑场景）时省略该字段。
+      if (mem) {
+        const destinationScope = store.scopes.getById(mem.scopeId);
+        if (destinationScope) payload.terminalScope = scopeDescriptor(store, destinationScope);
+      }
       events.push({ deviceId: device, seq: 0, type: 'scope_exit', memoryId: job.entityId, occurredAt: nowIso(), payload });
       doneJobIds.push(job.id);
       continue;
@@ -167,6 +182,13 @@ function buildEventsForChain(
       // 非个人链记忆的任务不可路由 → 完成 + 审计（旧实现是静默完成，27 条迁移事故的根源）。
       if (!memScope || memScope.preset !== 'personal-global') {
         auditUnroutable(job, `memory_scope_not_personal:${memScope?.preset ?? 'unknown'}`);
+        doneJobIds.push(job.id);
+        continue;
+      }
+    } else if (role === 'project') {
+      // 项目链只承载 project-global，且必须是本链的项目（tasks 2.2 物理排除断言）。
+      if (!memScope || memScope.preset !== 'project-global' || !chainProjectId || memScope.projectId !== chainProjectId) {
+        auditUnroutable(job, `memory_scope_not_project_chain:${memScope?.preset ?? 'unknown'}`);
         doneJobIds.push(job.id);
         continue;
       }
@@ -247,21 +269,25 @@ function assignSeqs(store: CairnStore, spaceKey: string, events: SyncEvent[]): v
 }
 
 /** 单个 job 的归属：返回目标链空间键；不可路由返回 null。 */
-function routeJob(store: CairnStore, job: PendingJob, preserveOn: boolean): { spaceKey: string; role: 'personal' | 'preserve' } | null {
+function routeJob(store: CairnStore, job: PendingJob, preserveOn: boolean): { spaceKey: string; role: 'personal' | 'preserve' | 'project' } | null {
   if (job.payload?.['op'] === 'scope_exit') {
     const fromSpace = typeof job.payload['fromSpace'] === 'string' ? String(job.payload['fromSpace']) : PERSONAL_SPACE_KEY;
     if (fromSpace === PERSONAL_SPACE_KEY) return { spaceKey: PERSONAL_SPACE_KEY, role: 'personal' };
     if (isPreserveSpaceKey(fromSpace)) return { spaceKey: fromSpace, role: 'preserve' };
     return null;
   }
+  // sync_upstream：按记忆当前作用域路由（入队后可能已迁移；迁移动作会重建 outbox，
+  // 这里是防御性兜底）。项目链判定必须排在 sync_preserve 与保管链之前——且
+  // **不受 preserveDeviceBound 影响**：这是与保管链的关键差别（tasks 2.1）。
+  const mem = store.memories.get(job.entityId);
+  const scope = mem ? store.scopes.getById(mem.scopeId) : null;
+  if (scope?.preset === 'project-global' && scope.projectId) {
+    return { spaceKey: projectSpaceKey(scope.projectId), role: 'project' };
+  }
   if (job.jobTypeHint === 'sync_preserve') {
     if (!preserveOn) return null;
     return { spaceKey: preserveSpaceKey(store.identity.deviceId), role: 'preserve' };
   }
-  // sync_upstream：按记忆当前作用域路由（入队后可能已迁移；迁移动作会重建 outbox，
-  // 这里是防御性兜底）。personal → 个人链；保管链作用域 → 保管链（开启时）；其余不可路由。
-  const mem = store.memories.get(job.entityId);
-  const scope = mem ? store.scopes.getById(mem.scopeId) : null;
   if (scope?.preset === 'personal-global') return { spaceKey: PERSONAL_SPACE_KEY, role: 'personal' };
   if (scope && isPreserveScopePreset(scope.preset) && preserveOn) {
     return { spaceKey: preserveSpaceKey(store.identity.deviceId), role: 'preserve' };
@@ -307,7 +333,7 @@ async function pushClaimed(store: CairnStore, remote: RemoteStore, vault: VaultC
   };
 
   // 按目标链分组；不可路由任务立即完成 + 审计（MUST NOT 产生远端事件）
-  const byChain = new Map<string, { role: 'personal' | 'preserve'; jobs: PendingJob[] }>();
+  const byChain = new Map<string, { role: 'personal' | 'preserve' | 'project'; jobs: PendingJob[] }>();
   const doneDirectly: string[] = [];
   for (const job of jobs) {
     const target = routeJob(store, job, preserveOn);

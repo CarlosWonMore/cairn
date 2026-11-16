@@ -30,6 +30,19 @@ cairn vault config --preserve-device-bound off    # 关闭 = 回到既有物理�
 - **安全取舍**：开启后 vault 密钥泄露的爆炸半径从「个人全局」扩大到「全部记忆」（详见 `docs/cairn-security.md` §2.1）；不接受请保持关闭。
 - `cairn doctor` / `cairn status` 如实汇报当前模式与各链的本地序号、拉取游标、待办与缺口。
 
+## 项目链（`project/<projectId>`，2026-11 起）
+
+项目作用域内容的**治理结果**要跨设备一致，而设备限定内容仍不复制——因此项目链与保管链是两条不同通道：
+
+- **链键**：`project/<projectId>`，projectId 是跨设备稳定 UUID（`add-stable-project-identity`）。一个项目一条链，单写者仍是「每设备每空间」。
+- **路由**（push 期按记忆当前作用域决定；复用 `sync_upstream` 任务类型，不新增 jobType）：`project-global` → 本项目链，**与保管模式开关无关**（缺 projectId 时降级到保管链并审计 `sync_job_unroutable`，不得静默）；`project-device` → 本设备保管链；`device-local` → 本设备保管链（仅模式开启）。
+- **发现**：pull 每次列举 `project/` 前缀，与本地已知项目链取**并集**——新设备本地没有任何项目行也能发现链（发现范围不由本地状态单方面决定）。列举失败只审计 `project_chain_list_failed` 并跳过，不阻断个人链。
+- **物化**：项目链事件**强制**按描述符 `projectId` 落 `project-global`（find-or-create 项目与空间行），描述符的 preset 差异不作数；缺 projectId → skip + 审计 `project_scope_not_materialized`。
+- **解除「不再持有」**：项目链 upsert 命中带 `scope_exit:` 标记的副本时，清除标记 + `archived → active` + 迁移到项目作用域（审计 `project_reheld`）。个人链迟到修订仍按 `upsert_shadowed_by_scope_exit` 跳过——按链角色分流是既有安全语义，不能统一解除。
+- **终态作用域**：迁出通知新增可选 `terminalScope`（preset/projectId/spaceName/deviceId）。接收端写入 `meta` 键 `terminal_scope:<memoryId>`（canonical JSON），仅用于展示（控制台的「终态 …」「本机不再持有」徽章）；**不复制内容、不产生墓碑、不参与授权**，遗忘或重新持有时删除。
+- **旧版本边界**：≤0.6.3 只列举个人链与本机保管链，看不到项目链——不报错、不卡链，表现为「仍不持有」。**对端需升级**才能看到项目内容。
+- **对账与可观测**：`sync backfill` 报告按三链分列（personal / project / preserve）；项目链缺口的判据是与 personal 相同的 `sync_upstream`（不是 `sync_preserve`，否则项目记忆的旧保管任务会被误判为已处理）。`doctor` / `status` 汇报每条项目链的 localSeq / 拉取游标 / 待办 / 缺口。
+
 ## 快速开始（两个设备）
 
 ```bash
@@ -83,7 +96,7 @@ cairn sync backfill --apply    # 真正补入本地队列（默认每次至多 5
 cairn sync push                # 补完仍需显式上传；backfill 从不联网
 ```
 
-判定口径：作用域为 `encrypted` 且不绑定具体设备、状态 active、且**历史上从未有过任何** `sync_upstream` 任务（不论状态）的记忆。只看 pending 会把已推送过的记忆重报为缺口，因此刻意不限制任务状态。开启保管模式后，对账同时覆盖保管链（设备限定与项目内容 → `preserve/<deviceId>`），报告按链分列（个人链 / 保管链各自的候选、新增、已存在、排除）。
+判定口径：作用域为 `encrypted` 且不绑定具体设备、状态 active、且**历史上从未有过任何** `sync_upstream` 任务（不论状态）的记忆。只看 pending 会把已推送过的记忆重报为缺口，因此刻意不限制任务状态。报告按链分列：个人链、项目链（`project-global`，判据同为 `sync_upstream`）、保管链（`device-local` / `project-device`，判据为 `sync_preserve`）。
 
 `cairn doctor` 的 `counts.upstreamGap` 报告同一口径的缺口数，健康时恒为 0；非零时在 `notes` 里给出一条指向本命令的提示，但**不进 `problems`、不改退出码**——缺口是可自愈状态，不是库损坏。
 

@@ -1,9 +1,10 @@
 import { CairnStore } from '../store/open.js';
 import { SyncEvent, SyncScopeDescriptor, SyncScopeExitPayload, SyncTombstonePayload, SyncUpsertPayload } from './events.js';
 import { err } from '../core/errors.js';
+import { canonicalJson } from '../core/hash.js';
 import { nowIso } from '../core/time.js';
 import { AuditLog } from '../store/audit.js';
-import { PERSONAL_SPACE_KEY, isPreserveSpaceKey, isPreserveScopePreset } from './vault.js';
+import { PERSONAL_SPACE_KEY, isPreserveSpaceKey, isPreserveScopePreset, isProjectSpaceKey } from './vault.js';
 import { ScopeRow } from '../core/scope.js';
 
 /**
@@ -15,12 +16,17 @@ import { ScopeRow } from '../core/scope.js';
  * scope_exit（add-scope-migration）：远端迁出 → 本地标记「不再持有」（meta 标记 + 归档，
  * 无墓碑不删数据）；带 reentry 标记的迁回重推解除标记；迟到修订按 shadowed 跳过。
  *
- * 物化过滤（add-cloud-preserve-mode tasks 3.2）：
+ * 物化过滤（add-cloud-preserve-mode tasks 3.2 + add-cross-device-project-sync tasks 3.3）：
  * - 个人链事件 → 物化为 personal-global（现状不变；旧事件无描述符同样走这条）；
+ * - 项目链事件 → 强制按描述符 projectId 物化为该项目的 project-global（缺 projectId → skip + 审计）；
  * - 本设备保管链事件 → 按描述符物化（device-local 归本机、项目内容归本机）；
  *   描述符缺失（防御）→ 按 device-local 处理并审计；
  *   agent-private / session-ephemeral 描述符 → 永不物化（skip + 审计）。
  * - 归属设备：落地时把 event.deviceId 记为 origin_device_id（D8）。
+ *
+ * 「不再持有」标记按链角色分流（design D4）：个人链迟到修订 → shadowed；
+ * 项目链 upsert → 解除（project_reheld）；保管链 upsert → 只恢复活动（preserve_reheld，
+ * 保留个人链标记）。
  *
  * 保管链是单写者链（只有本设备写），因此多一条个人链没有的规则：
  * 事件内容哈希命中本地任一历史修订 → 该事件已并入本地历史，跳过（不是等待）。
@@ -35,6 +41,9 @@ export interface ApplyOutcome {
   shadowed: number;
   /** 收到 scope_exit 并标记「不再持有」的条数（add-scope-migration）。 */
   scopeExited: number;
+  /** 本次因项目链/保管链 upsert 解除「不再持有」标记并恢复活动的条数。
+   *  追加维度：这些事件同时仍按其返回结果计入 skipped/applied（不改变既有语义）。 */
+  revived: number;
 }
 
 /** 「不再持有」标记：meta 行（不加表列；与 sync_pushed/sync_seq 同一 meta 键空间）。
@@ -49,13 +58,44 @@ function hasScopeExitMarker(store: CairnStore, memoryId: string): boolean {
 
 function clearScopeExitMarker(store: CairnStore, memoryId: string): void {
   store.db.run('DELETE FROM meta WHERE key = ?', scopeExitKey(memoryId));
+  // 重新持有后终态作用域不再成立，随标记一并清除（否则活动记忆上会挂着过期「终态」）。
+  store.db.run('DELETE FROM meta WHERE key = ?', terminalScopeKey(memoryId));
 }
 
-/** 链角色：个人链 / 本设备保管链。其余链在本变更中不存在。 */
-type ChainRole = 'personal' | 'preserve';
+/**
+ * 恢复活动时补归属设备（D8）：三条 revive 路径（scope_reheld / project_reheld /
+ * preserve_reheld）此前只清标记、改状态、迁作用域，origin 留空——接收方副本因此
+ * 「两头证据都缺」（NULL + 无 sync_pushed），缺口判据永远命中（真机 24 条）。
+ * 只补未知：已有值不改写（归属是溯源事实，一经写入不改写）。
+ */
+function adoptOriginIfUnknown(store: CairnStore, memoryId: string, originDeviceId: string): void {
+  store.db.run(
+    'UPDATE memory SET origin_device_id = ? WHERE id = ? AND origin_device_id IS NULL',
+    originDeviceId,
+    memoryId,
+  );
+}
+
+/** 终态作用域（add-cross-device-project-sync D6）：不再持有副本的展示补充信息，
+ * 不是记忆状态机的一部分，因此落 meta 而不加 memory 列。 */
+function terminalScopeKey(memoryId: string): string {
+  return `terminal_scope:${memoryId}`;
+}
+
+function writeTerminalScope(store: CairnStore, memoryId: string, scope: SyncScopeDescriptor): void {
+  store.db.run(
+    'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+    terminalScopeKey(memoryId),
+    canonicalJson(scope),
+  );
+}
+
+/** 链角色：个人链 / 项目链 / 本设备保管链。 */
+type ChainRole = 'personal' | 'project' | 'preserve';
 
 function chainRole(spaceKey: string): ChainRole {
   if (spaceKey === PERSONAL_SPACE_KEY) return 'personal';
+  if (isProjectSpaceKey(spaceKey)) return 'project';
   if (isPreserveSpaceKey(spaceKey)) return 'preserve';
   throw err('E_VALIDATION', `未知同步链: ${spaceKey}`);
 }
@@ -64,12 +104,21 @@ function chainRole(spaceKey: string): ChainRole {
  * 描述符 → 本地作用域行（find-or-create）。保管链事件的项目作用域会连带
  * find-or-create 项目与空间行（projectId 是跨设备稳定 UUID）；只建结构行，
  * 绝不产生任何 outbox 任务（spec：拉取路径不产生上行）。
+ *
+ * 项目链（tasks 3.3）：链键本身就是 `project/<projectId>`，落点**必须**是该项目
+ * 的 project-global 作用域——描述符里的 preset 差异不作数（旧对端/异常载荷也
+ * 不能让项目内容掉进 personal-global）。缺 projectId 无法确定落点 → E_FORBIDDEN。
  */
 function materializeScope(store: CairnStore, role: ChainRole, descriptor: SyncScopeDescriptor | undefined, ownDeviceId: string): ScopeRow {
   if (role === 'personal') {
     return store.scopes.resolvePreset('personal-global');
   }
   const d = descriptor;
+  if (role === 'project') {
+    const projectId = d?.projectId;
+    if (!projectId) throw err('E_FORBIDDEN', '项目链事件描述符缺 projectId');
+    return store.scopes.resolvePreset('project-global', { projectId, projectName: d.spaceName ?? projectId });
+  }
   if (!d) {
     // 保管链事件必有描述符（本变更起才有保管链）；缺失属防御路径，按设备限定落位。
     return store.scopes.resolvePreset('device-local', { deviceId: ownDeviceId });
@@ -92,7 +141,13 @@ function materializeScope(store: CairnStore, role: ChainRole, descriptor: SyncSc
   return store.scopes.resolvePreset('project-global', opts);
 }
 
-export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, audit: AuditLog): keyof ApplyOutcome {
+export function applyEvent(
+  store: CairnStore,
+  ev: SyncEvent,
+  spaceKey: string,
+  audit: AuditLog,
+  tally?: ApplyOutcome,
+): keyof ApplyOutcome {
   const memories = store.memories;
   const role = chainRole(spaceKey);
   // 跨设备记忆身份对齐：id 命中 → 直接用；否则按修订内容哈希血统匹配
@@ -112,9 +167,16 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
       return 'skipped';
     }
     const alreadyMarked = hasScopeExitMarker(store, mem.id);
-    if (alreadyMarked) return 'skipped'; // 幂等：标记存在即处理过（重复事件不再改动）
+    // 终态作用域（tasks 4.1）：旧事件没有该字段——缺省不写，展示端按「未知」处理。
+    const terminal = (ev.payload as SyncScopeExitPayload).terminalScope;
+    if (alreadyMarked) {
+      // 幂等：标记存在即处理过。旧事件先到、带终态的新事件后到时只补写终态。
+      if (terminal) writeTerminalScope(store, mem.id, terminal);
+      return 'skipped';
+    }
     store.db.transaction(() => {
       store.db.run('INSERT INTO meta (key, value) VALUES (?, ?)', scopeExitKey(mem.id), nowIso());
+      if (terminal) writeTerminalScope(store, mem.id, terminal);
       // 归档只在「当前持有是经个人链」时发生：记忆已落在保管链作用域（自设备重放
       // 先于迁出事件到达）说明本设备仍以别的作用域持有它，只补标记不归档。
       const scope = store.scopes.getById(mem.scopeId);
@@ -161,7 +223,7 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
     matScope = materializeScope(store, role, descriptor, store.identity.deviceId);
   } catch (e) {
     if ((e as { code?: string }).code === 'E_FORBIDDEN') {
-      audit.record('sync', 'preserve_scope_not_materialized', { type: 'memory', id: ev.memoryId }, {
+      audit.record('sync', role === 'project' ? 'project_scope_not_materialized' : 'preserve_scope_not_materialized', { type: 'memory', id: ev.memoryId }, {
         from: ev.deviceId,
         seq: ev.seq,
         preset: descriptor?.preset ?? null,
@@ -208,6 +270,7 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
   // 重新持有时一并物化回 personal-global（记忆此前被本地迁到别的作用域的场景）。
   if (role === 'personal' && payload.reentry === true && marked) {
     clearScopeExitMarker(store, mem.id);
+    adoptOriginIfUnknown(store, mem.id, ev.deviceId);
     if (mem.status === 'archived') {
       store.db.run("UPDATE memory SET status = 'active', updated_at = ? WHERE id = ?", nowIso(), mem.id);
     }
@@ -221,11 +284,28 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
     return 'shadowed';
   }
 
+  // 项目链 upsert 落在带标记的记忆上（tasks 3.4 / design D4）：这不等于「个人链的
+  // 迟到修订」——记忆在**另一条链**被重新发布，本设备重新持有它：清标记 + 恢复活动 +
+  // 按描述符落到项目作用域。个人链的 shadowed 分支（上面）必须保持逐字不变。
+  if (role === 'project' && marked) {
+    clearScopeExitMarker(store, mem.id);
+    adoptOriginIfUnknown(store, mem.id, ev.deviceId);
+    if (mem.status === 'archived') {
+      store.db.run("UPDATE memory SET status = 'active', updated_at = ? WHERE id = ?", nowIso(), mem.id);
+    }
+    if (mem.scopeId !== matScope.id) {
+      store.memories.migrateScope(mem.id, matScope.id, `sync:${ev.deviceId}`);
+    }
+    audit.record('sync', 'project_reheld', { type: 'memory', id: mem.id }, { from: ev.deviceId, seq: ev.seq });
+    if (tally) tally.revived++;
+  }
+
   // 保管链 upsert 落在带标记的记忆上：这是自设备重放（恢复场景）——设备仍以
   // 描述符作用域持有它。解除归档并按描述符落位；保留个人链标记（个人链持有确实已离开，
   // 迟到的个人链修订仍应被挡）。
   const reheldFromMarker = role === 'preserve' && marked;
   if (reheldFromMarker) {
+    adoptOriginIfUnknown(store, mem.id, ev.deviceId);
     if (mem.status === 'archived') {
       store.db.run("UPDATE memory SET status = 'active', updated_at = ? WHERE id = ?", nowIso(), mem.id);
     }
@@ -233,6 +313,7 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
       store.memories.migrateScope(mem.id, matScope.id, `sync:${ev.deviceId}`);
     }
     audit.record('sync', 'preserve_reheld', { type: 'memory', id: mem.id }, { from: ev.deviceId, seq: ev.seq });
+    if (tally) tally.revived++;
   }
 
   if (mem.contentHash === payload.contentHash) return 'skipped';
@@ -245,9 +326,9 @@ export function applyEvent(store: CairnStore, ev: SyncEvent, spaceKey: string, a
       { reason: `sync from ${ev.deviceId}#${ev.seq}`, author: `sync:${ev.deviceId}` },
       store.identity.deviceId,
     );
-    // 物化随内容走：保管链事件按描述符落位；个人链事件不动已有落位
+    // 物化随内容走：保管链/项目链事件按描述符落位；个人链事件不动已有落位
     // （本设备主动迁移后的并发修订不该被拉回 personal-global）。
-    if (role === 'preserve' && mem.scopeId !== matScope.id) {
+    if ((role === 'preserve' || role === 'project') && mem.scopeId !== matScope.id) {
       store.memories.migrateScope(mem.id, matScope.id, `sync:${ev.deviceId}`);
     }
     audit.record('sync', 'fast_forwarded', { type: 'memory', id: mem.id }, { from: ev.deviceId, seq: ev.seq });
@@ -321,11 +402,11 @@ function matchByLineage(store: CairnStore, ev: SyncEvent): string | null {
 /** 批量应用：parentHash 未知的事件保留在返回值中由调用方决定重试；单事件失败不拖垮整批。 */
 export function applyEvents(store: CairnStore, events: SyncEvent[], spaceKey: string): { outcome: ApplyOutcome; waitEvents: SyncEvent[] } {
   const audit = store.audit;
-  const outcome: ApplyOutcome = { applied: 0, skipped: 0, conflicted: 0, waited: 0, tombstoned: 0, shadowed: 0, scopeExited: 0 };
+  const outcome: ApplyOutcome = { applied: 0, skipped: 0, conflicted: 0, waited: 0, tombstoned: 0, shadowed: 0, scopeExited: 0, revived: 0 };
   const waitEvents: SyncEvent[] = [];
   for (const ev of events) {
     try {
-      const r = applyEvent(store, ev, spaceKey, audit);
+      const r = applyEvent(store, ev, spaceKey, audit, outcome);
       outcome[r]++;
       if (r === 'waited') waitEvents.push(ev);
     } catch (e) {

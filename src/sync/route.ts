@@ -5,6 +5,7 @@ import {
   PERSONAL_SPACE_KEY,
   preserveModeEnabled,
   preserveSpaceKey,
+  projectSpaceKey,
   isPreserveScopePreset,
 } from './vault.js';
 
@@ -16,7 +17,8 @@ import {
  *
  * 路由规则：
  * - personal-global（encrypted + all）→ `sync_upstream` → 个人链；
- * - 保管模式开启 + 设备限定/项目内容 → `sync_preserve` → 本设备保管链（preserve/<deviceId>）；
+ * - project-global（带 projectId）→ `sync_upstream` → 项目链 project/<projectId>（与保管模式无关）；
+ * - 保管模式开启 + 设备限定/project-device → `sync_preserve` → 本设备保管链（preserve/<deviceId>）；
  * - 其余（device-local OFF / sensitive / agent-private / session-ephemeral）→ 不入队，
  *   这是正常结果不是错误（物理排除语义）。
  *
@@ -51,6 +53,27 @@ export function enqueueMemorySync(
       idempotencyKey: input.idempotencyKey,
     });
     return { enqueued: r.enqueued, chain: r.enqueued ? PERSONAL_SPACE_KEY : null, jobType: r.enqueued ? 'sync_upstream' : null, reason: r.enqueued ? undefined : 'duplicate' };
+  }
+  // 项目内容 → 本项目链（add-cross-device-project-sync D2）：与保管模式无关，
+  // 且必须排在 isPreserveScopePreset 之前——project-global 也在该预设集合里，
+  // 顺序写反就会继续走保管链（本项目最容易踩空的一处）。
+  if (scope.preset === 'project-global') {
+    if (scope.projectId) {
+      const r = store.outbox.enqueue({
+        jobType: 'sync_upstream',
+        scopeId: scope.id,
+        entityType: 'memory',
+        entityId: input.memoryId,
+        payload: { op: input.op, memoryId: input.memoryId },
+        idempotencyKey: input.idempotencyKey,
+      });
+      return { enqueued: r.enqueued, chain: r.enqueued ? projectSpaceKey(scope.projectId) : null, jobType: r.enqueued ? 'sync_upstream' : null, reason: r.enqueued ? undefined : 'duplicate' };
+    }
+    // 缺 projectId 无法确定链：降级到下面的保管链/既有分支，但必须留痕（不得静默丢弃）。
+    store.audit.record('sync', 'sync_job_unroutable', { type: 'memory', id: input.memoryId }, {
+      jobType: 'sync_upstream',
+      reason: 'project_global_missing_project_id',
+    });
   }
   // 保管模式开启：设备限定与项目内容 → 本设备保管链（spec「保管模式下设备限定写入入队」）
   if (isPreserveScopePreset(scope.preset) && preserveModeEnabled(store.paths.dataDir)) {

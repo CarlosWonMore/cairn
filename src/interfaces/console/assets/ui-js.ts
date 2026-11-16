@@ -629,6 +629,16 @@ export const UI_JS = String.raw`
         // 不挂 title：未知不是翻译对，说明放详情抽屉的「来源设备」行；原文模式无 title 的不变量保持成立。
         head.appendChild(chip('来源未知', 'muted'));
       }
+      // 终态作用域（add-cross-device-project-sync 6.1）：不再持有的副本如实展示发出端迁往的
+      // 作用域与归属设备。复用同一 chip 路径；可翻译文案不挂 title，只有原文取值才挂。
+      if (mem.terminalScope) {
+        var ts = mem.terminalScope;
+        var tsPreset = label(ts.preset, PRESET_LABEL);
+        var tsText = '终态 ' + tsPreset + (ts.spaceName ? ' · ' + ts.spaceName : '') +
+          (ts.deviceId ? ' · ' + short(ts.deviceId, 12) : '');
+        head.appendChild(chip(tsText, 'warn', tsPreset === ts.preset ? null : ts.preset));
+        if (mem.status === 'archived') head.appendChild(chip('本机不再持有', 'muted'));
+      }
       head.appendChild(chipLabel(mem.authority, AUTHORITY_LABEL, mem.authority === 'imported_unverified' ? 'warn' : 'muted'));
       if (mem.sensitivity === 'sensitive') head.appendChild(chip('sensitive', 'danger'));
       if (mem.openConflicts > 0) head.appendChild(chip('冲突 ' + mem.openConflicts, 'danger'));
@@ -957,14 +967,22 @@ export const UI_JS = String.raw`
     var scopeRaw = d.scope ? d.scope.preset + ' / ' + d.scope.syncPolicy : '—';
     var scopeShown = d.scope ? label(d.scope.preset, PRESET_LABEL) + ' / ' + label(d.scope.syncPolicy, SYNC_POLICY_LABEL) : '—';
     // [字段名, 显示值, 原始值]：两者不同时把原文挂到 title，中文模式也看得到库里的真实取值。
-    [['kind', label(d.memory.kind, KIND_LABEL), d.memory.kind],
+    var metaRows = [['kind', label(d.memory.kind, KIND_LABEL), d.memory.kind],
      ['status', label(d.memory.status, STATUS_LABEL), d.memory.status],
      ['authority', label(d.memory.authority, AUTHORITY_LABEL), d.memory.authority],
      ['sensitivity', d.memory.sensitivity, d.memory.sensitivity],
      ['scope', scopeShown, scopeRaw],
      ['来源设备', d.memory.originDeviceId || '未知（历史记忆）', d.memory.originDeviceId || null],
      ['createdAt', fmtTime(d.memory.createdAt), null], ['updatedAt', fmtTime(d.memory.updatedAt), null],
-     ['contentHash', d.memory.contentHash, null]].forEach(function (pair) {
+     ['contentHash', d.memory.contentHash, null]];
+    // 终态作用域（6.1）：仅不再持有副本有值；缺省不显示该行（未知不编造）。
+    if (d.memory.terminalScope) {
+      var ts = d.memory.terminalScope;
+      var tsText = label(ts.preset, PRESET_LABEL) + (ts.spaceName ? ' · ' + ts.spaceName : '') +
+        (ts.deviceId ? ' · ' + short(ts.deviceId, 12) : '');
+      metaRows.push(['终态作用域', tsText, ts.preset]);
+    }
+    metaRows.forEach(function (pair) {
       var tr = el('tr');
       tr.appendChild(el('th', null, pair[0]));
       tr.appendChild(el('td', { 'class': 'mono', title: pair[1] === pair[2] ? null : pair[2] }, pair[1]));

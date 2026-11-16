@@ -7,6 +7,7 @@ import {
   MIGRATION_005_MEMORY_IMPORTANCE_USAGE,
   MIGRATION_006_OUTBOX_SCOPE_EXIT,
   MIGRATION_007_PRESERVE_ORIGIN,
+  MIGRATION_008_ORIGIN_BACKFILL,
 } from './schema.js';
 import { err } from '../core/errors.js';
 
@@ -58,6 +59,12 @@ export const MIGRATIONS: readonly Migration[] = [
     // 外键纪律同 006。
     preTransactionPragma: ['PRAGMA foreign_keys = OFF'],
     postTransactionPragma: ['PRAGMA foreign_keys = ON'],
+  },
+  {
+    version: 8,
+    name: 'origin_device_backfill',
+    sql: MIGRATION_008_ORIGIN_BACKFILL,
+    // 纯 UPDATE（memory + audit_event），不重建表、不碰外键。
   },
 ];
 
