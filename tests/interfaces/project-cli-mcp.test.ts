@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, ChildProcess } from 'node:child_process';
+import { join } from 'node:path';
 import { makeTestHome, cleanupTestHome } from '../helpers.js';
 import { cliEntry, mcpServerEntry } from '../spawn-target.js';
 
@@ -186,4 +187,186 @@ test('CLI --help 暴露 search/export 的 --project', async () => {
   const r = await runCli(['--help']);
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /--project <id\|alias>/);
+});
+
+/**
+ * CLI 写路径与读路径同一口径（同型问题第四次）：`cairn add --project` 也解析别名，
+ * 未登记别名报 E_NOT_FOUND 且零写入，UUID 与 --scope-id 路径行为不变。
+ */
+test('CLI add --project：已登记别名写入 project-global，落库为 UUID', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  const alias = 'https://github.com/o/write-alias.git';
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', alias])).stdout) as { projectId: string };
+    assert.match(proj.projectId, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/, '登记应产出 uuidv7');
+
+    const added = await runCli([...base, 'add', 'WRITE_ALIAS_TOKEN rotates monthly', '--scope', 'project-global', '--project', alias]);
+    assert.equal(added.code, 0, `已登记别名必须可写（修复前 E_VALIDATION）: ${added.stderr}`);
+    assert.equal((JSON.parse(added.stdout) as { skipped?: boolean }).skipped, undefined);
+
+    // 落库的 project_id 就是 UUID：按 UUID 检索必须命中，按别名检索等价
+    const byId = JSON.parse((await runCli([...base, 'search', 'WRITE_ALIAS_TOKEN', '--project', proj.projectId])).stdout) as { results: unknown[] };
+    assert.equal(byId.results.length, 1);
+    const byAlias = JSON.parse((await runCli([...base, 'search', 'WRITE_ALIAS_TOKEN', '--project', alias])).stdout) as { results: unknown[] };
+    assert.equal(byAlias.results.length, 1);
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI add --project：未登记别名报 E_NOT_FOUND 且零写入', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    const bad = await runCli([...base, 'add', 'WRITE_UNREGISTERED_TOKEN', '--scope', 'project-global', '--project', 'D:/never/registered']);
+    assert.notEqual(bad.code, 0, '未登记别名不得写入');
+    const body = JSON.parse(bad.stdout) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, 'E_NOT_FOUND');
+    assert.match(body.error.message, /project resolve/);
+
+    const none = JSON.parse((await runCli([...base, 'search', 'WRITE_UNREGISTERED_TOKEN'])).stdout) as { results: unknown[] };
+    assert.equal(none.results.length, 0, '失败必须零写入');
+    const list = JSON.parse((await runCli([...base, 'project', 'list'])).stdout) as { count: number };
+    assert.equal(list.count, 0, '写路径只查不建，不得顺手登记项目');
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI add --project：合法 UUID 行为不变（回归）', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', 'https://github.com/o/write-uuid.git'])).stdout) as { projectId: string };
+    const added = await runCli([...base, 'add', 'WRITE_UUID_TOKEN', '--scope', 'project-global', '--project', proj.projectId]);
+    assert.equal(added.code, 0, added.stderr);
+    const hit = JSON.parse((await runCli([...base, 'search', 'WRITE_UUID_TOKEN', '--project', proj.projectId])).stdout) as { results: unknown[] };
+    assert.equal(hit.results.length, 1);
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI add --scope-id：不触发 project 解析（回归）', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    const first = JSON.parse((await runCli([...base, 'add', 'SCOPE_ID_TOKEN', '--scope', 'personal-global'])).stdout) as { scopeId: string };
+    assert.ok(first.scopeId);
+
+    // 带一个未登记 --project 也必须成功：--scope-id 已指定作用域，不走解析
+    const second = await runCli([...base, 'add', 'SCOPE_ID_TOKEN_2', '--scope-id', first.scopeId, '--project', 'D:/never/registered']);
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal((JSON.parse(second.stdout) as { scopeId: string }).scopeId, first.scopeId);
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+/** 候选只能由 MCP 创建（CLI 无 propose），沿用 cli.test.ts 的做法：add 后直接降级 status。 */
+async function addCandidate(home: string, content: string): Promise<string> {
+  const added = JSON.parse((await runCli(['--home', home, '--json', 'add', content])).stdout) as { id: string };
+  execFileSync(process.execPath, ['-e', `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(${JSON.stringify(join(home, 'data', 'cairn.db'))});
+    db.prepare("UPDATE memory SET status='candidate', authority='agent_inferred', confidence=0.5 WHERE id=?").run(${JSON.stringify(added.id)});
+    db.close();
+  `], { encoding: 'utf8' });
+  return added.id;
+}
+
+/**
+ * 写路径的 `--scope-project` 也必须解析别名（同型问题第五次）：promote 与两个 rescope 分支
+ * 原先原样透传，已登记别名一律撞 resolveScope 的「项目身份必须是 UUID」（E_VALIDATION）。
+ */
+test('CLI rescope <id> --scope-project：已登记别名迁移到该项目作用域', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  const alias = 'https://github.com/o/rescope-alias.git';
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', alias])).stdout) as { projectId: string };
+    const added = JSON.parse((await runCli([...base, 'add', 'RESCOPE_ALIAS_TOKEN stays project-scoped'])).stdout) as { id: string; scopeId: string };
+
+    const r = await runCli([...base, 'rescope', added.id, '--scope-preset', 'project-global', '--scope-project', alias, '--force']);
+    assert.equal(r.code, 0, `已登记别名必须可迁移（修复前 E_VALIDATION）: ${r.stderr}`);
+    const body = JSON.parse(r.stdout) as { targetScope: string; results: { ok: boolean; toScope?: string }[] };
+    assert.equal(body.results[0]?.ok, true);
+    assert.equal(body.results[0]?.toScope, body.targetScope, '落点必须是项目作用域');
+    assert.notEqual(body.targetScope, added.scopeId);
+
+    // 落点是该项目 UUID 的作用域：按 UUID 与按别名检索都必须命中
+    for (const project of [proj.projectId, alias]) {
+      const hit = JSON.parse((await runCli([...base, 'search', 'RESCOPE_ALIAS_TOKEN', '--project', project])).stdout) as { results: unknown[] };
+      assert.equal(hit.results.length, 1, `按 ${project} 必须命中迁移后的记忆`);
+    }
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI rescope <id> --scope-project：未登记别名报 E_NOT_FOUND 且作用域未变', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    const added = JSON.parse((await runCli([...base, 'add', 'RESCOPE_BAD_ALIAS_TOKEN untouched'])).stdout) as { id: string };
+    const bad = await runCli([...base, 'rescope', added.id, '--scope-preset', 'project-global', '--scope-project', 'D:/never/registered', '--force']);
+    assert.notEqual(bad.code, 0, '未登记别名不得迁移');
+    const body = JSON.parse(bad.stdout) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, 'E_NOT_FOUND');
+    assert.match(body.error.message, /project resolve/);
+
+    // 作用域未变：默认检索（非项目作用域）仍命中；项目作用域不可见
+    const plain = JSON.parse((await runCli([...base, 'search', 'RESCOPE_BAD_ALIAS_TOKEN'])).stdout) as { results: unknown[] };
+    assert.equal(plain.results.length, 1, '失败必须零写入');
+    const list = JSON.parse((await runCli([...base, 'project', 'list'])).stdout) as { count: number };
+    assert.equal(list.count, 0, '写路径只查不建');
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI promote --scope-project：已登记别名晋升到该项目作用域', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  const alias = 'https://github.com/o/promote-alias.git';
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', alias])).stdout) as { projectId: string };
+    const candId = await addCandidate(home, 'PROMOTE_ALIAS_TOKEN candidate');
+
+    const r = await runCli([...base, 'promote', candId, '--scope-preset', 'project-global', '--scope-project', alias]);
+    assert.equal(r.code, 0, `已登记别名必须可晋升（修复前 E_VALIDATION）: ${r.stderr}`);
+    const body = JSON.parse(r.stdout) as { status: string; scopePreset: string; scopeId: string; previousScopeId: string };
+    assert.equal(body.status, 'active');
+    assert.equal(body.scopePreset, 'project-global');
+    assert.notEqual(body.scopeId, body.previousScopeId);
+
+    const hit = JSON.parse((await runCli([...base, 'search', 'PROMOTE_ALIAS_TOKEN', '--project', proj.projectId])).stdout) as { results: unknown[] };
+    assert.equal(hit.results.length, 1);
+  } finally {
+    cleanupTestHome(home);
+  }
+});
+
+test('CLI promote / rescope：--scope-project 传合法 UUID 行为不变（回归）', async () => {
+  const home = makeTestHome();
+  const base = ['--home', home, '--json'];
+  try {
+    const proj = JSON.parse((await runCli([...base, 'project', 'resolve', 'https://github.com/o/uuid-write.git'])).stdout) as { projectId: string };
+
+    const candId = await addCandidate(home, 'UUID_WRITE_PROMOTE_TOKEN');
+    const promoted = await runCli([...base, 'promote', candId, '--scope-preset', 'project-global', '--scope-project', proj.projectId]);
+    assert.equal(promoted.code, 0, promoted.stderr);
+    assert.equal((JSON.parse(promoted.stdout) as { scopePreset: string }).scopePreset, 'project-global');
+
+    const added = JSON.parse((await runCli([...base, 'add', 'UUID_WRITE_RESCOPE_TOKEN'])).stdout) as { id: string };
+    const rescoped = await runCli([...base, 'rescope', added.id, '--scope-preset', 'project-global', '--scope-project', proj.projectId, '--force']);
+    assert.equal(rescoped.code, 0, rescoped.stderr);
+
+    // --pending 分支同样接受 UUID（空清单也算跑通解析路径）
+    const pending = await runCli([...base, 'rescope', '--pending', '--scope-preset', 'project-global', '--scope-project', proj.projectId]);
+    assert.equal(pending.code, 0, pending.stderr);
+  } finally {
+    cleanupTestHome(home);
+  }
 });

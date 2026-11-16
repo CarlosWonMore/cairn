@@ -2,6 +2,21 @@
 
 本文件记录 `@carloswon/cairn-memory` 的显著变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.6.9] - 2026-11-16
+
+### Fixed
+- **CLI 写路径统一解析项目别名**：`--project` / `--scope-project` 此前在写入口原样透传，传路径别名会被 UUID 结构防线拒绝（`E_VALIDATION`「项目身份必须是 UUID」）。这是**安全失败**（不写坏数据），但别名不可用；而读路径（`search` / `memory_context`）早已解析——**同一语义两处口径**，本仓库第四次同型问题。
+  - 覆盖全部 4 个写入口：`add` / `onboarding auto`（经 `scopeSelectionFrom`）、`promote`、`rescope <id>`、`rescope --pending`。
+  - 统一为 `resolveProjectAlias(db, raw, 'cairn project resolve')`：只查不建、未登记 `E_NOT_FOUND` + 指引登记、UUID 原样返回、空值保持「未指定」。
+  - 校验顺序：**先 preset 后别名**（`personal-global` 配未登记别名不该报别名错误）。
+
+## [0.6.8] - 2026-11-16
+
+### Fixed
+- **CLI `--project` 在帮助文本里缺失**：`cairn search` 一直支持 `--project`，但 `--help` 只列了 `[--status] [--scope-id] [--include-expired]`。对端真机验证因此不知道有这个参数，误判为「项目作用域记忆无法召回」——**能力被文档隐藏**；同时补上 `export` 的 `--project`。
+- **CLI `--project` 不接受项目别名**（读路径）：传路径别名时**静默 0 命中**，而 MCP 会解析并报 `E_NOT_FOUND`。抽成共用 `resolveProjectAlias()`，CLI 与 MCP 同源。
+  > `scopeAllowsRead` 要求 `scope.projectId` 与查询严格相等，**未携带项目身份时项目作用域内容不可见——这是规格要求**（`scoped-retrieval`「全通道作用域隔离」），不是缺陷。
+
 ## [0.6.7] - 2026-11-16
 
 ### Fixed

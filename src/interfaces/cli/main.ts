@@ -15,6 +15,7 @@ import { backupDatabase, restoreFromBackup } from '../../store/backup.js';
 import { scopeAllowsUpstream } from '../../core/scope.js';
 import { openStore } from '../../store/open.js';
 import { addAlias, listProjects, resolveProject, resolveProjectAlias } from '../../store/projects.js';
+import type { CairnDb } from '../../store/db.js';
 import { startConsoleServer } from '../console/server.js';
 import { exportConsoleHtml, normalizePersonalName } from '../console/export.js';
 import { readReviews, reviewPackForBatch, reviewSubmit } from '../console/review-store.js';
@@ -126,17 +127,33 @@ function diag(message: string): void {
   process.stderr.write(`[cairn] ${message}\n`);
 }
 
-function scopeSelectionFrom(flags: Flags): import('../app-service.js').ScopeSelection | undefined {
+/**
+ * 写路径的 scope 选择：`--project` 与读路径走同一解析（UUID 原样、已登记别名→UUID、
+ * 未登记别名 E_NOT_FOUND）。`--scope-id` 已直接指定作用域时不需要 project，不再解析。
+ * 只查不建：登记入口仍是 `cairn project resolve`。
+ */
+function scopeSelectionFrom(flags: Flags, db: CairnDb): import('../app-service.js').ScopeSelection | undefined {
   const preset = str(flags, 'scope') as import('../app-service.js').ScopeSelection['preset'] | undefined;
-  if (!preset && !str(flags, 'scope-id')) return undefined;
+  const scopeId = str(flags, 'scope-id');
+  if (!preset && !scopeId) return undefined;
+  const projectId = scopeId ? str(flags, 'project') : resolveProjectAlias(db, str(flags, 'project'), 'cairn project resolve') ?? undefined;
   return {
     preset,
-    scopeId: str(flags, 'scope-id'),
-    projectId: str(flags, 'project'),
+    scopeId,
+    projectId,
     projectName: str(flags, 'project-name'),
     agentId: str(flags, 'agent'),
     ttlDays: flags['ttl-days'] != null ? Number(flags['ttl-days']) : undefined,
   };
+}
+
+/**
+ * 只有 project-* 预设才用项目身份；解析前先认预设——用户既没给 project-* 预设又给错别名时，
+ * 「缺预设/缺项目」比「别名未登记」更贴近真实错误。别名口径与读路径一致（只查不建）。
+ */
+function projectIdForPreset(flags: Flags, db: CairnDb, preset: string | undefined): string | undefined {
+  if (preset !== 'project-global' && preset !== 'project-device') return undefined;
+  return resolveProjectAlias(db, str(flags, 'scope-project'), 'cairn project resolve') ?? undefined;
 }
 
 const AGENT_KINDS = Object.keys(HOST_ADAPTERS) as AgentKind[];
@@ -189,7 +206,7 @@ async function main(): Promise<void> {
             kind: str(flags, 'kind') as never,
             sensitivity: flags['sensitive'] === true ? 'sensitive' : 'normal',
             expiresAt: str(flags, 'expires') ?? null,
-            scope: scopeSelectionFrom(flags),
+            scope: scopeSelectionFrom(flags, service.store.db),
           },
           { judgement: judgementFromFlags(flags) },
         );
@@ -257,9 +274,10 @@ async function main(): Promise<void> {
         // 候选晋升（add-candidate-promote-command D1）：CLI 本身即批准凭据，签发通道记 cli。
         const id = args[0];
         if (!id) throw new CairnError('E_VALIDATION', '用法: cairn promote <id> [--scope-preset <preset>] [--scope-project <id>]');
+        const scopePreset = str(flags, 'scope-preset') as never;
         const r = service.promoteCandidate(id, {
-          scopePreset: str(flags, 'scope-preset') as never,
-          projectId: str(flags, 'scope-project'),
+          scopePreset,
+          projectId: projectIdForPreset(flags, service.store.db, scopePreset),
         });
         out(
           {
@@ -289,9 +307,9 @@ async function main(): Promise<void> {
         // 与 forget --pending 同一套哲学：先列清单再逐条执行。
         const preset = str(flags, 'scope-preset');
         const force = flags['force'] === true;
-        const projectId = str(flags, 'scope-project');
         if (flags['pending'] === true) {
           if (!preset) throw new CairnError('E_VALIDATION', '用法: cairn rescope --pending --scope-preset <preset> [--scope-project <id>] [--force] [--dry-run]');
+          const projectId = projectIdForPreset(flags, service.store.db, preset);
           const pending = service.listPendingRescope();
           const dryRun = flags['dry-run'] === true;
           const items = pending.map((p) => ({
@@ -353,6 +371,7 @@ async function main(): Promise<void> {
           ids = [args[0]!];
         }
         if (ids.length === 0) throw new CairnError('E_VALIDATION', '用法: cairn rescope <id> --scope-preset <preset>；批量迁移用 --ids-file <file>（每行一个 id）');
+        const projectId = projectIdForPreset(flags, service.store.db, preset);
         // 预检汇总（只读探测，不代表执行判定；执行判定在 rescopeMemory 内）：
         // 将迁移 N 条，其中 M 条将失去同步，K 条预计被拒绝。
         const target = service.resolveScope({ preset: preset as never, projectId });
@@ -995,7 +1014,7 @@ async function main(): Promise<void> {
           const r = runAutoOnboarding(service.store, {
             policyId,
             batchId: str(flags, 'batch'),
-            scope: scopeSelectionFrom(flags),
+            scope: scopeSelectionFrom(flags, service.store.db),
             dryRun: flags['dry-run'] === true,
             // --redo：已晋升的条目也重新判；--items：只处理点名的几条（同样视为显式重做）。
             redo: flags['redo'] === true,
